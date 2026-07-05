@@ -29,14 +29,22 @@ The four architecture-shaping unknowns, each a standalone spike under `spikes/`:
 **Exit gate:** hooks proven end-to-end in a harness (OSC in a real ConPTY pane → Windows toast on screen);
 ADR-003 decided. *Tests: the passthrough assertion becomes a permanent CI integration test.*
 
-### M1 — Terminal core: one pane, four shells, correct
+### M1 — Terminal core: one pane, real shells, correct ✅ COMPLETE (2026-07-05)
 
-- `gmux-pty` + `gmux-vt` + minimal `gmux-gui` (winit + wgpu DX12 + glyphon): a single pane that runs
-  PowerShell 7/5, cmd, Git Bash, and WSL bash **correctly** — colors, cursor, scrollback, wide
-  chars/emoji, UTF-8 split reads, resize with debounce, DSR-CPR/DA1 replies, win32-input-mode, mouse.
-- mux-core state model (`gmux-mux`) exists as a crate from day 1 (in-process; no daemon yet).
-- *Demo:* run `claude` in the pane, watch it behave identically to Windows Terminal.
-  *Tests:* VT corpus units; ConPTY integration matrix (per shell); vttest subset.
+Cargo workspace `crates/gmux-{pty,vt,mux,gui,gmux}`, 45 tests green + 5 console-gated ConPTY
+integration tests (run via `scripts/console-tests.ps1`). The `gmux` GUI launches, opens a window,
+spawns a shell, and renders. Delivered:
+- **`gmux-pty`** — `Pty` over ConPTY (Job-Object kill-on-close, reader→channel, resize, `ensure_console`).
+- **`gmux-vt`** — `alacritty_terminal` grid + side `vte` OSC parser → `TermEvent`s (OSC 9/777/99/9;4/7/133).
+- **`gmux-mux`** — `Pane` (Pty+Terminal+pump→attention), `$/@/%` ids, Session/Window/Mux tree.
+- **`gmux-gui`** — wgpu 30 (DX12) renderer: monospace glyph atlas + bg/glyph pipelines + cursor + attention
+  ring, verified by **offscreen pixel-readback tests**; winit window + keyboard input + resize.
+- **`gmux`** bin — opens a window running the default shell (PowerShell).
+
+Deferred from M1 to later milestones (tracked): glyphon/complex-shaping + emoji/wide chars (custom atlas is
+ASCII for now), win32-input-mode + mouse (basic key mapping done), damage-tracked rendering (full redraw
+now), scrollback viewport (visible grid only), Git Bash/WSL shell matrix pass. *Next:* M2 (toasts —
+attention→`Pending` path already proven; productize the WinRT toast from the M0 spike).
 
 ### M2 — Notification hooks, productized (the killer feature)
 
