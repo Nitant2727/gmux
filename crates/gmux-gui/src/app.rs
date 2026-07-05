@@ -18,7 +18,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::renderer::PaneView;
+use crate::renderer::{PaneView, SidebarRow};
 use crate::Renderer;
 
 const FONT_PX: f32 = 18.0;
@@ -98,7 +98,9 @@ impl ApplicationHandler for App {
         surface.configure(&device, &config);
 
         let renderer = Renderer::from_device(device, queue, format, FONT_PX);
-        let cols = (config.width / renderer.cell_w()).max(1) as u16;
+        let sidebar_w = renderer.sidebar_width().min(config.width / 3);
+        let content_w = config.width.saturating_sub(sidebar_w).max(1);
+        let cols = (content_w / renderer.cell_w()).max(1) as u16;
         let rows = (config.height / renderer.cell_h()).max(1) as u16;
         let pane = Pane::spawn(&self.shell, PtySize { cols, rows }).expect("spawn shell");
         let session = Session::start("gmux", pane);
@@ -299,6 +301,13 @@ impl State {
         (self.renderer.cell_w().max(1), self.renderer.cell_h().max(1))
     }
 
+    /// `(sidebar_w, content_w, height)` — the sidebar takes a fixed column (capped at 1/3 width).
+    fn areas(&self) -> (u32, u32, u32) {
+        let sidebar_w = self.renderer.sidebar_width().min(self.config.width / 3);
+        let content_w = self.config.width.saturating_sub(sidebar_w).max(1);
+        (sidebar_w, content_w, self.config.height)
+    }
+
     fn spawn_pane(&self, shell: &str) -> Option<Pane> {
         let (cw, ch) = self.cell_dims();
         let cols = (self.config.width / cw).max(1) as u16;
@@ -372,9 +381,9 @@ impl State {
     }
 
     fn focus_dir(&mut self, dir: FocusDir) {
-        let (w, h) = (self.config.width, self.config.height);
+        let (_, content_w, h) = self.areas();
         if let Some(win) = self.session.active_window_mut() {
-            win.focus_dir(dir, w, h);
+            win.focus_dir(dir, content_w, h);
         }
         self.window.request_redraw();
     }
@@ -387,11 +396,12 @@ impl State {
         self.window.request_redraw();
     }
 
-    /// Resize every pane of the active window to match its computed rectangle.
+    /// Resize every pane of the active window to match its computed rectangle (content area).
     fn resize_active_window(&self) {
         let (cw, ch) = self.cell_dims();
+        let (_, content_w, h) = self.areas();
         if let Some(w) = self.session.active_window() {
-            for (id, rect) in w.layout_rects(self.config.width, self.config.height) {
+            for (id, rect) in w.layout_rects(content_w, h) {
                 if let Some(p) = w.pane(id) {
                     let cols = (rect.w / cw).max(1) as u16;
                     let rows = (rect.h / ch).max(1) as u16;
@@ -435,12 +445,27 @@ impl State {
         };
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let (w, h) = (self.config.width, self.config.height);
+        let (sidebar_w, content_w, _) = self.areas();
 
-        // Collect snapshots for the active window's panes, then render them in one pass.
+        // Sidebar rows: one per window (tab), with git/cwd metadata + attention.
+        let active_idx = self.session.active_index();
+        let rows: Vec<SidebarRow> = self
+            .session
+            .windows()
+            .iter()
+            .enumerate()
+            .map(|(i, win)| {
+                let info = win.workspace_info();
+                SidebarRow { name: info.name, branch: info.branch, attention: info.attention, active: i == active_idx }
+            })
+            .collect();
+
+        // Collect snapshots for the active window's panes (offset into the content area).
         let mut snaps: Vec<(PaneSnapshot, gmux_mux::Attention, bool, gmux_mux::Rect)> = Vec::new();
         if let Some(win) = self.session.active_window() {
             let active = win.active_id();
-            for (id, rect) in win.layout_rects(w, h) {
+            for (id, mut rect) in win.layout_rects(content_w, h) {
+                rect.x += sidebar_w;
                 if let Some(p) = win.pane(id) {
                     snaps.push((p.snapshot(), p.attention(), id == active, rect));
                 }
@@ -450,7 +475,7 @@ impl State {
             .iter()
             .map(|(s, a, active, rect)| PaneView { snap: s, attention: *a, active: *active, rect: *rect })
             .collect();
-        self.renderer.render_panes(&view, &views, w, h);
+        self.renderer.render_frame(&view, &rows, sidebar_w, &views, w, h);
         // `frame` presents on drop.
     }
 }

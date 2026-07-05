@@ -11,6 +11,11 @@ use crate::atlas::Atlas;
 const RING_COLOR: Rgb = Rgb { r: 0x3b, g: 0x82, b: 0xf6 }; // blue — attention
 const ACTIVE_COLOR: Rgb = Rgb { r: 0x55, g: 0x55, b: 0x55 }; // dim — focused pane border
 const CURSOR_COLOR: Rgb = Rgb { r: 0xcc, g: 0xcc, b: 0xcc };
+const SIDEBAR_BG: Rgb = Rgb { r: 0x16, g: 0x16, b: 0x1a };
+const SIDEBAR_SEP: Rgb = Rgb { r: 0x33, g: 0x33, b: 0x3a };
+const SIDEBAR_ACTIVE: Rgb = Rgb { r: 0x26, g: 0x26, b: 0x30 };
+const TEXT: Rgb = Rgb { r: 0xcc, g: 0xcc, b: 0xcc };
+const DIM: Rgb = Rgb { r: 0x88, g: 0x88, b: 0x88 };
 const RING_PX: f32 = 3.0;
 
 /// One pane to draw in a multi-pane frame.
@@ -19,6 +24,14 @@ pub struct PaneView<'a> {
     pub attention: Attention,
     pub active: bool,
     pub rect: Rect,
+}
+
+/// One workspace (window/tab) row in the sidebar.
+pub struct SidebarRow {
+    pub name: String,
+    pub branch: Option<String>,
+    pub attention: bool,
+    pub active: bool,
 }
 
 #[repr(C)]
@@ -376,6 +389,169 @@ impl Renderer {
                 // Clamp to the surface so a viewport never exceeds the attachment.
                 let w = w.min(surf_w.saturating_sub(x)).max(1);
                 let h = h.min(surf_h.saturating_sub(y)).max(1);
+                pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
+                pass.set_scissor_rect(x, y, w, h);
+                if d.bg_n > 0 {
+                    pass.set_pipeline(&self.bg_pipeline);
+                    pass.set_vertex_buffer(0, d.bg.slice(..));
+                    pass.draw(0..d.bg_n, 0..1);
+                }
+                if d.glyph_n > 0 {
+                    pass.set_pipeline(&self.glyph_pipeline);
+                    pass.set_bind_group(0, &self.atlas_bind_group, &[]);
+                    pass.set_vertex_buffer(0, d.glyph.slice(..));
+                    pass.draw(0..d.glyph_n, 0..1);
+                }
+            }
+        }
+        self.queue.submit([enc.finish()]);
+    }
+
+    /// The natural width for the sidebar (fits ~22 monospace chars).
+    pub fn sidebar_width(&self) -> u32 {
+        self.atlas.cell_w * 22 + 24
+    }
+
+    fn row_h(&self) -> f32 {
+        self.atlas.cell_h as f32 * 2.0 + 10.0
+    }
+
+    /// Append glyph quads for `s` starting at pixel `(x, y)` (monospace advance), full-surface NDC.
+    fn text_run(&self, s: &str, x: f32, y: f32, color: [f32; 4], fw: f32, fh: f32, out: &mut Vec<GlyphVertex>) {
+        let cw = self.atlas.cell_w as f32;
+        let ch = self.atlas.cell_h as f32;
+        let to_ndc = |x: f32, y: f32| [x / fw * 2.0 - 1.0, 1.0 - y / fh * 2.0];
+        for (i, c) in s.chars().enumerate() {
+            if let Some(uv) = self.atlas.tile_uv(c) {
+                let x0 = x + i as f32 * cw;
+                let corners = [
+                    (to_ndc(x0, y), [uv[0], uv[1]]),
+                    (to_ndc(x0 + cw, y), [uv[2], uv[1]]),
+                    (to_ndc(x0 + cw, y + ch), [uv[2], uv[3]]),
+                    (to_ndc(x0, y), [uv[0], uv[1]]),
+                    (to_ndc(x0 + cw, y + ch), [uv[2], uv[3]]),
+                    (to_ndc(x0, y + ch), [uv[0], uv[3]]),
+                ];
+                for (p, t) in corners {
+                    out.push(GlyphVertex { pos: p, uv: t, color });
+                }
+            }
+        }
+    }
+
+    fn build_sidebar(&self, rows: &[SidebarRow], sidebar_w: u32, fw: f32, fh: f32) -> (Vec<BgVertex>, Vec<GlyphVertex>) {
+        let mut bg = Vec::new();
+        let mut gl = Vec::new();
+        let sw = sidebar_w as f32;
+        let ch = self.atlas.cell_h as f32;
+        let to_ndc = |x: f32, y: f32| [x / fw * 2.0 - 1.0, 1.0 - y / fh * 2.0];
+        let quad = |bg: &mut Vec<BgVertex>, x0: f32, y0: f32, x1: f32, y1: f32, c: [f32; 4]| {
+            let (a, b, cc, d) = (to_ndc(x0, y0), to_ndc(x1, y0), to_ndc(x1, y1), to_ndc(x0, y1));
+            for p in [a, b, cc, a, cc, d] {
+                bg.push(BgVertex { pos: p, color: c });
+            }
+        };
+        quad(&mut bg, 0.0, 0.0, sw, fh, rgba(SIDEBAR_BG));
+        quad(&mut bg, sw - 1.0, 0.0, sw, fh, rgba(SIDEBAR_SEP));
+
+        let rh = self.row_h();
+        for (i, r) in rows.iter().enumerate() {
+            let y = i as f32 * rh;
+            if r.active {
+                quad(&mut bg, 0.0, y, sw, y + rh, rgba(SIDEBAR_ACTIVE));
+            }
+            if r.attention {
+                quad(&mut bg, 8.0, y + 9.0, 16.0, y + 17.0, rgba(RING_COLOR));
+            }
+            self.text_run(&r.name, 24.0, y + 6.0, rgba(TEXT), fw, fh, &mut gl);
+            if let Some(b) = &r.branch {
+                self.text_run(&format!("git:{b}"), 24.0, y + 6.0 + ch, rgba(DIM), fw, fh, &mut gl);
+            }
+        }
+        (bg, gl)
+    }
+
+    /// Render a full frame: the sidebar (left column) plus the panes.
+    pub fn render_frame(
+        &self,
+        view: &wgpu::TextureView,
+        sidebar: &[SidebarRow],
+        sidebar_w: u32,
+        panes: &[PaneView],
+        surf_w: u32,
+        surf_h: u32,
+    ) {
+        let (fw, fh) = (surf_w.max(1) as f32, surf_h.max(1) as f32);
+        let (sbg, sgl) = self.build_sidebar(sidebar, sidebar_w, fw, fh);
+        let vb = |data: &[u8]| {
+            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("gmux-vb"),
+                contents: data,
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        };
+        let sbg_buf = vb(bytemuck::cast_slice(&sbg));
+        let sgl_buf = vb(bytemuck::cast_slice(&sgl));
+
+        struct Draw {
+            rect: Rect,
+            bg: wgpu::Buffer,
+            bg_n: u32,
+            glyph: wgpu::Buffer,
+            glyph_n: u32,
+        }
+        let mut draws = Vec::with_capacity(panes.len());
+        for pv in panes {
+            let (bg, glyphs) =
+                self.build_vertices(pv.snap, pv.attention, pv.active, pv.rect.w.max(1), pv.rect.h.max(1));
+            draws.push(Draw {
+                rect: pv.rect,
+                bg_n: bg.len() as u32,
+                glyph_n: glyphs.len() as u32,
+                bg: vb(bytemuck::cast_slice(&bg)),
+                glyph: vb(bytemuck::cast_slice(&glyphs)),
+            });
+        }
+
+        let mut enc = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gmux-frame") });
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("gmux-frame-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.03, g: 0.03, b: 0.03, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            // Sidebar (full-surface viewport).
+            pass.set_viewport(0.0, 0.0, fw, fh, 0.0, 1.0);
+            pass.set_scissor_rect(0, 0, surf_w, surf_h);
+            if !sbg.is_empty() {
+                pass.set_pipeline(&self.bg_pipeline);
+                pass.set_vertex_buffer(0, sbg_buf.slice(..));
+                pass.draw(0..sbg.len() as u32, 0..1);
+            }
+            if !sgl.is_empty() {
+                pass.set_pipeline(&self.glyph_pipeline);
+                pass.set_bind_group(0, &self.atlas_bind_group, &[]);
+                pass.set_vertex_buffer(0, sgl_buf.slice(..));
+                pass.draw(0..sgl.len() as u32, 0..1);
+            }
+            // Panes (viewport per pane).
+            for d in &draws {
+                let (x, y) = (d.rect.x, d.rect.y);
+                let w = d.rect.w.max(1).min(surf_w.saturating_sub(x)).max(1);
+                let h = d.rect.h.max(1).min(surf_h.saturating_sub(y)).max(1);
                 pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
                 pass.set_scissor_rect(x, y, w, h);
                 if d.bg_n > 0 {

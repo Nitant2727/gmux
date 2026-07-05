@@ -6,11 +6,13 @@ pub mod attention;
 pub mod ids;
 pub mod layout;
 pub mod pane;
+pub mod workspace;
 
 pub use attention::Attention;
 pub use ids::{PaneId, SessionId, WindowId};
 pub use layout::{FocusDir, Rect, SplitDir};
 pub use pane::{Pane, PaneEvent, PaneSnapshot};
+pub use workspace::WorkspaceInfo;
 
 // Re-export the types callers need so they don't have to depend on gmux-pty / gmux-vt directly.
 pub use gmux_pty::PtySize;
@@ -101,6 +103,19 @@ impl Window {
     /// Grow the active pane by `delta` (fraction) against its split sibling.
     pub fn resize_active(&mut self, delta: f32) {
         self.root.resize_leaf(self.active, delta);
+    }
+
+    /// Sidebar metadata for this window: name, active pane's cwd, git branch, and attention.
+    pub fn workspace_info(&self) -> WorkspaceInfo {
+        let cwd = self.active_pane().cwd();
+        let branch = cwd.as_deref().and_then(|c| workspace::git_branch(std::path::Path::new(c)));
+        let name = cwd
+            .as_deref()
+            .map(workspace::cwd_name)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "shell".to_string());
+        let attention = self.panes().any(|p| p.attention().is_pending());
+        WorkspaceInfo { name, cwd, branch, attention }
     }
 
     /// Each pane's rectangle within a `(w, h)` area. When zoomed, the active pane fills it.
