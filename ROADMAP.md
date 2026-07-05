@@ -182,10 +182,20 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
   from remote agents raise attention/toasts identically to local panes**. Persist prunes remote
   leaves from the layout tree (indices stay consistent; remote panes re-attach via the transport,
   never respawn as local shells). 152 tests; console suites green.
-- Stage 2b: `gmux-remote` transport — spawn `ssh -tt … tmux -CC new -As gmux` (injectable command
-  line; tested against stub processes — no WSL/tmux on the dev machine), strip the DCS wrapper,
-  ordered reply correlation, `send-keys -H` input, tmux-layout→`Node` converter; then server/CLI
-  wiring (`gmux ssh-tmux`), pause-based flow control; tmux ≥3.2 gate with degraded mode below.
+- **Stage 2b ✅ (2026-07-06): `gmux-remote` transport crate** — `RemoteTmux::spawn(command_line)`
+  (injectable: production `ssh -tt … tmux -CC new -As gmux`, tests stub processes) with piped stdio +
+  kill-on-close **job object** (tree-kill so `kill()`/Drop can't deadlock on a grandchild holding the
+  pipe); DCS-intro strip (chunk-boundary safe; ST deliberately NOT scanned — `capture-pane -e` bodies
+  contain raw `ESC \`; detach = the protocol's own `%exit`); **attach-greeting reply surfaced as
+  `TransportEvent::Greeting`** so positional correlation never desyncs (the classic control-mode
+  trap, caught by adversarial review); `send-keys -H` hex input, resize/split/kill/new-window
+  helpers; chunk-appended stderr for live ssh diagnostics; layout→`Node` converter with midpoint
+  ratios (`(first+0.5)/span`) so `floor(span·ratio)` reproduces tmux sizes for every geometry
+  (exhaustively tested to span 400). 13 tests. **Not yet live-tested against a real tmux** (no
+  WSL/ssh peer on the dev machine) — needs a real remote before M9 is declared done.
+- Stage 2c: server/CLI wiring — `Call::SshTmux`/`gmux ssh-tmux`, daemon tick pumping transport
+  events into remote windows/panes (%output→push_output, %layout-change→layout_to_node,
+  %window-add/close, %exit→mark_exited), `%pause` flow control; tmux ≥3.2 gate with degraded mode.
 
 ### M10 — Keybindings & configuration polish
 
