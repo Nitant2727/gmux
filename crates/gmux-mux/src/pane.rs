@@ -56,7 +56,15 @@ impl Pane {
     /// Spawn `command_line` (a shell or program) in a new pseudoconsole of `size` and start pumping
     /// its output through a fresh terminal.
     pub fn spawn(command_line: &str, size: PtySize) -> io::Result<Pane> {
-        let (pty, rx) = Pty::spawn(command_line, size)?;
+        let id = PaneId::alloc();
+        // Inject self-addressing env so agent hooks and `gmux notify --pane` can target this pane,
+        // and advertise gmux to terminal-aware tools.
+        let env = vec![
+            ("GMUX_PANE".to_string(), id.to_string()),
+            ("TERM_PROGRAM".to_string(), "gmux".to_string()),
+            ("COLORTERM".to_string(), "truecolor".to_string()),
+        ];
+        let (pty, rx) = Pty::spawn_with_env(command_line, size, &env)?;
         let terminal = Arc::new(Mutex::new(Terminal::new(size.cols, size.rows)));
         let attention = Arc::new(Mutex::new(Attention::default()));
         let title = Arc::new(Mutex::new(String::new()));
@@ -104,7 +112,7 @@ impl Pane {
         });
 
         Ok(Pane {
-            id: PaneId::alloc(),
+            id,
             pty,
             terminal,
             events,

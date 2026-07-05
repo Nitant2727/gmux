@@ -41,8 +41,8 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
     InitializeProcThreadAttributeList, ResumeThread, UpdateProcThreadAttribute,
-    WaitForSingleObject, CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT, INFINITE,
-    PROCESS_INFORMATION, STARTUPINFOEXW,
+    WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+    INFINITE, PROCESS_INFORMATION, STARTUPINFOEXW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
 
@@ -78,6 +78,26 @@ unsafe impl Send for Pty {}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(once(0)).collect()
+}
+
+/// Build a UTF-16 environment block = this process's env with `additions` applied, double-null
+/// terminated and sorted case-insensitively (as `CreateProcessW` expects with
+/// `CREATE_UNICODE_ENVIRONMENT`).
+fn build_env_block(additions: &[(String, String)]) -> Vec<u16> {
+    use std::collections::BTreeMap;
+    let mut map: BTreeMap<String, String> = std::env::vars().collect();
+    for (k, v) in additions {
+        map.insert(k.clone(), v.clone());
+    }
+    let mut entries: Vec<(String, String)> = map.into_iter().collect();
+    entries.sort_by(|a, b| a.0.to_uppercase().cmp(&b.0.to_uppercase()));
+    let mut block: Vec<u16> = Vec::new();
+    for (k, v) in entries {
+        block.extend(format!("{k}={v}").encode_utf16());
+        block.push(0);
+    }
+    block.push(0); // final double-null terminator
+    block
 }
 
 fn last_err(context: &str) -> io::Error {
@@ -134,11 +154,28 @@ pub fn ensure_console() {
 }
 
 impl Pty {
-    /// Spawn `command_line` (e.g. `"cmd.exe /c echo hi"` or a shell path) attached to a new
-    /// pseudoconsole of `size`. Returns the handle plus a channel yielding raw output chunks
-    /// until the child exits (the channel closes on EOF).
+    /// Spawn `command_line` attached to a new pseudoconsole of `size`, inheriting this process's
+    /// environment. See [`Pty::spawn_with_env`] to add variables.
     pub fn spawn(command_line: &str, size: PtySize) -> io::Result<(Pty, Receiver<Vec<u8>>)> {
+        Self::spawn_with_env(command_line, size, &[])
+    }
+
+    /// Spawn `command_line` with `env` variables added to (or overriding) the inherited environment
+    /// — e.g. `GMUX_PANE`. Returns the handle plus a channel yielding raw output chunks until the
+    /// child exits (the channel closes on EOF).
+    pub fn spawn_with_env(
+        command_line: &str,
+        size: PtySize,
+        env: &[(String, String)],
+    ) -> io::Result<(Pty, Receiver<Vec<u8>>)> {
         ensure_console();
+        // Keep the env block alive for the whole CreateProcessW call.
+        let mut env_block = if env.is_empty() { Vec::new() } else { build_env_block(env) };
+        let (env_ptr, env_flag) = if env_block.is_empty() {
+            (null(), 0)
+        } else {
+            (env_block.as_mut_ptr() as *const c_void, CREATE_UNICODE_ENVIRONMENT)
+        };
         unsafe {
             let sa = SECURITY_ATTRIBUTES {
                 nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
@@ -204,8 +241,8 @@ impl Pty {
                 null(),
                 null(),
                 0, // no handle inheritance; pseudoconsole binds stdio
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
-                null(),
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | env_flag,
+                env_ptr,
                 null(),
                 &si as *const STARTUPINFOEXW as *const _,
                 &mut pi,
@@ -322,3 +359,17 @@ impl Drop for Pty {
 #[derive(Clone, Copy)]
 struct SendHandle(HANDLE);
 unsafe impl Send for SendHandle {}
+
+#[cfg(test)]
+mod tests {
+    use super::build_env_block;
+
+    #[test]
+    fn env_block_adds_vars_and_inherits() {
+        let block = build_env_block(&[("GMUX_TEST_VAR".into(), "hello-42".into())]);
+        let s = String::from_utf16_lossy(&block);
+        assert!(s.contains("GMUX_TEST_VAR=hello-42"), "addition missing");
+        assert!(s.to_uppercase().contains("PATH="), "did not inherit process env (PATH)");
+        assert_eq!(*block.last().unwrap(), 0, "block must be null-terminated");
+    }
+}

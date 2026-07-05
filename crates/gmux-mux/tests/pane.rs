@@ -41,6 +41,16 @@ fn pane_runs_shell_and_snapshots() {
 
 #[test]
 #[ignore = "requires a real console; run via scripts/console-tests.ps1 gmux-mux pane"]
+fn injects_gmux_pane_env() {
+    let pane = Pane::spawn("cmd.exe /c echo PANE=%GMUX_PANE%", PtySize { cols: 120, rows: 30 }).unwrap();
+    let found = wait_until(Duration::from_secs(6), || {
+        snapshot_text(&pane).iter().any(|l| l.contains("PANE=%") && !l.contains("GMUX_PANE%"))
+    });
+    assert!(found, "GMUX_PANE not injected/expanded: {:?}", snapshot_text(&pane));
+}
+
+#[test]
+#[ignore = "requires a real console; run via scripts/console-tests.ps1 gmux-mux pane"]
 fn osc9_sets_attention_and_emits_event() {
     let cmd = r#"powershell -NoProfile -Command "[Console]::Out.Write([char]27 + ']9;agent needs input' + [char]7); Start-Sleep -Milliseconds 500""#;
     let pane = Pane::spawn(cmd, PtySize { cols: 120, rows: 30 }).unwrap();
