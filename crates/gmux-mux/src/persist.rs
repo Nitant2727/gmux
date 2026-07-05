@@ -36,6 +36,9 @@ pub struct WindowSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PaneRecord {
     pub cwd: Option<String>,
+    /// The pane's visible screen text at save time (replayed as inert history on restore).
+    #[serde(default)]
+    pub screen: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -55,11 +58,11 @@ impl SessionSnapshot {
         SessionSnapshot { version: SNAPSHOT_VERSION, active: session.active_index(), windows }
     }
 
-    /// Restore a session by respawning a shell per pane in its saved cwd. `spawn(cwd)` creates a
-    /// pane (the caller supplies the shell + size).
+    /// Restore a session by respawning a shell per pane. `spawn(record)` creates a pane (the caller
+    /// supplies the shell + size, uses `record.cwd`, and replays `record.screen` as inert history).
     pub fn restore<F>(&self, name: &str, mut spawn: F) -> io::Result<Session>
     where
-        F: FnMut(Option<&str>) -> io::Result<Pane>,
+        F: FnMut(&PaneRecord) -> io::Result<Pane>,
     {
         let mut windows = Vec::with_capacity(self.windows.len());
         for w in &self.windows {
@@ -80,7 +83,10 @@ impl WindowSnapshot {
         }
         let panes = ids
             .iter()
-            .map(|id| PaneRecord { cwd: window.pane(*id).and_then(|p| p.cwd()) })
+            .map(|id| match window.pane(*id) {
+                Some(p) => PaneRecord { cwd: p.cwd(), screen: screen_lines(p) },
+                None => PaneRecord { cwd: None, screen: Vec::new() },
+            })
             .collect();
         let active = index_of.get(&window.active_id()).copied().unwrap_or(0);
         WindowSnapshot { panes, layout: node_to_snapshot(window.root(), &index_of), active }
@@ -88,13 +94,13 @@ impl WindowSnapshot {
 
     fn restore<F>(&self, spawn: &mut F) -> io::Result<Window>
     where
-        F: FnMut(Option<&str>) -> io::Result<Pane>,
+        F: FnMut(&PaneRecord) -> io::Result<Pane>,
     {
         // Spawn one pane per record; index -> new PaneId.
         let mut ids = Vec::with_capacity(self.panes.len());
         let mut map = HashMap::new();
         for rec in &self.panes {
-            let pane = spawn(rec.cwd.as_deref())?;
+            let pane = spawn(rec)?;
             ids.push(pane.id);
             map.insert(pane.id, pane);
         }
@@ -105,6 +111,24 @@ impl WindowSnapshot {
         let active = ids.get(self.active).copied().unwrap_or(ids[0]);
         Ok(Window::from_parts(map, root, active))
     }
+}
+
+/// The pane's visible screen as text lines, with trailing blank lines trimmed.
+fn screen_lines(p: &Pane) -> Vec<String> {
+    let snap = p.snapshot();
+    let mut lines: Vec<String> = snap
+        .cells
+        .iter()
+        .map(|row| {
+            let mut s: String = row.iter().map(|c| c.ch).collect();
+            s.truncate(s.trim_end_matches(' ').len());
+            s
+        })
+        .collect();
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    lines
 }
 
 fn node_to_snapshot(node: &Node, index_of: &HashMap<PaneId, usize>) -> NodeSnapshot {
@@ -141,7 +165,10 @@ mod tests {
             version: SNAPSHOT_VERSION,
             active: 0,
             windows: vec![WindowSnapshot {
-                panes: vec![PaneRecord { cwd: Some(r"C:\a".into()) }, PaneRecord { cwd: None }],
+                panes: vec![
+                    PaneRecord { cwd: Some(r"C:\a".into()), screen: vec!["line one".into()] },
+                    PaneRecord { cwd: None, screen: Vec::new() },
+                ],
                 layout: NodeSnapshot::Split {
                     horizontal: true,
                     ratio: 0.5,

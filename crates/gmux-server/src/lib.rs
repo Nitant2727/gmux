@@ -44,10 +44,14 @@ impl Server {
         })
     }
 
-    /// Restore the last session from disk (respawning shells in saved cwds), or start fresh.
+    /// Restore the last session from disk (respawning shells in saved cwds + replaying screen
+    /// history), or start fresh.
     pub fn restore_or_new(shell: String) -> io::Result<Server> {
         if let Some(snap) = load_snapshot() {
-            let restored = snap.restore("gmux", |cwd| Pane::spawn_in(&shell, DEFAULT_SIZE, cwd));
+            let restored = snap.restore("gmux", |rec| {
+                let replay = restore_replay(&rec.screen);
+                Pane::spawn_in(&shell, DEFAULT_SIZE, rec.cwd.as_deref(), replay.as_deref())
+            });
             if let Ok(session) = restored {
                 if session.pane_count() > 0 {
                     eprintln!("gmux daemon: restored {} pane(s) from last session", session.pane_count());
@@ -388,6 +392,22 @@ fn state_path() -> PathBuf {
 fn load_snapshot() -> Option<SessionSnapshot> {
     let text = std::fs::read_to_string(state_path()).ok()?;
     serde_json::from_str(&text).ok()
+}
+
+/// Build the inert-history replay for a restored pane: the saved screen lines under a dim divider.
+/// Returns `None` when there is nothing to replay.
+fn restore_replay(screen: &[String]) -> Option<String> {
+    if screen.iter().all(|l| l.is_empty()) {
+        return None;
+    }
+    let mut out = String::new();
+    for line in screen {
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    // Dim divider (SGR 90) marking where restored history ends and the fresh shell begins.
+    out.push_str("\x1b[90m\u{2500}\u{2500}\u{2500} gmux: restored (process not running) \u{2500}\u{2500}\u{2500}\x1b[0m\r\n");
+    Some(out)
 }
 
 /// Run the daemon: restore or create the mux, serve the pipe, and block until all panes exit.

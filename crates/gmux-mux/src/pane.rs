@@ -56,12 +56,18 @@ impl Pane {
     /// Spawn `command_line` (a shell or program) in a new pseudoconsole of `size` and start pumping
     /// its output through a fresh terminal.
     pub fn spawn(command_line: &str, size: PtySize) -> io::Result<Pane> {
-        Self::spawn_in(command_line, size, None)
+        Self::spawn_in(command_line, size, None, None)
     }
 
-    /// Spawn `command_line` in working directory `cwd` (used by session restore to reopen a shell
-    /// in its saved directory).
-    pub fn spawn_in(command_line: &str, size: PtySize, cwd: Option<&str>) -> io::Result<Pane> {
+    /// Spawn `command_line` in working directory `cwd`, optionally pre-seeding the terminal with
+    /// `replay` bytes (inert restored history) before the child's output starts. Used by session
+    /// restore to reopen a shell in its saved directory beneath its previous screen contents.
+    pub fn spawn_in(
+        command_line: &str,
+        size: PtySize,
+        cwd: Option<&str>,
+        replay: Option<&str>,
+    ) -> io::Result<Pane> {
         let id = PaneId::alloc();
         // Inject self-addressing env so agent hooks and `gmux notify --pane` can target this pane,
         // and advertise gmux to terminal-aware tools.
@@ -72,6 +78,10 @@ impl Pane {
         ];
         let (pty, rx) = Pty::spawn_full(command_line, size, &env, cwd)?;
         let terminal = Arc::new(Mutex::new(Terminal::new(size.cols, size.rows)));
+        // Replay saved history into the fresh terminal before the child's output arrives.
+        if let Some(r) = replay {
+            terminal.lock().unwrap().advance(r.as_bytes());
+        }
         let attention = Arc::new(Mutex::new(Attention::default()));
         let title = Arc::new(Mutex::new(String::new()));
         let cwd = Arc::new(Mutex::new(None));

@@ -83,7 +83,9 @@ fn snapshot_capture_and_restore_rebuilds_layout() {
 
     // Restore into a brand-new session (as a fresh daemon would after reboot).
     let restored = snap
-        .restore("gmux", |cwd| Pane::spawn_in("cmd.exe", PtySize { cols: 80, rows: 24 }, cwd))
+        .restore("gmux", |rec| {
+            Pane::spawn_in("cmd.exe", PtySize { cols: 80, rows: 24 }, rec.cwd.as_deref(), None)
+        })
         .expect("restore");
     assert_eq!(restored.pane_count(), 2, "restore must rebuild both panes");
     assert_eq!(restored.windows().len(), 1);
