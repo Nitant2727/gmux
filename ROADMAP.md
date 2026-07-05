@@ -168,9 +168,17 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
 
 ### M9 — Remote tmux (control-mode client)
 
-- `gmux ssh-tmux user@host`: spawn `ssh … tmux -CC attach`, parse control mode (%begin/%end, %output
-  octal-unescape, %layout-change, pause-based flow control), map session→session/window→window/pane→pane,
-  bidirectional (split/send-keys/paste); tmux ≥3.2 gate with degraded mode below.
+- **Stage 1 ✅ (2026-07-06): `gmux-tmux` parser crate** — sans-io control-mode parser (std-only):
+  `Parser::feed(bytes) -> Vec<Event>` with cross-feed line buffering; `%begin/%end/%error` reply
+  assembly correlated by command number (column-0-anchored guards; `%`-prefixed body lines stay in
+  the body, preserved as **raw bytes**); `%output` octal-unescape (`\ooo`, invalid escapes pass
+  through, non-UTF-8 survives); all notification variants + forward-compatible `Unknown`;
+  layout-string parser (recursive descent, 64-level depth cap — a remote-deliverable deep-nesting
+  stack overflow was caught by adversarial review pre-commit); 1 MiB unterminated-line cap
+  (bounded memory against a hostile peer). 43 tests + doc-test.
+- Stage 2: `gmux ssh-tmux user@host` — spawn `ssh … tmux -CC attach` (strip the DCS wrapper),
+  request queue over stdin, map session→session/window→window/pane→pane into the mux, bidirectional
+  (split/send-keys/paste), pause-based flow control; tmux ≥3.2 gate with degraded mode below.
 
 ### M10 — Keybindings & configuration polish
 
