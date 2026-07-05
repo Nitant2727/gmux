@@ -75,12 +75,16 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
   switch tab. Pane process exit collapses the split (job-object tree-kill from M1).
 - *Verified:* layout units + offscreen render + GUI launch smoke. *Next:* M4 (sidebar/workspaces).
 
-### M4 — Workspaces and the sidebar
+### M4 — Workspaces and the sidebar ✅ CORE COMPLETE (2026-07-05)
 
-- Vertical sidebar: per-workspace git branch, cwd (OSC 7/9;9 + PEB fallback), listening ports
-  (job-object PID → `GetExtendedTcpTable`), latest-notification text + unread badge; jump-to-unread.
-- `gmux set-status/set-progress/log` sidebar metadata (cmux parity).
-- *Demo:* three repos, three workspaces, live branch/port/notification state at a glance.
+- `gmux-mux` [workspace.rs](crates/gmux-mux/src/workspace.rs): `git_branch` (reads `.git/HEAD`, handles
+  refs + detached + worktree `.git` files, no deps), `cwd_name`, `WorkspaceInfo`; `Window::workspace_info()`
+  aggregates active-pane cwd → branch + any-pane attention. 4 tests.
+- `gmux-gui` vertical sidebar (`Renderer::render_frame` + `build_sidebar` + `text_run`): a left column of
+  one row per window (tab) showing name, `git:<branch>`, an attention dot, and active-row highlight; panes
+  render into the remaining content area.
+- Deferred: listening ports (job-object PID → `GetExtendedTcpTable`), `gmux set-status/log` sidebar
+  metadata, jump-to-unread. *Next:* M5 (named-pipe API + full CLI).
 
 ### M5 — Programmability: the pipe API and CLI
 
