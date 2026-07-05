@@ -587,6 +587,9 @@ impl State {
                 self.window.request_redraw();
                 Response::ok(id, ResultBody::Done)
             }
+            // Rendering/control methods are served by the daemon (M6 stage 2); the in-GUI mux
+            // server does not implement them.
+            _ => Response::err(id, "method served only by the gmux daemon"),
         }
     }
 

@@ -41,6 +41,22 @@ pub enum Call {
     NewWindow { #[serde(default)] command: Option<String> },
     /// Raise a notification (as if the target pane emitted OSC 777).
     Notify { #[serde(default)] pane: Option<u64>, title: String, #[serde(default)] body: String },
+
+    // --- rendering / control (used by the thin-client GUI, M6 stage 2) ---
+    /// Get the active window's pane rectangles + tab list for a content area of `w`×`h` pixels.
+    GetLayout { w: u32, h: u32 },
+    /// Get a pane's visible grid for rendering.
+    GetGrid { pane: u64 },
+    /// Report the GUI's content-area geometry so the daemon resizes the active window's panes.
+    ResizeView { w: u32, h: u32, cell_w: u32, cell_h: u32 },
+    /// Move focus between panes: `dir` is "left" | "right" | "up" | "down".
+    FocusPane { dir: String },
+    /// Close the active pane.
+    ClosePane,
+    /// Toggle zoom on the active pane.
+    ToggleZoom,
+    /// Switch tabs: `next` true = next window, false = previous.
+    SwitchWindow { next: bool },
 }
 
 /// A response envelope: exactly one of `result` / `error` is set.
@@ -70,7 +86,63 @@ pub enum ResultBody {
     Panes(Vec<PaneInfo>),
     Text(String),
     PaneId(u64),
+    Layout(LayoutWire),
+    Grid(GridWire),
     Done,
+}
+
+/// A cell on the wire (compact; `flags` bit0 bold, bit1 italic, bit2 underline, bit3 inverse).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CellWire {
+    pub ch: char,
+    pub fg: [u8; 3],
+    pub bg: [u8; 3],
+    pub flags: u8,
+}
+
+pub const CELL_BOLD: u8 = 1;
+pub const CELL_ITALIC: u8 = 2;
+pub const CELL_UNDERLINE: u8 = 4;
+pub const CELL_INVERSE: u8 = 8;
+
+/// A pane's visible grid for rendering (row-major `cells`, length `cols * rows`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GridWire {
+    pub cols: u16,
+    pub rows: u16,
+    pub cursor_col: u16,
+    pub cursor_row: u16,
+    pub cells: Vec<CellWire>,
+}
+
+/// One pane's rectangle within the content area.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaneRectWire {
+    pub id: u64,
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+    pub active: bool,
+    pub attention: bool,
+}
+
+/// One sidebar tab (window).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TabWire {
+    pub index: usize,
+    pub name: String,
+    pub branch: Option<String>,
+    pub attention: bool,
+    pub active: bool,
+}
+
+/// The active window's layout + the tab list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LayoutWire {
+    pub active_pane: u64,
+    pub tabs: Vec<TabWire>,
+    pub panes: Vec<PaneRectWire>,
 }
 
 /// One pane's metadata (for `list-panes`).
@@ -173,6 +245,41 @@ mod tests {
         let big = vec![b'x'; MAX_LINE + 10];
         let mut cur = Cursor::new(big);
         assert!(read_msg::<Request>(&mut cur).is_err());
+    }
+
+    #[test]
+    fn render_methods_and_results_roundtrip() {
+        for call in [
+            Call::GetLayout { w: 800, h: 600 },
+            Call::GetGrid { pane: 3 },
+            Call::ResizeView { w: 800, h: 600, cell_w: 9, cell_h: 18 },
+            Call::FocusPane { dir: "right".into() },
+            Call::ClosePane,
+            Call::ToggleZoom,
+            Call::SwitchWindow { next: true },
+        ] {
+            let req = Request { id: 1, call };
+            let mut buf = Vec::new();
+            write_msg(&mut buf, &req).unwrap();
+            let back: Request = read_msg(&mut Cursor::new(buf)).unwrap().unwrap();
+            assert_eq!(back, req);
+        }
+
+        let grid = ResultBody::Grid(GridWire {
+            cols: 2,
+            rows: 1,
+            cursor_col: 0,
+            cursor_row: 0,
+            cells: vec![
+                CellWire { ch: 'h', fg: [255, 255, 255], bg: [0, 0, 0], flags: CELL_BOLD },
+                CellWire { ch: 'i', fg: [10, 20, 30], bg: [1, 2, 3], flags: 0 },
+            ],
+        });
+        let resp = Response::ok(2, grid.clone());
+        let mut buf = Vec::new();
+        write_msg(&mut buf, &resp).unwrap();
+        let back: Response = read_msg(&mut Cursor::new(buf)).unwrap().unwrap();
+        assert_eq!(back.result, Some(grid));
     }
 
     #[test]

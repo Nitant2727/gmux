@@ -8,9 +8,12 @@
 use std::io::{self, BufReader};
 use std::sync::{Arc, Mutex};
 
-use gmux_mux::{Pane, PaneId, PtySize, Session, SplitDir};
+use gmux_mux::{FocusDir, Pane, PaneId, PtySize, Session, SplitDir};
 use gmux_pipe::{PipeServer, PipeStream};
-use gmux_proto::{read_msg, write_msg, Call, PaneInfo, Request, Response, ResultBody};
+use gmux_proto::{
+    read_msg, write_msg, Call, CellWire, GridWire, LayoutWire, PaneInfo, PaneRectWire, Request,
+    Response, ResultBody, TabWire, CELL_BOLD, CELL_INVERSE, CELL_ITALIC, CELL_UNDERLINE,
+};
 
 const DEFAULT_SIZE: PtySize = PtySize { cols: 120, rows: 30 };
 
@@ -18,13 +21,15 @@ const DEFAULT_SIZE: PtySize = PtySize { cols: 120, rows: 30 };
 pub struct Server {
     pub session: Session,
     pub shell: String,
+    /// Last content-area geometry reported by a client (for focus-movement math).
+    last_view: (u32, u32),
 }
 
 impl Server {
     /// Create a server whose session's first window runs `shell`.
     pub fn new(shell: String) -> io::Result<Server> {
         let pane = Pane::spawn(&shell, DEFAULT_SIZE)?;
-        Ok(Server { session: Session::start("gmux", pane), shell })
+        Ok(Server { session: Session::start("gmux", pane), shell, last_view: (1200, 720) })
     }
 
     fn spawn_pane(&self, command: &Option<String>) -> io::Result<Pane> {
@@ -103,7 +108,108 @@ impl Server {
                     None => Response::err(id, "no target pane"),
                 }
             }
+
+            Call::GetLayout { w, h } => {
+                self.last_view = (*w, *h);
+                Response::ok(id, ResultBody::Layout(self.layout(*w, *h)))
+            }
+            Call::GetGrid { pane } => match self.find(*pane) {
+                Some(p) => Response::ok(id, ResultBody::Grid(grid_wire(p))),
+                None => Response::err(id, format!("no pane %{pane}")),
+            },
+            Call::ResizeView { w, h, cell_w, cell_h } => {
+                self.last_view = (*w, *h);
+                let (cw, ch) = ((*cell_w).max(1), (*cell_h).max(1));
+                if let Some(win) = self.session.active_window() {
+                    for (pid, rect) in win.layout_rects(*w, *h) {
+                        if let Some(p) = win.pane(pid) {
+                            let cols = (rect.w / cw).max(1) as u16;
+                            let rows = (rect.h / ch).max(1) as u16;
+                            let _ = p.resize(PtySize { cols, rows });
+                        }
+                    }
+                }
+                Response::ok(id, ResultBody::Done)
+            }
+            Call::FocusPane { dir } => {
+                let d = match dir.as_str() {
+                    "left" => FocusDir::Left,
+                    "right" => FocusDir::Right,
+                    "up" => FocusDir::Up,
+                    "down" => FocusDir::Down,
+                    other => return Response::err(id, format!("bad dir '{other}'")),
+                };
+                let (w, h) = self.last_view;
+                if let Some(win) = self.session.active_window_mut() {
+                    win.focus_dir(d, w, h);
+                }
+                Response::ok(id, ResultBody::Done)
+            }
+            Call::ClosePane => {
+                let closed = self.session.active_window_mut().and_then(|w| w.close_active());
+                if closed.is_none() {
+                    self.session.close_active_window();
+                }
+                Response::ok(id, ResultBody::Done)
+            }
+            Call::ToggleZoom => {
+                if let Some(w) = self.session.active_window_mut() {
+                    w.toggle_zoom();
+                }
+                Response::ok(id, ResultBody::Done)
+            }
+            Call::SwitchWindow { next } => {
+                if *next {
+                    self.session.next_window();
+                } else {
+                    self.session.prev_window();
+                }
+                Response::ok(id, ResultBody::Done)
+            }
         }
+    }
+
+    fn layout(&self, w: u32, h: u32) -> LayoutWire {
+        let active_idx = self.session.active_index();
+        let tabs = self
+            .session
+            .windows()
+            .iter()
+            .enumerate()
+            .map(|(i, win)| {
+                let info = win.workspace_info();
+                TabWire {
+                    index: i,
+                    name: info.name,
+                    branch: info.branch,
+                    attention: info.attention,
+                    active: i == active_idx,
+                }
+            })
+            .collect();
+        let (active_pane, panes) = match self.session.active_window() {
+            Some(win) => {
+                let active = win.active_id();
+                let rects = win
+                    .layout_rects(w, h)
+                    .into_iter()
+                    .filter_map(|(pid, r)| {
+                        win.pane(pid).map(|p| PaneRectWire {
+                            id: pid.0,
+                            x: r.x,
+                            y: r.y,
+                            w: r.w,
+                            h: r.h,
+                            active: pid == active,
+                            attention: p.attention().is_pending(),
+                        })
+                    })
+                    .collect();
+                (active.0, rects)
+            }
+            None => (0, Vec::new()),
+        };
+        LayoutWire { active_pane, tabs, panes }
     }
 
     fn list_panes(&self) -> Vec<PaneInfo> {
@@ -133,6 +239,41 @@ impl Server {
     pub fn all_exited(&self) -> bool {
         self.session.pane_count() == 0
             || self.session.windows().iter().all(|w| w.panes().all(|p| !p.is_alive()))
+    }
+}
+
+fn grid_wire(p: &Pane) -> GridWire {
+    let snap = p.snapshot();
+    let mut cells = Vec::with_capacity(snap.cols as usize * snap.rows as usize);
+    for row in &snap.cells {
+        for c in row {
+            let mut flags = 0u8;
+            if c.bold {
+                flags |= CELL_BOLD;
+            }
+            if c.italic {
+                flags |= CELL_ITALIC;
+            }
+            if c.underline {
+                flags |= CELL_UNDERLINE;
+            }
+            if c.inverse {
+                flags |= CELL_INVERSE;
+            }
+            cells.push(CellWire {
+                ch: c.ch,
+                fg: [c.fg.r, c.fg.g, c.fg.b],
+                bg: [c.bg.r, c.bg.g, c.bg.b],
+                flags,
+            });
+        }
+    }
+    GridWire {
+        cols: snap.cols,
+        rows: snap.rows,
+        cursor_col: snap.cursor.0,
+        cursor_row: snap.cursor.1,
+        cells,
     }
 }
 

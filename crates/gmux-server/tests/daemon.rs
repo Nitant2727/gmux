@@ -37,6 +37,26 @@ fn server_owns_pane_and_serves_protocol() {
     assert_ne!(new_pane, pane);
     assert_eq!(count_panes(&mut s), 2);
 
+    // GetLayout returns both pane rects (side by side) + one tab.
+    let layout = match s.handle(&Request { id: 10, call: Call::GetLayout { w: 1000, h: 400 } }).result {
+        Some(ResultBody::Layout(l)) => l,
+        other => panic!("expected layout, got {other:?}"),
+    };
+    assert_eq!(layout.panes.len(), 2, "split should yield two rects");
+    assert_eq!(layout.tabs.len(), 1);
+    assert!(layout.panes.iter().any(|r| r.active), "one pane must be active");
+
+    // GetGrid returns a full grid for a pane.
+    let grid = match s.handle(&Request { id: 11, call: Call::GetGrid { pane } }).result {
+        Some(ResultBody::Grid(g)) => g,
+        other => panic!("expected grid, got {other:?}"),
+    };
+    assert_eq!(grid.cells.len(), grid.cols as usize * grid.rows as usize, "grid cell count");
+
+    // ResizeView + FocusPane are accepted.
+    assert!(s.handle(&Request { id: 12, call: Call::ResizeView { w: 800, h: 400, cell_w: 9, cell_h: 18 } }).error.is_none());
+    assert!(s.handle(&Request { id: 13, call: Call::FocusPane { dir: "right".into() } }).error.is_none());
+
     // send-keys into the original pane, then capture its screen.
     std::thread::sleep(Duration::from_millis(400));
     let sk = s.handle(&Request {
