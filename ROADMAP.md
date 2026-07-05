@@ -62,11 +62,18 @@ attention→`Pending` path already proven; productize the WinRT toast from the M
 Deferred: OSC 133 idle→attention (BEL covered); overlay-icon count badge (flash+progress done); multi-pane
 toast attribution refinements land with M3 splits. *Next:* M3 (splits).
 
-### M3 — Splits and multiplexing UI
+### M3 — Splits and multiplexing UI ✅ COMPLETE (2026-07-05)
 
-- Binary split tree: horizontal/vertical splits, keyboard-driven focus movement + resize, zoom,
-  close-with-tree-kill (job objects). Multiple windows (tabs).
-- *Demo:* 2×2 grid of agents, keyboard-only navigation. *Tests:* layout-tree units, input routing.
+- `gmux-mux` binary split tree ([layout.rs](crates/gmux-mux/src/layout.rs)): split/collapse, spatial
+  focus (`neighbor`), ratio resize, zoom, windows (tabs) — 11 unit tests. `Window` = pane HashMap +
+  split-tree `Node` + active + zoom; `Session` = windows + tabs; `remove_pane` collapses on exit.
+- `gmux-gui` multi-pane rendering: `Renderer::render_panes` draws each pane into its viewport in one
+  pass, with an active-pane border + per-pane attention ring. App holds a `Session`; input routes to the
+  active pane; panes resize to their rects.
+- Keybindings: **Ctrl+Shift+D/E** split side-by-side / stacked, **Alt+Arrows** focus, **Ctrl+Shift+Arrows**
+  resize, **Ctrl+Shift+Z** zoom, **Ctrl+Shift+W** close pane, **Ctrl+Shift+T** new tab, **Ctrl+Shift+N/P**
+  switch tab. Pane process exit collapses the split (job-object tree-kill from M1).
+- *Verified:* layout units + offscreen render + GUI launch smoke. *Next:* M4 (sidebar/workspaces).
 
 ### M4 — Workspaces and the sidebar
 
