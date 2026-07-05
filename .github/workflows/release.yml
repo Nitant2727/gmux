@@ -1,0 +1,46 @@
+# gmux release — portable zips for x64 + ARM64 on version tags (M8).
+#
+# Code signing is intentionally not wired yet (needs a cert in repo secrets); when available,
+# add a signtool step between build and package. Until then the zips ship unsigned.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: package (${{ matrix.label }})
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            label: x64
+          - target: aarch64-pc-windows-msvc
+            label: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.label }}
+      - name: Build gmux (release)
+        run: cargo build --release --locked -p gmux --target ${{ matrix.target }}
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          $stage = "gmux-${{ github.ref_name }}-windows-${{ matrix.label }}"
+          New-Item -ItemType Directory $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/gmux.exe" $stage/
+          Copy-Item README.md $stage/
+          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: gmux-*.zip
