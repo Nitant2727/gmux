@@ -118,13 +118,17 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
 - Deferred to M8: reconnect-on-daemon-restart, grid diffing/binary side-channel (currently full-grid JSON
   poll at 30 fps), custom shell hand-off to the daemon. *Next:* M7 (session restore across reboot).
 
-### M7 — Session restore across reboot
+### M7 — Session restore across reboot 🔶 STAGE A COMPLETE (2026-07-05)
 
-- Debounced checkpoints (layout + cwd + spawn info + zstd VT scrollback snapshots + attention state);
-  restore-on-launch with inert-history replay + divider; per-agent resume commands behind approval UI;
-  secret scrubbing.
-- *Demo:* reboot the machine; relaunch gmux; every workspace/pane/cwd/scrollback is back, agents offer
-  to resume. *Tests:* checkpoint→restore round-trip equality; snapshot-corruption tolerance.
+- **Stage A ✅ (layout + cwd)** — `gmux-mux/persist.rs`: `SessionSnapshot` serializes the window/split-tree
+  layout + per-pane cwd (serde); `capture`/`restore` (respawns a **shell** per pane in its saved cwd — never
+  auto-reruns agents). `gmux-pty`/`gmux-mux` gained `spawn_full`/`spawn_in` (cwd). Daemon
+  (`gmux-server`) debounce-saves to `%LOCALAPPDATA%\gmux\state\session.json` every ~2 s + clears it on clean
+  exit; `restore_or_new` rebuilds on start. **Verified:** persist roundtrip unit tests + restore integration
+  test + **live reboot simulation** (kill daemon abruptly → new daemon restored both panes).
+- **Stage B (next)** — scrollback/screen replay: capture each pane's VT-encoded screen in the snapshot and
+  replay it as inert history under a `[Restored …]` divider on respawn; secret scrubbing of env; optional
+  per-agent resume behind approval. *Next:* M7b, then M8 hardening.
 
 ### M8 — MVP hardening and release
 
