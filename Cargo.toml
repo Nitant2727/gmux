@@ -1,0 +1,14 @@
+# gmux Cargo workspace. Spikes under spikes/ are separate throwaway workspaces (excluded).
+[workspace]
+resolver = "2"
+members = ["crates/gmux-pty", "crates/gmux-vt"]
+exclude = ["spikes"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.91"
+
+[profile.dev]
+# ConPTY/VT work is I/O bound; keep dev builds fast.
+opt-level = 0
