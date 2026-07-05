@@ -146,10 +146,13 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
 - **CI ✅ (2026-07-05):** GitHub Actions — x64 build+test, ARM64 cross-build (`.github/workflows/ci.yml`);
   portable-zip release job on `v*` tags (`release.yml`, signing deferred until a cert exists). ARM64
   verified locally to compile crate-by-crate; final link needs the MSVC ARM64 tools (present on runners).
-- **Known bug (pre-existing, fix in flight):** `snapshot_capture_and_restore_rebuilds_layout` deadlocks in
-  ConPTY teardown under a real console — reproduced at HEAD~1, so it predates the scrollback work.
-- Remaining: code signing, installer, first-run experience (shell-integration snippets, `hooks setup`
-  prompt), docs site, crash reporting (opt-in, local dumps).
+- **ConPTY teardown deadlock ✅ FIXED (2026-07-05):** `Pty::drop` now terminates the child job *before*
+  `ClosePseudoConsole` — on Win11 26100+ the close returns immediately without disconnecting a live
+  client, the ConPTY host holds the output pipe open, the reader never EOFs, and the old `join()`
+  blocked forever (the job-close kill sat *after* the join). Pre-existing since M7; all three console
+  suites (`gmux-pty/spawn`, `gmux-mux/pane`, `gmux-server/daemon`) now exit 0.
+- Remaining: first-run experience (shell-integration snippets, `hooks setup` prompt), crash reporting
+  (opt-in, local dumps), installer, code signing (blocked on a cert), docs site.
 - **MVP definition of done:** a developer on Windows 11 runs three parallel Claude Code sessions in three
   workspaces with splits, gets a toast + pane ring the moment any agent needs input, scripts
   send-keys/capture-pane over the pipe from an external tool, detaches and reattaches, and has everything
