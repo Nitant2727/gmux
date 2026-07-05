@@ -8,11 +8,11 @@
 use std::io::{self, BufReader};
 use std::sync::{Arc, Mutex};
 
-use gmux_mux::{FocusDir, Pane, PaneId, PtySize, Session, SplitDir};
+use gmux_mux::{FocusDir, Pane, PaneEvent, PaneId, PtySize, Session, SplitDir, Urgency};
 use gmux_pipe::{PipeServer, PipeStream};
 use gmux_proto::{
-    read_msg, write_msg, Call, CellWire, GridWire, LayoutWire, PaneInfo, PaneRectWire, Request,
-    Response, ResultBody, TabWire, CELL_BOLD, CELL_INVERSE, CELL_ITALIC, CELL_UNDERLINE,
+    read_msg, write_msg, Call, CellWire, GridWire, LayoutWire, NotifyWire, PaneInfo, PaneRectWire,
+    Request, Response, ResultBody, TabWire, CELL_BOLD, CELL_INVERSE, CELL_ITALIC, CELL_UNDERLINE,
 };
 
 const DEFAULT_SIZE: PtySize = PtySize { cols: 120, rows: 30 };
@@ -23,13 +23,51 @@ pub struct Server {
     pub shell: String,
     /// Last content-area geometry reported by a client (for focus-movement math).
     last_view: (u32, u32),
+    /// Notifications raised by panes, drained by `PollNotifications`.
+    notifications: Vec<NotifyWire>,
 }
 
 impl Server {
     /// Create a server whose session's first window runs `shell`.
     pub fn new(shell: String) -> io::Result<Server> {
         let pane = Pane::spawn(&shell, DEFAULT_SIZE)?;
-        Ok(Server { session: Session::start("gmux", pane), shell, last_view: (1200, 720) })
+        Ok(Server {
+            session: Session::start("gmux", pane),
+            shell,
+            last_view: (1200, 720),
+            notifications: Vec::new(),
+        })
+    }
+
+    /// Drain every pane's events: queue notifications for `PollNotifications` and remove panes
+    /// whose process exited. Called periodically by the daemon loop.
+    pub fn tick(&mut self) {
+        let mut notes = Vec::new();
+        let mut exited = Vec::new();
+        for w in self.session.windows() {
+            for p in w.panes() {
+                for ev in p.drain_events() {
+                    match ev {
+                        PaneEvent::Notification(n) => notes.push(NotifyWire {
+                            pane: p.id.0,
+                            title: n.title,
+                            body: n.body,
+                            urgency: match n.urgency {
+                                Urgency::Low => 0,
+                                Urgency::Normal => 1,
+                                Urgency::Critical => 2,
+                            },
+                        }),
+                        PaneEvent::Exited => exited.push(p.id),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        self.notifications.extend(notes);
+        for id in exited {
+            self.session.remove_pane(id);
+        }
     }
 
     fn spawn_pane(&self, command: &Option<String>) -> io::Result<Pane> {
@@ -165,6 +203,9 @@ impl Server {
                     self.session.prev_window();
                 }
                 Response::ok(id, ResultBody::Done)
+            }
+            Call::PollNotifications => {
+                Response::ok(id, ResultBody::Notifications(std::mem::take(&mut self.notifications)))
             }
         }
     }
@@ -304,10 +345,17 @@ pub fn run(shell: String, pipe_base: &str) -> io::Result<()> {
     })?;
     eprintln!("gmux daemon: serving \\\\.\\pipe\\{name}");
 
-    // Block until every pane's process has exited.
+    // Drain pane events (notifications + exits) and stop once every pane has exited.
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        if server.lock().map(|s| s.all_exited()).unwrap_or(true) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let done = match server.lock() {
+            Ok(mut s) => {
+                s.tick();
+                s.all_exited()
+            }
+            Err(_) => true,
+        };
+        if done {
             eprintln!("gmux daemon: all panes exited, shutting down");
             return Ok(());
         }

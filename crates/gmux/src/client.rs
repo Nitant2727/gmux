@@ -49,7 +49,7 @@ fn print_result(body: &ResultBody) {
         ResultBody::Panes(panes) => print_panes(panes),
         ResultBody::Text(t) => println!("{t}"),
         ResultBody::PaneId(id) => println!("%{id}"),
-        ResultBody::Layout(_) | ResultBody::Grid(_) => {} // render data — not for the CLI
+        ResultBody::Layout(_) | ResultBody::Grid(_) | ResultBody::Notifications(_) => {} // not for the CLI
         ResultBody::Done => {}
     }
 }

@@ -1,39 +1,31 @@
-//! The windowed app: a winit window + wgpu surface rendering a session's active window (a split
-//! tree of panes). Keyboard input goes to the active pane; Ctrl+Shift / Alt chords drive splitting,
-//! focus movement, resize, zoom, and window (tab) management.
+//! The thin-client windowed app: a winit window + wgpu surface that renders the **daemon's** panes
+//! (fetched over the pipe each frame) and forwards input/control to the daemon. The daemon owns the
+//! panes, so closing this window detaches — the agents keep running — and relaunching reattaches.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gmux_mux::{
-    FocusDir, Notification, Pane, PaneEvent, PaneSnapshot, ProgressState, PtySize, Session,
-    SplitDir, Urgency,
-};
-use gmux_notify::{
-    flash_window, Notifier, ProgressState as NProgress, Taskbar, ToastRequest, Urgency as NUrgency,
-};
+use gmux_mux::{Attention, Cell, PaneSnapshot, Rect, Rgb};
+use gmux_notify::{flash_window, Notifier, ProgressState as NProgress, Taskbar, ToastRequest, Urgency as NUrgency};
+use gmux_proto::{Call, GridWire, LayoutWire, NotifyWire, ResultBody, CELL_BOLD, CELL_INVERSE, CELL_ITALIC, CELL_UNDERLINE};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::api::{self, ApiCommand};
+use crate::daemon_client::DaemonClient;
 use crate::renderer::{PaneView, SidebarRow};
 use crate::Renderer;
 
 const FONT_PX: f32 = 18.0;
 const TOAST_GROUP: &str = "gmux-session";
 const TOAST_MIN_INTERVAL: Duration = Duration::from_millis(1000);
-const RESIZE_STEP: f32 = 0.05;
+const FRAME: Duration = Duration::from_millis(33); // ~30 fps poll of remote grids
 
 pub struct App {
-    shell: String,
     mods: ModifiersState,
     state: Option<State>,
-    proxy: winit::event_loop::EventLoopProxy<()>,
-    cmd_tx: std::sync::mpsc::Sender<ApiCommand>,
-    cmd_rx: std::sync::mpsc::Receiver<ApiCommand>,
 }
 
 struct State {
@@ -41,28 +33,26 @@ struct State {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     renderer: Renderer,
-    session: Session,
+    client: DaemonClient,
+    active_pane: u64,
     focused: bool,
     hwnd: isize,
     notifier: Option<Notifier>,
     taskbar: Option<Taskbar>,
     last_toast: std::collections::HashMap<u64, Instant>,
-    /// Keeps the automation pipe server's accept loop alive.
-    _api_server: Option<gmux_pipe::PipeServer>,
 }
 
-/// Run the gmux GUI with the given shell command line. Blocks until the window closes.
-pub fn run(shell: String) -> Result<(), Box<dyn std::error::Error>> {
-    let event_loop = EventLoop::<()>::with_user_event().build()?;
+/// Run the gmux GUI. `_shell` is currently unused (the daemon picks its shell); kept for the CLI
+/// signature and a future `--daemon <shell>` hand-off.
+pub fn run(_shell: String) -> Result<(), Box<dyn std::error::Error>> {
+    let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    let proxy = event_loop.create_proxy();
-    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
-    let mut app = App { shell, mods: ModifiersState::empty(), state: None, proxy, cmd_tx, cmd_rx };
+    let mut app = App { mods: ModifiersState::empty(), state: None };
     event_loop.run_app(&mut app)?;
     Ok(())
 }
 
-impl ApplicationHandler<()> for App {
+impl ApplicationHandler for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
@@ -100,59 +90,37 @@ impl ApplicationHandler<()> for App {
         surface.configure(&device, &config);
 
         let renderer = Renderer::from_device(device, queue, format, FONT_PX);
-        let sidebar_w = renderer.sidebar_width().min(config.width / 3);
-        let content_w = config.width.saturating_sub(sidebar_w).max(1);
-        let cols = (content_w / renderer.cell_w()).max(1) as u16;
-        let rows = (config.height / renderer.cell_h()).max(1) as u16;
-        let pane = Pane::spawn(&self.shell, PtySize { cols, rows }).expect("spawn shell");
-        let session = Session::start("gmux", pane);
+
+        // Attach to (or start) the daemon.
+        let client = match DaemonClient::connect_or_spawn("gmux") {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("gmux: cannot reach the daemon: {e}");
+                el.exit();
+                return;
+            }
+        };
 
         let hwnd = window_hwnd(&window).unwrap_or(0);
         let notifier = Notifier::new("com.gmux.app", "gmux").ok();
         let taskbar = if hwnd != 0 { Taskbar::new(hwnd) } else { None };
 
-        // Start the automation pipe server (\\.\pipe\gmux.<user>).
-        let api_server = match api::start("gmux", self.proxy.clone(), self.cmd_tx.clone()) {
-            Ok((server, name)) => {
-                eprintln!("gmux: automation API on {name}");
-                Some(server)
-            }
-            Err(e) => {
-                eprintln!("gmux: automation API unavailable: {e}");
-                None
-            }
-        };
-
-        self.state = Some(State {
+        let mut st = State {
             window,
             surface,
             config,
             renderer,
-            session,
+            client,
+            active_pane: 0,
             focused: true,
             hwnd,
             notifier,
             taskbar,
             last_toast: std::collections::HashMap::new(),
-            _api_server: api_server,
-        });
-        el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16)));
-    }
-
-    fn user_event(&mut self, _el: &ActiveEventLoop, _ev: ()) {
-        // A pipe thread queued API commands; service them all now.
-        let shell = self.shell.clone();
-        while let Ok(cmd) = self.cmd_rx.try_recv() {
-            if let Some(st) = self.state.as_mut() {
-                let response = st.handle_api(&shell, &cmd.request);
-                let _ = cmd.reply.send(response);
-            } else {
-                let _ = cmd.reply.send(gmux_proto::Response::err(cmd.request.id, "gmux not ready"));
-            }
-        }
-        if let Some(st) = self.state.as_ref() {
-            st.window.request_redraw();
-        }
+        };
+        st.sync_size();
+        self.state = Some(st);
+        el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME));
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -163,7 +131,8 @@ impl ApplicationHandler<()> for App {
                 if let Some(st) = self.state.as_mut() {
                     st.focused = f;
                     if f {
-                        st.focus_active_pane();
+                        st.clear_active_toast();
+                        flash_window(st.hwnd, false);
                         st.window.request_redraw();
                     }
                 }
@@ -173,18 +142,16 @@ impl ApplicationHandler<()> for App {
                     st.config.width = sz.width.max(1);
                     st.config.height = sz.height.max(1);
                     st.surface.configure(&st.renderer.device, &st.config);
-                    st.resize_active_window();
+                    st.sync_size();
                     st.window.request_redraw();
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if !self.try_shortcut(&event) {
                     if let Some(bytes) = key_to_bytes(&event, self.mods) {
-                        if let Some(st) = self.state.as_ref() {
-                            if let Some(w) = st.session.active_window() {
-                                let _ = w.active_pane().write(&bytes);
-                                w.active_pane().focus();
-                            }
+                        if let Some(st) = self.state.as_mut() {
+                            let text = String::from_utf8_lossy(&bytes).into_owned();
+                            st.client.control(Call::SendKeys { pane: st.active_pane, text, enter: false });
                         }
                     }
                 }
@@ -201,59 +168,15 @@ impl ApplicationHandler<()> for App {
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let Some(st) = self.state.as_mut() else { return };
 
-        // Collect events across every pane (borrowing the session immutably).
-        let mut redraw = false;
-        let mut notes: Vec<(u64, Notification)> = Vec::new();
-        let mut bells: Vec<u64> = Vec::new();
-        let mut progress: Vec<(ProgressState, Option<u8>)> = Vec::new();
-        let mut exited: Vec<gmux_mux::PaneId> = Vec::new();
-        let mut title: Option<String> = None;
-        let active_pane_id = st.session.active_window().map(|w| w.active_id());
-        for w in st.session.windows() {
-            for p in w.panes() {
-                for ev in p.drain_events() {
-                    match ev {
-                        PaneEvent::Output => redraw = true,
-                        PaneEvent::Notification(n) => {
-                            redraw = true;
-                            notes.push((p.id.0, n));
-                        }
-                        PaneEvent::Bell => bells.push(p.id.0),
-                        PaneEvent::Progress { state, pct } => progress.push((state, pct)),
-                        PaneEvent::Title(t) => {
-                            if Some(p.id) == active_pane_id {
-                                title = Some(t);
-                            }
-                        }
-                        PaneEvent::Cwd(_) => {}
-                        PaneEvent::Exited => exited.push(p.id),
-                    }
+        // Drain daemon notifications and toast the ones that arrived while unfocused.
+        if let Ok(ResultBody::Notifications(notes)) = st.client.call(Call::PollNotifications) {
+            for n in notes {
+                if !st.focused {
+                    st.fire_toast(&n);
                 }
             }
-        }
-
-        // Process (session borrow released).
-        if let Some(t) = title {
-            st.window.set_title(&format!("gmux — {t}"));
-        }
-        for (pane_id, n) in notes {
-            if !st.focused {
-                st.fire_toast(pane_id, &n);
-            }
-        }
-        if !bells.is_empty() && !st.focused {
-            flash_window(st.hwnd, true);
-        }
-        for (state, pct) in progress {
-            if let Some(tb) = &st.taskbar {
-                tb.set_progress(map_progress(state), pct);
-            }
-        }
-        for id in exited {
-            st.session.remove_pane(id);
-            redraw = true;
-        }
-        if st.session.pane_count() == 0 {
+        } else {
+            // Daemon gone: nothing left to render.
             el.exit();
             return;
         }
@@ -261,65 +184,57 @@ impl ApplicationHandler<()> for App {
         if let Some(nf) = &st.notifier {
             if !nf.poll_activations().is_empty() {
                 st.window.focus_window();
-                st.focus_active_pane();
-                redraw = true;
+                st.clear_active_toast();
+                flash_window(st.hwnd, false);
             }
         }
 
-        if redraw {
-            st.window.request_redraw();
-        }
-        el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16)));
+        // Poll the daemon for fresh output by re-rendering.
+        st.window.request_redraw();
+        el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME));
     }
 }
 
 impl App {
-    /// Handle a gmux keyboard chord. Returns whether it was consumed (so it isn't sent to the pane).
+    /// Handle a gmux keyboard chord by forwarding a control call to the daemon.
     fn try_shortcut(&mut self, event: &KeyEvent) -> bool {
-        let shell = self.shell.clone();
         let mods = self.mods;
         let Some(st) = self.state.as_mut() else { return false };
 
-        // Alt+Arrow → move focus between panes.
         if mods.alt_key() && !mods.control_key() {
             if let Key::Named(named) = &event.logical_key {
                 let dir = match named {
-                    NamedKey::ArrowLeft => Some(FocusDir::Left),
-                    NamedKey::ArrowRight => Some(FocusDir::Right),
-                    NamedKey::ArrowUp => Some(FocusDir::Up),
-                    NamedKey::ArrowDown => Some(FocusDir::Down),
+                    NamedKey::ArrowLeft => Some("left"),
+                    NamedKey::ArrowRight => Some("right"),
+                    NamedKey::ArrowUp => Some("up"),
+                    NamedKey::ArrowDown => Some("down"),
                     _ => None,
                 };
                 if let Some(d) = dir {
-                    st.focus_dir(d);
+                    st.client.control(Call::FocusPane { dir: d.to_string() });
+                    st.window.request_redraw();
                     return true;
                 }
             }
         }
 
-        // Ctrl+Shift+... → pane / window management.
         if mods.control_key() && mods.shift_key() {
-            if let Key::Named(named) = &event.logical_key {
-                let delta = match named {
-                    NamedKey::ArrowLeft | NamedKey::ArrowUp => Some(-RESIZE_STEP),
-                    NamedKey::ArrowRight | NamedKey::ArrowDown => Some(RESIZE_STEP),
+            if let Key::Character(s) = &event.logical_key {
+                let control = match s.chars().next().map(|c| c.to_ascii_lowercase()) {
+                    Some('d') => Some(Call::SplitPane { dir: "h".into(), command: None }),
+                    Some('e') => Some(Call::SplitPane { dir: "v".into(), command: None }),
+                    Some('w') => Some(Call::ClosePane),
+                    Some('z') => Some(Call::ToggleZoom),
+                    Some('t') => Some(Call::NewWindow { command: None }),
+                    Some('n') => Some(Call::SwitchWindow { next: true }),
+                    Some('p') => Some(Call::SwitchWindow { next: false }),
                     _ => None,
                 };
-                if let Some(d) = delta {
-                    st.resize_ratio(d);
+                if let Some(call) = control {
+                    st.client.control(call);
+                    st.sync_size();
+                    st.window.request_redraw();
                     return true;
-                }
-            }
-            if let Key::Character(s) = &event.logical_key {
-                match s.chars().next().map(|c| c.to_ascii_lowercase()) {
-                    Some('d') => return st.action_split(&shell, SplitDir::Horizontal),
-                    Some('e') => return st.action_split(&shell, SplitDir::Vertical),
-                    Some('w') => return st.action_close_pane(),
-                    Some('z') => return st.action_zoom(),
-                    Some('t') => return st.action_new_window(&shell),
-                    Some('n') => return st.action_switch_window(true),
-                    Some('p') => return st.action_switch_window(false),
-                    _ => {}
                 }
             }
         }
@@ -332,269 +247,50 @@ impl State {
         (self.renderer.cell_w().max(1), self.renderer.cell_h().max(1))
     }
 
-    /// `(sidebar_w, content_w, height)` — the sidebar takes a fixed column (capped at 1/3 width).
     fn areas(&self) -> (u32, u32, u32) {
         let sidebar_w = self.renderer.sidebar_width().min(self.config.width / 3);
         let content_w = self.config.width.saturating_sub(sidebar_w).max(1);
         (sidebar_w, content_w, self.config.height)
     }
 
-    fn spawn_pane(&self, shell: &str) -> Option<Pane> {
+    /// Tell the daemon our content geometry so it resizes its panes.
+    fn sync_size(&mut self) {
+        let (_, content_w, h) = self.areas();
         let (cw, ch) = self.cell_dims();
-        let cols = (self.config.width / cw).max(1) as u16;
-        let rows = (self.config.height / ch).max(1) as u16;
-        Pane::spawn(shell, PtySize { cols, rows }).ok()
-    }
-
-    fn focus_active_pane(&self) {
-        if let Some(w) = self.session.active_window() {
-            w.active_pane().focus();
-        }
-        self.clear_active_toast();
-        flash_window(self.hwnd, false);
+        self.client.control(Call::ResizeView { w: content_w, h, cell_w: cw, cell_h: ch });
     }
 
     fn clear_active_toast(&self) {
-        if let (Some(nf), Some(w)) = (&self.notifier, self.session.active_window()) {
-            nf.clear(&format!("pane-{}", w.active_id().0), TOAST_GROUP);
+        if let Some(nf) = &self.notifier {
+            nf.clear(&format!("pane-{}", self.active_pane), TOAST_GROUP);
         }
     }
 
-    fn action_split(&mut self, shell: &str, dir: SplitDir) -> bool {
-        if let Some(pane) = self.spawn_pane(shell) {
-            if let Some(w) = self.session.active_window_mut() {
-                w.split(dir, pane);
-            }
-            self.resize_active_window();
-            self.window.request_redraw();
-        }
-        true
-    }
-
-    fn action_new_window(&mut self, shell: &str) -> bool {
-        if let Some(pane) = self.spawn_pane(shell) {
-            self.session.add_window(pane);
-            self.resize_active_window();
-            self.window.request_redraw();
-        }
-        true
-    }
-
-    fn action_close_pane(&mut self) -> bool {
-        let closed_pane = self.session.active_window_mut().and_then(|w| w.close_active());
-        if closed_pane.is_none() {
-            // Last pane in the window: close the window (if not the last one).
-            self.session.close_active_window();
-        }
-        self.resize_active_window();
-        self.window.request_redraw();
-        true
-    }
-
-    fn action_zoom(&mut self) -> bool {
-        if let Some(w) = self.session.active_window_mut() {
-            w.toggle_zoom();
-        }
-        self.resize_active_window();
-        self.window.request_redraw();
-        true
-    }
-
-    fn action_switch_window(&mut self, next: bool) -> bool {
-        if next {
-            self.session.next_window();
-        } else {
-            self.session.prev_window();
-        }
-        self.resize_active_window();
-        self.window.request_redraw();
-        true
-    }
-
-    fn focus_dir(&mut self, dir: FocusDir) {
-        let (_, content_w, h) = self.areas();
-        if let Some(win) = self.session.active_window_mut() {
-            win.focus_dir(dir, content_w, h);
-        }
-        self.window.request_redraw();
-    }
-
-    fn resize_ratio(&mut self, delta: f32) {
-        if let Some(win) = self.session.active_window_mut() {
-            win.resize_active(delta);
-        }
-        self.resize_active_window();
-        self.window.request_redraw();
-    }
-
-    /// Resize every pane of the active window to match its computed rectangle (content area).
-    fn resize_active_window(&self) {
-        let (cw, ch) = self.cell_dims();
-        let (_, content_w, h) = self.areas();
-        if let Some(w) = self.session.active_window() {
-            for (id, rect) in w.layout_rects(content_w, h) {
-                if let Some(p) = w.pane(id) {
-                    let cols = (rect.w / cw).max(1) as u16;
-                    let rows = (rect.h / ch).max(1) as u16;
-                    let _ = p.resize(PtySize { cols, rows });
-                }
-            }
-        }
-    }
-
-    fn fire_toast(&mut self, pane_id: u64, n: &Notification) {
+    fn fire_toast(&mut self, n: &NotifyWire) {
         let now = Instant::now();
-        if let Some(prev) = self.last_toast.get(&pane_id) {
+        if let Some(prev) = self.last_toast.get(&n.pane) {
             if now.duration_since(*prev) < TOAST_MIN_INTERVAL {
                 return;
             }
         }
-        self.last_toast.insert(pane_id, now);
+        self.last_toast.insert(n.pane, now);
         let title = if n.title.is_empty() { "gmux".to_string() } else { n.title.clone() };
         let req = ToastRequest {
-            tag: format!("pane-{pane_id}"),
+            tag: format!("pane-{}", n.pane),
             group: TOAST_GROUP.to_string(),
             title,
             body: n.body.clone(),
-            urgency: map_urgency(n.urgency),
-            launch_arg: format!("pane={pane_id}"),
+            urgency: match n.urgency {
+                0 => NUrgency::Low,
+                2 => NUrgency::Critical,
+                _ => NUrgency::Normal,
+            },
+            launch_arg: format!("pane={}", n.pane),
         };
         if let Some(nf) = &self.notifier {
             let _ = nf.show(&req);
         }
         flash_window(self.hwnd, true);
-    }
-
-    /// Execute one automation-API call against the mux state (main thread).
-    fn handle_api(&mut self, shell: &str, req: &gmux_proto::Request) -> gmux_proto::Response {
-        use gmux_proto::{Call, PaneInfo, Response, ResultBody};
-        let id = req.id;
-        match &req.call {
-            Call::Hello { .. } => Response::ok(
-                id,
-                ResultBody::Hello {
-                    server_version: env!("CARGO_PKG_VERSION").to_string(),
-                    protocol: gmux_proto::PROTOCOL_VERSION,
-                },
-            ),
-            Call::ListPanes => {
-                let active_win = self.session.active_index();
-                let mut panes = Vec::new();
-                for (wi, win) in self.session.windows().iter().enumerate() {
-                    let active_pane = win.active_id();
-                    for p in win.panes() {
-                        let snap = p.snapshot();
-                        panes.push(PaneInfo {
-                            id: p.id.0,
-                            window: wi,
-                            active: wi == active_win && p.id == active_pane,
-                            title: p.title(),
-                            cwd: p.cwd(),
-                            cols: snap.cols,
-                            rows: snap.rows,
-                            attention: p.attention().is_pending(),
-                        });
-                    }
-                }
-                panes.sort_by_key(|p| p.id);
-                Response::ok(id, ResultBody::Panes(panes))
-            }
-            Call::SendKeys { pane, text, enter } => match self.find_pane(*pane) {
-                Some(p) => {
-                    let mut bytes = text.as_bytes().to_vec();
-                    if *enter {
-                        bytes.push(b'\r');
-                    }
-                    match p.write(&bytes) {
-                        Ok(()) => Response::ok(id, ResultBody::Done),
-                        Err(e) => Response::err(id, format!("write failed: {e}")),
-                    }
-                }
-                None => Response::err(id, format!("no pane %{pane}")),
-            },
-            Call::CapturePane { pane } => match self.find_pane(*pane) {
-                Some(p) => {
-                    let snap = p.snapshot();
-                    let mut lines: Vec<String> = snap
-                        .cells
-                        .iter()
-                        .map(|row| {
-                            let mut s: String = row.iter().map(|c| c.ch).collect();
-                            s.truncate(s.trim_end_matches(' ').len());
-                            s
-                        })
-                        .collect();
-                    while lines.last().is_some_and(|l| l.is_empty()) {
-                        lines.pop();
-                    }
-                    Response::ok(id, ResultBody::Text(lines.join("\n")))
-                }
-                None => Response::err(id, format!("no pane %{pane}")),
-            },
-            Call::SplitPane { dir, command } => {
-                let sd = match dir.as_str() {
-                    "h" => SplitDir::Horizontal,
-                    "v" => SplitDir::Vertical,
-                    other => return Response::err(id, format!("bad dir '{other}' (h|v)")),
-                };
-                let cmd = command.clone().unwrap_or_else(|| shell.to_string());
-                match self.spawn_pane(&cmd) {
-                    Some(pane) => {
-                        let pid = pane.id.0;
-                        if let Some(w) = self.session.active_window_mut() {
-                            w.split(sd, pane);
-                        }
-                        self.resize_active_window();
-                        self.window.request_redraw();
-                        Response::ok(id, ResultBody::PaneId(pid))
-                    }
-                    None => Response::err(id, "failed to spawn pane"),
-                }
-            }
-            Call::NewWindow { command } => {
-                let cmd = command.clone().unwrap_or_else(|| shell.to_string());
-                match self.spawn_pane(&cmd) {
-                    Some(pane) => {
-                        let pid = pane.id.0;
-                        self.session.add_window(pane);
-                        self.resize_active_window();
-                        self.window.request_redraw();
-                        Response::ok(id, ResultBody::PaneId(pid))
-                    }
-                    None => Response::err(id, "failed to spawn pane"),
-                }
-            }
-            Call::Notify { pane, title, body } => {
-                let target = pane
-                    .or_else(|| self.session.active_window().map(|w| w.active_id().0));
-                let Some(target) = target else { return Response::err(id, "no target pane") };
-                if self.find_pane(target).is_none() {
-                    return Response::err(id, format!("no pane %{target}"));
-                }
-                if let Some(p) = self.find_pane(target) {
-                    p.request_attention();
-                }
-                let n = Notification {
-                    kind: gmux_mux::NotifyKind::Osc777,
-                    title: title.clone(),
-                    body: body.clone(),
-                    urgency: Urgency::Normal,
-                    id: None,
-                };
-                if !self.focused {
-                    self.fire_toast(target, &n);
-                }
-                self.window.request_redraw();
-                Response::ok(id, ResultBody::Done)
-            }
-            // Rendering/control methods are served by the daemon (M6 stage 2); the in-GUI mux
-            // server does not implement them.
-            _ => Response::err(id, "method served only by the gmux daemon"),
-        }
-    }
-
-    fn find_pane(&self, id: u64) -> Option<&Pane> {
-        self.session.pane(gmux_mux::PaneId(id))
     }
 
     fn render(&mut self) {
@@ -610,28 +306,30 @@ impl State {
         let (w, h) = (self.config.width, self.config.height);
         let (sidebar_w, content_w, _) = self.areas();
 
-        // Sidebar rows: one per window (tab), with git/cwd metadata + attention.
-        let active_idx = self.session.active_index();
-        let rows: Vec<SidebarRow> = self
-            .session
-            .windows()
+        let layout: LayoutWire = match self.client.call(Call::GetLayout { w: content_w, h }) {
+            Ok(ResultBody::Layout(l)) => l,
+            _ => return,
+        };
+        self.active_pane = layout.active_pane;
+        let rows: Vec<SidebarRow> = layout
+            .tabs
             .iter()
-            .enumerate()
-            .map(|(i, win)| {
-                let info = win.workspace_info();
-                SidebarRow { name: info.name, branch: info.branch, attention: info.attention, active: i == active_idx }
-            })
+            .map(|t| SidebarRow { name: t.name.clone(), branch: t.branch.clone(), attention: t.attention, active: t.active })
             .collect();
 
-        // Collect snapshots for the active window's panes (offset into the content area).
-        let mut snaps: Vec<(PaneSnapshot, gmux_mux::Attention, bool, gmux_mux::Rect)> = Vec::new();
-        if let Some(win) = self.session.active_window() {
-            let active = win.active_id();
-            for (id, mut rect) in win.layout_rects(content_w, h) {
-                rect.x += sidebar_w;
-                if let Some(p) = win.pane(id) {
-                    snaps.push((p.snapshot(), p.attention(), id == active, rect));
-                }
+        // Update the taskbar attention badge / progress based on overall attention.
+        if let Some(tb) = &self.taskbar {
+            let any = layout.panes.iter().any(|p| p.attention);
+            tb.set_progress(if any { NProgress::Paused } else { NProgress::None }, None);
+        }
+
+        let mut snaps: Vec<(PaneSnapshot, Attention, bool, Rect)> = Vec::new();
+        for pr in &layout.panes {
+            if let Ok(ResultBody::Grid(g)) = self.client.call(Call::GetGrid { pane: pr.id }) {
+                let snap = grid_to_snapshot(&g);
+                let att = if pr.attention { Attention::Pending } else { Attention::Quiet };
+                let rect = Rect { x: pr.x + sidebar_w, y: pr.y, w: pr.w, h: pr.h };
+                snaps.push((snap, att, pr.active, rect));
             }
         }
         let views: Vec<PaneView> = snaps
@@ -639,8 +337,43 @@ impl State {
             .map(|(s, a, active, rect)| PaneView { snap: s, attention: *a, active: *active, rect: *rect })
             .collect();
         self.renderer.render_frame(&view, &rows, sidebar_w, &views, w, h);
-        // `frame` presents on drop.
     }
+}
+
+/// Reconstruct a [`PaneSnapshot`] from a wire grid.
+fn grid_to_snapshot(g: &GridWire) -> PaneSnapshot {
+    let cols = g.cols as usize;
+    let rows = g.rows as usize;
+    let blank = Cell {
+        ch: ' ',
+        fg: Rgb { r: 0xcc, g: 0xcc, b: 0xcc },
+        bg: Rgb { r: 0x11, g: 0x11, b: 0x11 },
+        bold: false,
+        italic: false,
+        underline: false,
+        inverse: false,
+    };
+    let mut cells = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let mut row = Vec::with_capacity(cols);
+        for c in 0..cols {
+            let idx = r * cols + c;
+            row.push(match g.cells.get(idx) {
+                Some(cw) => Cell {
+                    ch: cw.ch,
+                    fg: Rgb { r: cw.fg[0], g: cw.fg[1], b: cw.fg[2] },
+                    bg: Rgb { r: cw.bg[0], g: cw.bg[1], b: cw.bg[2] },
+                    bold: cw.flags & CELL_BOLD != 0,
+                    italic: cw.flags & CELL_ITALIC != 0,
+                    underline: cw.flags & CELL_UNDERLINE != 0,
+                    inverse: cw.flags & CELL_INVERSE != 0,
+                },
+                None => blank,
+            });
+        }
+        cells.push(row);
+    }
+    PaneSnapshot { cells, cursor: (g.cursor_col, g.cursor_row), cols: g.cols, rows: g.rows }
 }
 
 fn window_hwnd(window: &Window) -> Option<isize> {
@@ -651,26 +384,7 @@ fn window_hwnd(window: &Window) -> Option<isize> {
     }
 }
 
-fn map_urgency(u: Urgency) -> NUrgency {
-    match u {
-        Urgency::Low => NUrgency::Low,
-        Urgency::Normal => NUrgency::Normal,
-        Urgency::Critical => NUrgency::Critical,
-    }
-}
-
-fn map_progress(s: ProgressState) -> NProgress {
-    match s {
-        ProgressState::Remove => NProgress::None,
-        ProgressState::Set => NProgress::Normal,
-        ProgressState::Error => NProgress::Error,
-        ProgressState::Indeterminate => NProgress::Indeterminate,
-        ProgressState::Paused => NProgress::Paused,
-    }
-}
-
-/// Translate a key press into the bytes to send to the PTY. Full win32-input-mode fidelity is a
-/// later milestone (ARCHITECTURE §5.3).
+/// Translate a key press into bytes for the PTY (full win32-input-mode fidelity comes later).
 fn key_to_bytes(event: &KeyEvent, mods: ModifiersState) -> Option<Vec<u8>> {
     use NamedKey::*;
     match &event.logical_key {
@@ -693,7 +407,7 @@ fn key_to_bytes(event: &KeyEvent, mods: ModifiersState) -> Option<Vec<u8>> {
             if mods.control_key() && !mods.shift_key() {
                 let c = s.chars().next()?.to_ascii_lowercase();
                 if c.is_ascii_lowercase() {
-                    return Some(vec![(c as u8 - b'a') + 1]); // Ctrl-A = 1 ...
+                    return Some(vec![(c as u8 - b'a') + 1]);
                 }
             }
             Some(s.as_bytes().to_vec())

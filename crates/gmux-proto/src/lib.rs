@@ -57,6 +57,8 @@ pub enum Call {
     ToggleZoom,
     /// Switch tabs: `next` true = next window, false = previous.
     SwitchWindow { next: bool },
+    /// Drain notifications raised since the last poll (for the GUI to toast).
+    PollNotifications,
 }
 
 /// A response envelope: exactly one of `result` / `error` is set.
@@ -88,7 +90,17 @@ pub enum ResultBody {
     PaneId(u64),
     Layout(LayoutWire),
     Grid(GridWire),
+    Notifications(Vec<NotifyWire>),
     Done,
+}
+
+/// A notification raised by a pane (for the GUI to toast). `urgency`: 0 low, 1 normal, 2 critical.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotifyWire {
+    pub pane: u64,
+    pub title: String,
+    pub body: String,
+    pub urgency: u8,
 }
 
 /// A cell on the wire (compact; `flags` bit0 bold, bit1 italic, bit2 underline, bit3 inverse).
