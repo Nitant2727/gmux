@@ -102,16 +102,21 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
 - Deferred: scrollback ranges + SGR in capture-pane, screenshot, wait-for, subscribe event stream,
   `#{}` formats, session verbs (attach/detach land with M6 daemon). *Next:* M6 (detach/daemon).
 
-### M6 — Detach/reattach: the daemon split 🔶 STAGE 1 COMPLETE (2026-07-05)
+### M6 — Detach/reattach: the daemon split ✅ COMPLETE (2026-07-05)
 
-- **Stage 1 ✅** — `gmux-server` crate: headless `Server { session, shell }` owns the mux + ConPTYs and
-  serves the protocol; `gmux --daemon` runs it (blocks until all panes exit). **Verified end-to-end:** the
-  daemon process owns a real pane and the CLI drives it (hello/list-panes/split/send-keys/capture) with no
-  GUI — console-gated integration test + live daemon+CLI smoke.
-- **Stage 2 (next)** — rewire the GUI as a thin client: add `GetLayout`/`GetGrid`/`resize` protocol
-  methods (grid streaming), make the GUI attach to the daemon (auto-spawn if absent) and render remote
-  state instead of owning a Mux; close GUI → daemon+agents keep running; reopen → reattach.
-- *Tests so far:* daemon serves protocol headlessly; job-object tree-kill from M1 covers child reaping.
+- **`gmux-server`** — headless `Server` owns the mux + ConPTYs; `gmux --daemon` runs it (drains pane
+  events each 100 ms via `tick`, removes exited panes, queues notifications; stops when all panes exit).
+- **Protocol** (`gmux-proto`): grid/layout streaming (`GetLayout`/`GetGrid`/`ResizeView`), pane control
+  (`FocusPane`/`ClosePane`/`ToggleZoom`/`SwitchWindow`), and `PollNotifications`; wire cell/grid/layout types.
+- **GUI is now a thin client** (`gmux-gui/app.rs` rewritten; old in-GUI pipe server deleted): on start it
+  attaches to (or spawns, via `CREATE_NO_WINDOW` so its ConPTYs bind) the daemon; each frame it fetches
+  `GetLayout` + `GetGrid` and renders remote grids, forwards input/control over the pipe, and toasts from
+  `PollNotifications`.
+- **✅ Detach/reattach verified live:** launch GUI → spawns daemon; `send-keys` a marker; **kill the GUI →
+  the daemon keeps serving and `capture-pane` still shows the marker** (pane + process survived); relaunch
+  GUI → reattaches. Job-object tree-kill (M1) reaps children; daemon outlives the GUI.
+- Deferred to M8: reconnect-on-daemon-restart, grid diffing/binary side-channel (currently full-grid JSON
+  poll at 30 fps), custom shell hand-off to the daemon. *Next:* M7 (session restore across reboot).
 
 ### M7 — Session restore across reboot
 
