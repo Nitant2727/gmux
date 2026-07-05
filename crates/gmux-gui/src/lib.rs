@@ -4,6 +4,7 @@
 //! texture and reads the pixels back (used for headless verification, since the agent harness has
 //! no display). The windowed app lives in [`app`].
 
+pub mod api;
 pub mod app;
 pub mod atlas;
 pub mod renderer;

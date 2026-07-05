@@ -70,6 +70,12 @@ to length-prefixed binary frames. CLI verbs mirror tmux (`send-keys -l`, `captur
 access modes incl. password and allowAll), gmux allows same-user external clients by design
 (orchestrators are a feature); mutual PID/path verification both directions.
 
+**Amended 2026-07-05 (M5):** framing is **newline-delimited JSON** (one request/response object per
+line, 1 MiB line cap) instead of LSP `Content-Length` headers — strictly simpler for the scripting
+clients the API exists for (cmux precedent), with the same bounded-frame guarantee. Pipe name is
+`gmux.<username>` for now (SID-hash suffix when the daemon lands in M6); DACL = SYSTEM + current-user
+SID only.
+
 ## D-006 · Toasts: classic inbox WinRT + registry AUMID; not Windows App SDK
 
 2026-07-05 · **Accepted** · **M0-verified** ([m0-spikes](docs/research/m0-spikes.md)): registry-only AUMID

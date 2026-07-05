@@ -11,5 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 gmux-gui = { path = "../gmux-gui" }
+gmux-pipe = { path = "../gmux-pipe" }
+gmux-proto = { path = "../gmux-proto" }
 serde_json = "1"
 toml_edit = "0.22"

@@ -9,6 +9,7 @@
 //!
 //! Role dispatch (`--daemon` / more subcommands) grows with later milestones (ARCHITECTURE §3).
 
+mod client;
 mod hooks;
 
 use std::io::{Read, Write};
@@ -21,8 +22,14 @@ fn main() {
         Some("hooks") => cmd_hooks(&args[1..]),
         Some("_hook") => internal_hook(&args[1..]),
         Some("--help" | "-h" | "help") => print_help(),
-        // Anything else is treated as a command line to run in the GUI.
-        Some(_) => launch_gui(args.join(" ")),
+        Some(sub) => {
+            // API subcommands talk to the running gmux over the pipe.
+            if let Some(code) = client::dispatch(sub, &args[1..]) {
+                std::process::exit(code);
+            }
+            // Anything else is treated as a command line to run in the GUI.
+            launch_gui(args.join(" "))
+        }
     }
 }
 

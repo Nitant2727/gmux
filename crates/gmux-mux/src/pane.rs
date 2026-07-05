@@ -164,6 +164,12 @@ impl Pane {
         self.attention.lock().unwrap().focus();
     }
 
+    /// Externally request attention on this pane (e.g. the `notify` API method — equivalent to the
+    /// pane emitting a notification itself).
+    pub fn request_attention(&self) {
+        self.attention.lock().unwrap().set_pending();
+    }
+
     pub fn title(&self) -> String {
         self.title.lock().unwrap().clone()
     }

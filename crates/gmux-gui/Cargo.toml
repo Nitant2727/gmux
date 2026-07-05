@@ -8,6 +8,8 @@ publish = false
 [dependencies]
 gmux-mux = { path = "../gmux-mux" }
 gmux-notify = { path = "../gmux-notify" }
+gmux-pipe = { path = "../gmux-pipe" }
+gmux-proto = { path = "../gmux-proto" }
 wgpu = "30"
 winit = "0.30"
 pollster = "0.4"

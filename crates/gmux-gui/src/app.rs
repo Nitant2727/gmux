@@ -18,6 +18,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
+use crate::api::{self, ApiCommand};
 use crate::renderer::{PaneView, SidebarRow};
 use crate::Renderer;
 
@@ -30,6 +31,9 @@ pub struct App {
     shell: String,
     mods: ModifiersState,
     state: Option<State>,
+    proxy: winit::event_loop::EventLoopProxy<()>,
+    cmd_tx: std::sync::mpsc::Sender<ApiCommand>,
+    cmd_rx: std::sync::mpsc::Receiver<ApiCommand>,
 }
 
 struct State {
@@ -43,24 +47,22 @@ struct State {
     notifier: Option<Notifier>,
     taskbar: Option<Taskbar>,
     last_toast: std::collections::HashMap<u64, Instant>,
-}
-
-impl App {
-    pub fn new(shell: String) -> Self {
-        App { shell, mods: ModifiersState::empty(), state: None }
-    }
+    /// Keeps the automation pipe server's accept loop alive.
+    _api_server: Option<gmux_pipe::PipeServer>,
 }
 
 /// Run the gmux GUI with the given shell command line. Blocks until the window closes.
 pub fn run(shell: String) -> Result<(), Box<dyn std::error::Error>> {
-    let event_loop = EventLoop::new()?;
+    let event_loop = EventLoop::<()>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App::new(shell);
+    let proxy = event_loop.create_proxy();
+    let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+    let mut app = App { shell, mods: ModifiersState::empty(), state: None, proxy, cmd_tx, cmd_rx };
     event_loop.run_app(&mut app)?;
     Ok(())
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<()> for App {
     fn resumed(&mut self, el: &ActiveEventLoop) {
         if self.state.is_some() {
             return;
@@ -109,6 +111,18 @@ impl ApplicationHandler for App {
         let notifier = Notifier::new("com.gmux.app", "gmux").ok();
         let taskbar = if hwnd != 0 { Taskbar::new(hwnd) } else { None };
 
+        // Start the automation pipe server (\\.\pipe\gmux.<user>).
+        let api_server = match api::start("gmux", self.proxy.clone(), self.cmd_tx.clone()) {
+            Ok((server, name)) => {
+                eprintln!("gmux: automation API on {name}");
+                Some(server)
+            }
+            Err(e) => {
+                eprintln!("gmux: automation API unavailable: {e}");
+                None
+            }
+        };
+
         self.state = Some(State {
             window,
             surface,
@@ -120,8 +134,25 @@ impl ApplicationHandler for App {
             notifier,
             taskbar,
             last_toast: std::collections::HashMap::new(),
+            _api_server: api_server,
         });
         el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16)));
+    }
+
+    fn user_event(&mut self, _el: &ActiveEventLoop, _ev: ()) {
+        // A pipe thread queued API commands; service them all now.
+        let shell = self.shell.clone();
+        while let Ok(cmd) = self.cmd_rx.try_recv() {
+            if let Some(st) = self.state.as_mut() {
+                let response = st.handle_api(&shell, &cmd.request);
+                let _ = cmd.reply.send(response);
+            } else {
+                let _ = cmd.reply.send(gmux_proto::Response::err(cmd.request.id, "gmux not ready"));
+            }
+        }
+        if let Some(st) = self.state.as_ref() {
+            st.window.request_redraw();
+        }
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -432,6 +463,135 @@ impl State {
             let _ = nf.show(&req);
         }
         flash_window(self.hwnd, true);
+    }
+
+    /// Execute one automation-API call against the mux state (main thread).
+    fn handle_api(&mut self, shell: &str, req: &gmux_proto::Request) -> gmux_proto::Response {
+        use gmux_proto::{Call, PaneInfo, Response, ResultBody};
+        let id = req.id;
+        match &req.call {
+            Call::Hello { .. } => Response::ok(
+                id,
+                ResultBody::Hello {
+                    server_version: env!("CARGO_PKG_VERSION").to_string(),
+                    protocol: gmux_proto::PROTOCOL_VERSION,
+                },
+            ),
+            Call::ListPanes => {
+                let active_win = self.session.active_index();
+                let mut panes = Vec::new();
+                for (wi, win) in self.session.windows().iter().enumerate() {
+                    let active_pane = win.active_id();
+                    for p in win.panes() {
+                        let snap = p.snapshot();
+                        panes.push(PaneInfo {
+                            id: p.id.0,
+                            window: wi,
+                            active: wi == active_win && p.id == active_pane,
+                            title: p.title(),
+                            cwd: p.cwd(),
+                            cols: snap.cols,
+                            rows: snap.rows,
+                            attention: p.attention().is_pending(),
+                        });
+                    }
+                }
+                panes.sort_by_key(|p| p.id);
+                Response::ok(id, ResultBody::Panes(panes))
+            }
+            Call::SendKeys { pane, text, enter } => match self.find_pane(*pane) {
+                Some(p) => {
+                    let mut bytes = text.as_bytes().to_vec();
+                    if *enter {
+                        bytes.push(b'\r');
+                    }
+                    match p.write(&bytes) {
+                        Ok(()) => Response::ok(id, ResultBody::Done),
+                        Err(e) => Response::err(id, format!("write failed: {e}")),
+                    }
+                }
+                None => Response::err(id, format!("no pane %{pane}")),
+            },
+            Call::CapturePane { pane } => match self.find_pane(*pane) {
+                Some(p) => {
+                    let snap = p.snapshot();
+                    let mut lines: Vec<String> = snap
+                        .cells
+                        .iter()
+                        .map(|row| {
+                            let mut s: String = row.iter().map(|c| c.ch).collect();
+                            s.truncate(s.trim_end_matches(' ').len());
+                            s
+                        })
+                        .collect();
+                    while lines.last().is_some_and(|l| l.is_empty()) {
+                        lines.pop();
+                    }
+                    Response::ok(id, ResultBody::Text(lines.join("\n")))
+                }
+                None => Response::err(id, format!("no pane %{pane}")),
+            },
+            Call::SplitPane { dir, command } => {
+                let sd = match dir.as_str() {
+                    "h" => SplitDir::Horizontal,
+                    "v" => SplitDir::Vertical,
+                    other => return Response::err(id, format!("bad dir '{other}' (h|v)")),
+                };
+                let cmd = command.clone().unwrap_or_else(|| shell.to_string());
+                match self.spawn_pane(&cmd) {
+                    Some(pane) => {
+                        let pid = pane.id.0;
+                        if let Some(w) = self.session.active_window_mut() {
+                            w.split(sd, pane);
+                        }
+                        self.resize_active_window();
+                        self.window.request_redraw();
+                        Response::ok(id, ResultBody::PaneId(pid))
+                    }
+                    None => Response::err(id, "failed to spawn pane"),
+                }
+            }
+            Call::NewWindow { command } => {
+                let cmd = command.clone().unwrap_or_else(|| shell.to_string());
+                match self.spawn_pane(&cmd) {
+                    Some(pane) => {
+                        let pid = pane.id.0;
+                        self.session.add_window(pane);
+                        self.resize_active_window();
+                        self.window.request_redraw();
+                        Response::ok(id, ResultBody::PaneId(pid))
+                    }
+                    None => Response::err(id, "failed to spawn pane"),
+                }
+            }
+            Call::Notify { pane, title, body } => {
+                let target = pane
+                    .or_else(|| self.session.active_window().map(|w| w.active_id().0));
+                let Some(target) = target else { return Response::err(id, "no target pane") };
+                if self.find_pane(target).is_none() {
+                    return Response::err(id, format!("no pane %{target}"));
+                }
+                if let Some(p) = self.find_pane(target) {
+                    p.request_attention();
+                }
+                let n = Notification {
+                    kind: gmux_mux::NotifyKind::Osc777,
+                    title: title.clone(),
+                    body: body.clone(),
+                    urgency: Urgency::Normal,
+                    id: None,
+                };
+                if !self.focused {
+                    self.fire_toast(target, &n);
+                }
+                self.window.request_redraw();
+                Response::ok(id, ResultBody::Done)
+            }
+        }
+    }
+
+    fn find_pane(&self, id: u64) -> Option<&Pane> {
+        self.session.pane(gmux_mux::PaneId(id))
     }
 
     fn render(&mut self) {
