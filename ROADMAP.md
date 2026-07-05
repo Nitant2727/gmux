@@ -118,7 +118,7 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
 - Deferred to M8: reconnect-on-daemon-restart, grid diffing/binary side-channel (currently full-grid JSON
   poll at 30 fps), custom shell hand-off to the daemon. *Next:* M7 (session restore across reboot).
 
-### M7 — Session restore across reboot 🔶 STAGE A COMPLETE (2026-07-05)
+### M7 — Session restore across reboot ✅ COMPLETE (2026-07-05)
 
 - **Stage A ✅ (layout + cwd)** — `gmux-mux/persist.rs`: `SessionSnapshot` serializes the window/split-tree
   layout + per-pane cwd (serde); `capture`/`restore` (respawns a **shell** per pane in its saved cwd — never
@@ -126,23 +126,30 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
   (`gmux-server`) debounce-saves to `%LOCALAPPDATA%\gmux\state\session.json` every ~2 s + clears it on clean
   exit; `restore_or_new` rebuilds on start. **Verified:** persist roundtrip unit tests + restore integration
   test + **live reboot simulation** (kill daemon abruptly → new daemon restored both panes).
-- **Stage B 🔶 infra done** — the snapshot now captures each pane's visible screen text (`PaneRecord.screen`),
-  and restore pre-seeds the fresh terminal with it under a dim `─── gmux: restored ───` divider
-  (`Pane::spawn_in(.., replay)`). **Limitation (honest):** PowerShell's startup `ESC[2J` clears the *visible*
-  screen, so restored history only survives in scrollback — **displaying it needs the scrollback viewport
-  (rendering + `capture-pane -S`), which is folded into M8.** The persisted screen data is forward-compatible.
-- Deferred to M8: scrollback viewport (view + capture restored/scrolled history), env secret-scrubbing,
-  per-agent resume behind approval. *Next:* M8 hardening (incl. the scrollback viewport that lights up M7b).
+- **Stage B ✅ (screen restore via scrollback)** — the snapshot captures each pane's recent output
+  (`PaneRecord.screen`, last 200 lines of scrollback+screen), and restore pre-seeds the fresh terminal
+  with it under a dim `─── gmux: restored ───` divider (`Pane::spawn_in(.., replay)`). PowerShell's
+  startup `ESC[2J` pushes the replayed content into scrollback rather than destroying it, so it is
+  reachable through the M8 scrollback viewport. **Verified live (2026-07-05):** daemon force-killed and
+  restarted → `capture-pane -S -` returned the pre-kill marker, its output, and the restore divider.
+- Deferred: env secret-scrubbing in snapshots, per-agent resume behind approval.
 
 ### M8 — MVP hardening and release
 
-- **Scrollback viewport (in progress):** gmux-vt exposes history (`history_len` / `cells_at_offset` /
-  `scrollback_text` over alacritty's 10k-line grid history) ✅; `capture-pane -S` (protocol
-  `CapturePane.scrollback`, CLI `-S <n>|-S -`) ✅; `GetGrid.offset` + `GridWire.history/offset` for the
-  GUI viewport ✅; persist now snapshots the last 200 lines of scrollback+screen (M7b) ✅; GUI
-  wheel/PageUp scroll + daemon-reconnect — in flight.
-- x64+ARM64 CI matrix, code signing, installer (plus portable zip), first-run experience
-  (shell-integration snippets, `hooks setup` prompt), docs site, crash reporting (opt-in, local dumps).
+- **Scrollback viewport ✅ (2026-07-05):** gmux-vt exposes history (`history_len` / `cells_at_offset` /
+  `scrollback_text` over alacritty's 10k-line grid history); `capture-pane -S` (protocol
+  `CapturePane.scrollback`, CLI `-S <n>|-S -`); `GetGrid.offset` + `GridWire.history/offset`; GUI mouse
+  wheel + Shift+PageUp/PageDown scroll with Escape/typing snap-back, cursor suppressed while scrolled.
+- **Daemon-reconnect ✅ (2026-07-05):** GUI `DaemonClient::call` transparently reconnects (respawning
+  `gmux --daemon` if needed) and retries **idempotent calls only** — state-changing calls error instead
+  of risking double-apply; ~1 s `ResizeView` heartbeat re-teaches a restarted daemon the geometry.
+- **CI ✅ (2026-07-05):** GitHub Actions — x64 build+test, ARM64 cross-build (`.github/workflows/ci.yml`);
+  portable-zip release job on `v*` tags (`release.yml`, signing deferred until a cert exists). ARM64
+  verified locally to compile crate-by-crate; final link needs the MSVC ARM64 tools (present on runners).
+- **Known bug (pre-existing, fix in flight):** `snapshot_capture_and_restore_rebuilds_layout` deadlocks in
+  ConPTY teardown under a real console — reproduced at HEAD~1, so it predates the scrollback work.
+- Remaining: code signing, installer, first-run experience (shell-integration snippets, `hooks setup`
+  prompt), docs site, crash reporting (opt-in, local dumps).
 - **MVP definition of done:** a developer on Windows 11 runs three parallel Claude Code sessions in three
   workspaces with splits, gets a toast + pane ring the moment any agent needs input, scripts
   send-keys/capture-pane over the pipe from an external tool, detaches and reattaches, and has everything
