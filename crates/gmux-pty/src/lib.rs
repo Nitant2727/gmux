@@ -34,13 +34,13 @@ use windows_sys::Win32::System::Console::{
     SetStdHandle, COORD, HPCON, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject,
+    AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject,
     JobObjectExtendedLimitInformation, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, ResumeThread, UpdateProcThreadAttribute,
+    InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
     WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
     INFINITE, PROCESS_INFORMATION, STARTUPINFOEXW,
 };
@@ -352,14 +352,23 @@ impl Pty {
 impl Drop for Pty {
     fn drop(&mut self) {
         unsafe {
-            // Close input so the child sees EOF, tear down the pseudoconsole (build 26100+ returns
-            // immediately), which closes the output write end -> reader hits EOF and exits.
+            // Kill the child process tree FIRST. On Win11 (26100+) ClosePseudoConsole returns
+            // immediately without disconnecting a still-attached client, and the ConPTY host keeps
+            // the output pipe open while any client lives — so tearing down the console before the
+            // client is gone can leave the reader blocked in ReadFile forever (the reader.join()
+            // below then never returns, and the job close that would have killed the client never
+            // runs). Terminating the job up front guarantees the host drains, closes the pipe, and
+            // the reader hits EOF, making the join safe.
+            if !self.job.is_null() {
+                TerminateJobObject(self.job, 0);
+            } else {
+                TerminateProcess(self.process, 0);
+            }
             CloseHandle(self.input_write);
             ClosePseudoConsole(self.hpc);
             if let Some(r) = self.reader.take() {
                 let _ = r.join();
             }
-            // Closing the last job handle kills any surviving process tree.
             if !self.job.is_null() {
                 CloseHandle(self.job);
             }
