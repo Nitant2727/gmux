@@ -86,14 +86,21 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
 - Deferred: listening ports (job-object PID → `GetExtendedTcpTable`), `gmux set-status/log` sidebar
   metadata, jump-to-unread. *Next:* M5 (named-pipe API + full CLI).
 
-### M5 — Programmability: the pipe API and CLI
+### M5 — Programmability: the pipe API and CLI ✅ CORE COMPLETE (2026-07-05)
 
-- Full `\\.\pipe\gmux` JSON-RPC server + `gmux` CLI: list/new/attach sessions, new-window, split-pane,
-  **send-keys, capture-pane (with scrollback ranges + SGR), screenshot**, wait-for, list-panes with
-  `#{}` formats, subscribe (event stream), notify/set-status.
-- *Demo:* a PowerShell script that creates a workspace, splits it, launches an agent, waits for
-  `pane-attention`, captures the screen, and screenshots the pane — no gmux UI touched.
-  *Tests:* protocol golden files; PowerShell smoke client in CI.
+- **`gmux-proto`**: newline-delimited JSON protocol (D-005 amended), `hello/list-panes/send-keys/
+  capture-pane/split-pane/new-window/notify`, 1 MiB line cap, 5 tests.
+- **`gmux-pipe`** (workflow-built + adversarially verified): blocking named-pipe server/client,
+  thread-per-connection, **DACL locked to SYSTEM+current-user (verified by ACL read-back test)**,
+  REJECT_REMOTE_CLIENTS, FIRST_PIPE_INSTANCE, ERROR_NO_DATA race fixed, `try_clone`; 9 tests.
+- **App bridge** (`gmux-gui/api.rs`): pipe threads → command channel → `EventLoopProxy` wake →
+  main-thread execution against the Session; 5 s reply timeout.
+- **CLI client**: `gmux hello|list-panes|send-keys -t %N --enter <text>|capture-pane -t %N|`
+  `split-pane [-h|-v] [-- cmd]|new-window [-- cmd]`.
+- **End-to-end verified from an external process**: split → send-keys → capture-pane round-trip read
+  back live screen contents. Demo: [demos/m5.ps1](demos/m5.ps1).
+- Deferred: scrollback ranges + SGR in capture-pane, screenshot, wait-for, subscribe event stream,
+  `#{}` formats, session verbs (attach/detach land with M6 daemon). *Next:* M6 (detach/daemon).
 
 ### M6 — Detach/reattach: the daemon split
 
