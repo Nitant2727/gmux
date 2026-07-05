@@ -1,21 +1,149 @@
-//! gmux — the entry point. For M1 it opens a single window running a shell. Role dispatch
-//! (GUI / `--daemon` / CLI subcommands) arrives with the later milestones (ARCHITECTURE §3).
+//! gmux — the entry point + CLI.
 //!
-//! Usage:
-//!   gmux                       open a window running the default shell (PowerShell)
-//!   gmux <command line...>     open a window running that command (e.g. `gmux cmd.exe`)
+//!   gmux                         open a window running the default shell (PowerShell)
+//!   gmux <command line...>       open a window running that command (e.g. `gmux cmd.exe`)
+//!   gmux notify --title T [--body B] [--urgency low|normal|critical]
+//!                                emit an OSC 777 notification to stdout (run inside a gmux pane;
+//!                                gmux attributes it to that pane and shows a toast)
+//!   gmux hooks setup <agent>     configure claude-code | codex | gemini | aider | all
+//!
+//! Role dispatch (`--daemon` / more subcommands) grows with later milestones (ARCHITECTURE §3).
+
+mod hooks;
+
+use std::io::{Read, Write};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let shell = if args.is_empty() { default_shell() } else { args.join(" ") };
+    match args.first().map(String::as_str) {
+        None => launch_gui(default_shell()),
+        Some("notify") => notify(&args[1..]),
+        Some("hooks") => cmd_hooks(&args[1..]),
+        Some("_hook") => internal_hook(&args[1..]),
+        Some("--help" | "-h" | "help") => print_help(),
+        // Anything else is treated as a command line to run in the GUI.
+        Some(_) => launch_gui(args.join(" ")),
+    }
+}
 
+fn launch_gui(shell: String) {
     if let Err(e) = gmux_gui::run(shell) {
         eprintln!("gmux: {e}");
         std::process::exit(1);
     }
 }
 
-/// Prefer PowerShell 7 (`pwsh`) if on PATH, else Windows PowerShell, else cmd.
+/// `gmux notify` — emit an OSC 777 notification to stdout. When run inside a gmux pane this flows
+/// through the pane's PTY and gmux attributes it to that pane (via the stream) and shows a toast.
+fn notify(args: &[String]) {
+    let (mut title, mut body) = (String::new(), String::new());
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--title" => title = take(args, &mut i),
+            "--body" => body = take(args, &mut i),
+            "--subtitle" => {
+                // Fold subtitle into the body (OSC 777 has no subtitle field).
+                let s = take(args, &mut i);
+                body = if body.is_empty() { s } else { format!("{s} — {body}") };
+            }
+            "--urgency" => {
+                let _ = take(args, &mut i); // reserved; OSC 777 has no urgency field
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    // OSC 777 title must not contain ';' (the field separator); the body may.
+    let title = osc_field(&title, true);
+    let body = osc_field(&body, false);
+    let seq = format!("\x1b]777;notify;{title};{body}\x07");
+    let mut out = std::io::stdout();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
+}
+
+/// `gmux _hook claude-code` — read the Notification-event JSON on stdin and print a
+/// `{"terminalSequence": "]777;notify;Claude Code;<message>"}` object that Claude Code writes to
+/// the terminal (its allowlisted, race-free notification path).
+fn internal_hook(args: &[String]) {
+    let agent = args.first().map(String::as_str).unwrap_or("claude-code");
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    let message = serde_json::from_str::<serde_json::Value>(&input)
+        .ok()
+        .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| "needs your attention".to_string());
+    let title = match agent {
+        "codex" => "Codex",
+        "gemini" => "Gemini",
+        _ => "Claude Code",
+    };
+    let seq = format!("]777;notify;{};{}", osc_field(title, true), osc_field(&message, false));
+    let obj = serde_json::json!({ "terminalSequence": seq });
+    println!("{obj}");
+}
+
+fn cmd_hooks(args: &[String]) {
+    if args.first().map(String::as_str) != Some("setup") {
+        eprintln!("usage: gmux hooks setup <claude-code|codex|gemini|aider|all>");
+        std::process::exit(2);
+    }
+    let Some(agent) = args.get(1) else {
+        eprintln!("usage: gmux hooks setup <claude-code|codex|gemini|aider|all>");
+        std::process::exit(2);
+    };
+    let home = home_dir();
+    match hooks::setup(agent, &home) {
+        Ok(actions) => {
+            for a in actions {
+                println!("✓ {a}");
+            }
+        }
+        Err(e) => {
+            eprintln!("gmux hooks: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn print_help() {
+    print!(
+        "\
+gmux — a Windows-native terminal for AI coding agents
+
+USAGE:
+  gmux                                 open a window running the default shell
+  gmux <command...>                    open a window running that command
+  gmux notify --title T [--body B]     emit an OSC 777 notification (run inside a pane)
+  gmux hooks setup <agent>             configure claude-code | codex | gemini | aider | all
+  gmux --help                          show this help
+"
+    );
+}
+
+// --- helpers ---
+
+fn take(args: &[String], i: &mut usize) -> String {
+    *i += 1;
+    args.get(*i).cloned().unwrap_or_default()
+}
+
+/// Strip control chars from an OSC field; if `is_title`, also replace ';' (the separator) with ','.
+fn osc_field(s: &str, is_title: bool) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .map(|c| if is_title && c == ';' { ',' } else { c })
+        .collect()
+}
+
+fn home_dir() -> std::path::PathBuf {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
 fn default_shell() -> String {
     if which("pwsh.exe") {
         return "pwsh.exe -NoLogo".into();
@@ -27,9 +155,19 @@ fn default_shell() -> String {
     "cmd.exe".into()
 }
 
-/// True if `exe` is found on PATH.
 fn which(exe: &str) -> bool {
     std::env::var_os("PATH")
         .map(|paths| std::env::split_paths(&paths).any(|p| p.join(exe).exists()))
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::osc_field;
+
+    #[test]
+    fn osc_field_strips_controls_and_title_semicolons() {
+        assert_eq!(osc_field("a;b\x07c\nd", true), "a,bcd");
+        assert_eq!(osc_field("a;b\x07c\nd", false), "a;bcd"); // body keeps ';'
+    }
 }

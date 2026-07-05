@@ -11,3 +11,5 @@ path = "src/main.rs"
 
 [dependencies]
 gmux-gui = { path = "../gmux-gui" }
+serde_json = "1"
+toml_edit = "0.22"
