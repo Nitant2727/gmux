@@ -151,8 +151,14 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
   client, the ConPTY host holds the output pipe open, the reader never EOFs, and the old `join()`
   blocked forever (the job-close kill sat *after* the join). Pre-existing since M7; all three console
   suites (`gmux-pty/spawn`, `gmux-mux/pane`, `gmux-server/daemon`) now exit 0.
-- Remaining: first-run experience (shell-integration snippets, `hooks setup` prompt), crash reporting
-  (opt-in, local dumps), installer, code signing (blocked on a cert), docs site.
+- **First-run experience ✅ (2026-07-06):** `gmux shell-integration [--print|--install]` (PowerShell
+  prompt wrapper emitting OSC 133;A + OSC 9;9 cwd, gated on `TERM_PROGRAM=gmux`, marker-guarded
+  idempotent install into both CurrentUserAllHosts profiles); one-time welcome toast on first GUI
+  launch pointing at `hooks setup all` + `shell-integration --install` (marker in
+  `%LOCALAPPDATA%\gmux\state\first-run`, live-verified no re-fire); local crash reports — panic hook
+  in daemon+GUI appends message/location/backtrace to `%LOCALAPPDATA%\gmux\crash\` (never leaves the
+  machine).
+- Remaining: installer, code signing (blocked on a cert), docs site.
 - **MVP definition of done:** a developer on Windows 11 runs three parallel Claude Code sessions in three
   workspaces with splits, gets a toast + pane ring the moment any agent needs input, scripts
   send-keys/capture-pane over the pipe from an external tool, detaches and reattaches, and has everything
