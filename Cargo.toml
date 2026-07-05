@@ -1,7 +1,7 @@
 # gmux Cargo workspace. Spikes under spikes/ are separate throwaway workspaces (excluded).
 [workspace]
 resolver = "2"
-members = ["crates/gmux-pty", "crates/gmux-vt", "crates/gmux-mux"]
+members = ["crates/gmux-pty", "crates/gmux-vt", "crates/gmux-mux", "crates/gmux-gui", "crates/gmux"]
 exclude = ["spikes"]
 
 [workspace.package]
