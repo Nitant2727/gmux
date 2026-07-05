@@ -626,6 +626,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gmux-remote"
+version = "0.0.0"
+dependencies = [
+ "gmux-mux",
+ "gmux-tmux",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
 name = "gmux-server"
 version = "0.0.0"
 dependencies = [
