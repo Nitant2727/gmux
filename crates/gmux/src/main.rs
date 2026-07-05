@@ -6,11 +6,14 @@
 //!                                emit an OSC 777 notification to stdout (run inside a gmux pane;
 //!                                gmux attributes it to that pane and shows a toast)
 //!   gmux hooks setup <agent>     configure claude-code | codex | gemini | aider | all
+//!   gmux shell-integration       print (or --install into $PROFILE) the PowerShell snippet
 //!
 //! Role dispatch (`--daemon` / more subcommands) grows with later milestones (ARCHITECTURE §3).
 
 mod client;
+mod crash;
 mod hooks;
+mod shell_integration;
 
 use std::io::{Read, Write};
 
@@ -21,6 +24,7 @@ fn main() {
         Some("--daemon") => daemon(),
         Some("notify") => notify(&args[1..]),
         Some("hooks") => cmd_hooks(&args[1..]),
+        Some("shell-integration") => cmd_shell_integration(&args[1..]),
         Some("_hook") => internal_hook(&args[1..]),
         Some("--help" | "-h" | "help") => print_help(),
         Some(sub) => {
@@ -35,6 +39,7 @@ fn main() {
 }
 
 fn launch_gui(shell: String) {
+    crash::install("gui");
     if let Err(e) = gmux_gui::run(shell) {
         eprintln!("gmux: {e}");
         std::process::exit(1);
@@ -43,6 +48,7 @@ fn launch_gui(shell: String) {
 
 /// `gmux --daemon` — run the headless multiplexer server (owns the panes; survives GUI detach).
 fn daemon() {
+    crash::install("daemon");
     if let Err(e) = gmux_server::run(default_shell(), "gmux") {
         eprintln!("gmux daemon: {e}");
         std::process::exit(1);
@@ -123,6 +129,29 @@ fn cmd_hooks(args: &[String]) {
     }
 }
 
+/// `gmux shell-integration [--print|--install]` — print the PowerShell prompt snippet, or
+/// install it into the CurrentUserAllHosts profile(s) (guarded by markers; safe to re-run).
+fn cmd_shell_integration(args: &[String]) {
+    match args.first().map(String::as_str) {
+        None | Some("--print") => print!("{}", shell_integration::block()),
+        Some("--install") => match shell_integration::install(&home_dir()) {
+            Ok(actions) => {
+                for a in actions {
+                    println!("✓ {a}");
+                }
+            }
+            Err(e) => {
+                eprintln!("gmux shell-integration: {e}");
+                std::process::exit(1);
+            }
+        },
+        Some(_) => {
+            eprintln!("usage: gmux shell-integration [--print|--install]");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn print_help() {
     print!(
         "\
@@ -133,6 +162,7 @@ USAGE:
   gmux <command...>                    open a window running that command
   gmux notify --title T [--body B]     emit an OSC 777 notification (run inside a pane)
   gmux hooks setup <agent>             configure claude-code | codex | gemini | aider | all
+  gmux shell-integration [--install]   print (or install into $PROFILE) the PowerShell snippet
   gmux --help                          show this help
 "
     );

@@ -111,6 +111,20 @@ impl ApplicationHandler for App {
         let notifier = Notifier::new("com.gmux.app", "gmux").ok();
         let taskbar = if hwnd != 0 { Taskbar::new(hwnd) } else { None };
 
+        // First launch ever: one welcome toast pointing at the two setup commands.
+        if first_run(&state_dir()) {
+            if let Some(nf) = &notifier {
+                let _ = nf.show(&ToastRequest {
+                    tag: "welcome".to_string(),
+                    group: TOAST_GROUP.to_string(),
+                    title: "gmux".to_string(),
+                    body: "Run 'gmux hooks setup all' to get agent notifications, and 'gmux shell-integration --install' for prompt/cwd tracking.".to_string(),
+                    urgency: NUrgency::Normal,
+                    launch_arg: "welcome".to_string(),
+                });
+            }
+        }
+
         let mut st = State {
             window,
             surface,
@@ -462,6 +476,24 @@ fn grid_to_snapshot(g: &GridWire) -> PaneSnapshot {
     PaneSnapshot { cells, cursor: (g.cursor_col, g.cursor_row), cols: g.cols, rows: g.rows }
 }
 
+/// Where the first-run marker lives: `%LOCALAPPDATA%\gmux\state`.
+fn state_dir() -> std::path::PathBuf {
+    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(base).join("gmux").join("state")
+}
+
+/// True exactly once per install: reports whether `dir/first-run` is absent and drops the marker.
+/// Io errors are ignored — a failed marker just means the welcome toast may repeat next launch.
+fn first_run(dir: &std::path::Path) -> bool {
+    let marker = dir.join("first-run");
+    if marker.exists() {
+        return false;
+    }
+    let _ = std::fs::create_dir_all(dir);
+    let _ = std::fs::write(&marker, "");
+    true
+}
+
 fn window_hwnd(window: &Window) -> Option<isize> {
     use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
     match window.window_handle().ok()?.as_raw() {
@@ -499,5 +531,20 @@ fn key_to_bytes(event: &KeyEvent, mods: ModifiersState) -> Option<Vec<u8>> {
             Some(s.as_bytes().to_vec())
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_run_reports_once_then_sees_the_marker() {
+        let dir = std::env::temp_dir().join(format!("gmux-first-run-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(first_run(&dir), "fresh dir should be a first run");
+        assert!(dir.join("first-run").exists(), "marker file should be created");
+        assert!(!first_run(&dir), "second call should see the marker");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

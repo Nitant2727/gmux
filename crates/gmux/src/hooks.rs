@@ -106,7 +106,7 @@ fn bad(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
 }
 
-fn read_or_default(path: &Path) -> io::Result<String> {
+pub(crate) fn read_or_default(path: &Path) -> io::Result<String> {
     match fs::read_to_string(path) {
         Ok(s) => Ok(s),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
@@ -126,7 +126,7 @@ fn read_json_object(path: &Path) -> io::Result<serde_json::Map<String, serde_jso
     }
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
