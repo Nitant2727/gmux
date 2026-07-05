@@ -573,6 +573,7 @@ dependencies = [
  "ab_glyph",
  "bytemuck",
  "gmux-mux",
+ "gmux-notify",
  "pollster",
  "wgpu",
  "winit",
@@ -584,6 +585,13 @@ version = "0.0.0"
 dependencies = [
  "gmux-pty",
  "gmux-vt",
+]
+
+[[package]]
+name = "gmux-notify"
+version = "0.0.0"
+dependencies = [
+ "windows",
 ]
 
 [[package]]

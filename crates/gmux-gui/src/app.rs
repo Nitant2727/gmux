@@ -5,7 +5,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gmux_mux::{Pane, PaneEvent, PtySize};
+use gmux_mux::{Notification, Pane, PaneEvent, ProgressState, PtySize, Urgency};
+use gmux_notify::{
+    flash_window, Notifier, ProgressState as NProgress, Taskbar, ToastRequest, Urgency as NUrgency,
+};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -22,12 +25,85 @@ pub struct App {
     state: Option<State>,
 }
 
+const TOAST_GROUP: &str = "gmux-session";
+const TOAST_MIN_INTERVAL: Duration = Duration::from_millis(1000);
+
 struct State {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     renderer: Renderer,
     pane: Pane,
+    /// Whether the gmux window currently has focus (drives toast suppression).
+    focused: bool,
+    hwnd: isize,
+    notifier: Option<Notifier>,
+    taskbar: Option<Taskbar>,
+    last_toast: Option<Instant>,
+}
+
+impl State {
+    fn toast_tag(&self) -> String {
+        format!("pane-{}", self.pane.id.0)
+    }
+
+    /// Fire a Windows toast + taskbar flash for a notification (rate-limited per pane).
+    fn fire_toast(&mut self, n: &Notification) {
+        let now = Instant::now();
+        if let Some(prev) = self.last_toast {
+            if now.duration_since(prev) < TOAST_MIN_INTERVAL {
+                return; // collapse bursts
+            }
+        }
+        self.last_toast = Some(now);
+        let title = if n.title.is_empty() { "gmux".to_string() } else { n.title.clone() };
+        let req = ToastRequest {
+            tag: self.toast_tag(),
+            group: TOAST_GROUP.to_string(),
+            title,
+            body: n.body.clone(),
+            urgency: map_urgency(n.urgency),
+            launch_arg: format!("pane={}", self.pane.id.0),
+        };
+        if let Some(nf) = &self.notifier {
+            let _ = nf.show(&req);
+        }
+        flash_window(self.hwnd, true);
+    }
+
+    /// Clear attention on focus: mark pane read, remove toast, stop the taskbar flash.
+    fn clear_attention(&self) {
+        if let Some(nf) = &self.notifier {
+            nf.clear(&self.toast_tag(), TOAST_GROUP);
+        }
+        flash_window(self.hwnd, false);
+    }
+}
+
+fn window_hwnd(window: &Window) -> Option<isize> {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    match window.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+        _ => None,
+    }
+}
+
+fn map_urgency(u: Urgency) -> NUrgency {
+    match u {
+        Urgency::Low => NUrgency::Low,
+        Urgency::Normal => NUrgency::Normal,
+        Urgency::Critical => NUrgency::Critical,
+    }
+}
+
+fn map_progress(s: ProgressState) -> NProgress {
+    match s {
+        ProgressState::Remove => NProgress::None,
+        ProgressState::Set => NProgress::Normal,
+        ProgressState::Error => NProgress::Error,
+        ProgressState::Indeterminate => NProgress::Indeterminate,
+        ProgressState::Paused => NProgress::Paused,
+    }
 }
 
 impl App {
@@ -88,7 +164,22 @@ impl ApplicationHandler for App {
         let rows = (config.height / renderer.cell_h()).max(1) as u16;
         let pane = Pane::spawn(&self.shell, PtySize { cols, rows }).expect("spawn shell");
 
-        self.state = Some(State { window, surface, config, renderer, pane });
+        let hwnd = window_hwnd(&window).unwrap_or(0);
+        let notifier = Notifier::new("com.gmux.app", "gmux").ok();
+        let taskbar = if hwnd != 0 { Taskbar::new(hwnd) } else { None };
+
+        self.state = Some(State {
+            window,
+            surface,
+            config,
+            renderer,
+            pane,
+            focused: true,
+            hwnd,
+            notifier,
+            taskbar,
+            last_toast: None,
+        });
         el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(16)));
     }
 
@@ -97,6 +188,15 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::ModifiersChanged(m) => self.mods = m.state(),
+            WindowEvent::Focused(f) => {
+                st.focused = f;
+                if f {
+                    // Focusing the window focuses its pane: clear attention, remove toast, stop flash.
+                    st.pane.focus();
+                    st.clear_attention();
+                    st.window.request_redraw();
+                }
+            }
             WindowEvent::Resized(sz) => {
                 st.config.width = sz.width.max(1);
                 st.config.height = sz.height.max(1);
@@ -120,14 +220,43 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let Some(st) = self.state.as_mut() else { return };
         let mut redraw = false;
-        for ev in st.pane.drain_events() {
+        let events = st.pane.drain_events();
+        for ev in events {
             match ev {
-                PaneEvent::Output | PaneEvent::Notification(_) | PaneEvent::Bell => redraw = true,
+                PaneEvent::Output => redraw = true,
+                PaneEvent::Notification(n) => {
+                    redraw = true; // attention ring
+                    if !st.focused {
+                        st.fire_toast(&n); // toast + flash, only when we're not looking
+                    }
+                }
+                PaneEvent::Bell => {
+                    redraw = true;
+                    if !st.focused {
+                        flash_window(st.hwnd, true);
+                    }
+                }
+                PaneEvent::Progress { state, pct } => {
+                    if let Some(tb) = &st.taskbar {
+                        tb.set_progress(map_progress(state), pct);
+                    }
+                }
                 PaneEvent::Title(t) => st.window.set_title(&format!("gmux — {t}")),
+                PaneEvent::Cwd(_) => {}
                 PaneEvent::Exited => el.exit(),
-                _ => {}
             }
         }
+
+        // A clicked toast focuses the target pane's window.
+        if let Some(nf) = &st.notifier {
+            if !nf.poll_activations().is_empty() {
+                st.window.focus_window();
+                st.pane.focus();
+                st.clear_attention();
+                redraw = true;
+            }
+        }
+
         if redraw {
             st.window.request_redraw();
         }
