@@ -102,13 +102,16 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
 - Deferred: scrollback ranges + SGR in capture-pane, screenshot, wait-for, subscribe event stream,
   `#{}` formats, session verbs (attach/detach land with M6 daemon). *Next:* M6 (detach/daemon).
 
-### M6 — Detach/reattach: the daemon split
+### M6 — Detach/reattach: the daemon split 🔶 STAGE 1 COMPLETE (2026-07-05)
 
-- mux-core moves behind `gmux.exe --daemon`; GUI becomes a pipe client (binary damage side-channel);
-  close the GUI → agents keep running; `gmux attach` (or relaunching the GUI) restores the picture;
-  toast-click-after-GUI-exit relaunches and attaches to the right pane.
-- *Demo:* start a long agent task, close the GUI, reopen — scrollback and the running process are intact.
-  *Tests:* reattach state-sync; daemon crash → job objects reap children; GUI crash → daemon unaffected.
+- **Stage 1 ✅** — `gmux-server` crate: headless `Server { session, shell }` owns the mux + ConPTYs and
+  serves the protocol; `gmux --daemon` runs it (blocks until all panes exit). **Verified end-to-end:** the
+  daemon process owns a real pane and the CLI drives it (hello/list-panes/split/send-keys/capture) with no
+  GUI — console-gated integration test + live daemon+CLI smoke.
+- **Stage 2 (next)** — rewire the GUI as a thin client: add `GetLayout`/`GetGrid`/`resize` protocol
+  methods (grid streaming), make the GUI attach to the daemon (auto-spawn if absent) and render remote
+  state instead of owning a Mux; close GUI → daemon+agents keep running; reopen → reattach.
+- *Tests so far:* daemon serves protocol headlessly; job-object tree-kill from M1 covers child reaping.
 
 ### M7 — Session restore across reboot
 
