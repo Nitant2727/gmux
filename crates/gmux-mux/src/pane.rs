@@ -1,8 +1,12 @@
-//! A [`Pane`] = one [`Pty`] + one [`Terminal`] + a background pump that feeds PTY output into the
-//! terminal, updates attention state, and forwards notable events over a channel.
+//! A [`Pane`] = one [`Terminal`] fed by a [`Backend`]: either a local [`Pty`] with a background
+//! pump that feeds ConPTY output into the terminal, or a remote tmux pane whose transport pushes
+//! `%output` bytes in via [`Pane::push_output`]. Both paths funnel through the same
+//! [`TermEvent`]-to-[`PaneEvent`] mapping, so OSC 9/777/99 from remote agents raise attention and
+//! toasts exactly like local ones.
 
 use std::io;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -27,7 +31,7 @@ pub enum PaneEvent {
     Cwd(String),
     /// Progress update (OSC 9;4).
     Progress { state: ProgressState, pct: Option<u8> },
-    /// The child process exited (PTY reached EOF).
+    /// The child process exited (PTY reached EOF / the transport reported the remote pane gone).
     Exited,
 }
 
@@ -40,16 +44,77 @@ pub struct PaneSnapshot {
     pub rows: u16,
 }
 
+/// What produces a pane's bytes and consumes its input.
+enum Backend {
+    /// A local ConPTY child; output arrives via the pump thread.
+    Local { pty: Pty },
+    /// A mirror of a remote tmux pane (`%remote_id`); the real PTY lives on the remote server.
+    /// Output arrives via [`Pane::push_output`]; `input` forwards keystrokes to the transport
+    /// (which wraps them in `send-keys`). Holds the events `Sender` so `push_output` /
+    /// `mark_exited` reach the same channel the local pump would — for local panes the sender is
+    /// owned solely by the pump thread, preserving channel-disconnect semantics on exit.
+    Remote {
+        input: Box<dyn Fn(&[u8]) + Send + Sync>,
+        alive: Arc<AtomicBool>,
+        remote_id: u64,
+        tx: Sender<PaneEvent>,
+    },
+}
+
 /// A live terminal pane.
 pub struct Pane {
     pub id: PaneId,
-    pty: Pty,
+    backend: Backend,
     terminal: Arc<Mutex<Terminal>>,
     events: Receiver<PaneEvent>,
     attention: Arc<Mutex<Attention>>,
     title: Arc<Mutex<String>>,
     cwd: Arc<Mutex<Option<String>>>,
     _pump: Option<JoinHandle<()>>,
+}
+
+/// Advance `terminal` with `bytes` and forward the resulting [`TermEvent`]s as [`PaneEvent`]s:
+/// attention on Notification/Bell, title/cwd tracking, and a single `Output` per damaged chunk.
+/// The single funnel for pane output — the local pump thread and [`Pane::push_output`] both call
+/// this, so remote `%output` hits the same OSC parser + attention path as local PTY output.
+fn pump_bytes(
+    terminal: &Mutex<Terminal>,
+    attention: &Mutex<Attention>,
+    title: &Mutex<String>,
+    cwd: &Mutex<Option<String>>,
+    tx: &Sender<PaneEvent>,
+    bytes: &[u8],
+) {
+    let evs = terminal.lock().unwrap().advance(bytes);
+    let mut damaged = false;
+    for ev in evs {
+        match ev {
+            TermEvent::Damage => damaged = true,
+            TermEvent::Notification(n) => {
+                attention.lock().unwrap().set_pending();
+                let _ = tx.send(PaneEvent::Notification(n));
+            }
+            TermEvent::Bell => {
+                attention.lock().unwrap().set_pending();
+                let _ = tx.send(PaneEvent::Bell);
+            }
+            TermEvent::Title(s) => {
+                *title.lock().unwrap() = s.clone();
+                let _ = tx.send(PaneEvent::Title(s));
+            }
+            TermEvent::Cwd(p) => {
+                *cwd.lock().unwrap() = Some(p.clone());
+                let _ = tx.send(PaneEvent::Cwd(p));
+            }
+            TermEvent::Progress { state, pct } => {
+                let _ = tx.send(PaneEvent::Progress { state, pct });
+            }
+            TermEvent::PromptMark(_) => {}
+        }
+    }
+    if damaged {
+        let _ = tx.send(PaneEvent::Output);
+    }
 }
 
 impl Pane {
@@ -90,46 +155,14 @@ impl Pane {
         let (t, a, ti, cw) = (terminal.clone(), attention.clone(), title.clone(), cwd.clone());
         let pump = thread::spawn(move || {
             while let Ok(chunk) = rx.recv() {
-                let evs = {
-                    let mut term = t.lock().unwrap();
-                    term.advance(&chunk)
-                };
-                let mut damaged = false;
-                for ev in evs {
-                    match ev {
-                        TermEvent::Damage => damaged = true,
-                        TermEvent::Notification(n) => {
-                            a.lock().unwrap().set_pending();
-                            let _ = tx.send(PaneEvent::Notification(n));
-                        }
-                        TermEvent::Bell => {
-                            a.lock().unwrap().set_pending();
-                            let _ = tx.send(PaneEvent::Bell);
-                        }
-                        TermEvent::Title(s) => {
-                            *ti.lock().unwrap() = s.clone();
-                            let _ = tx.send(PaneEvent::Title(s));
-                        }
-                        TermEvent::Cwd(p) => {
-                            *cw.lock().unwrap() = Some(p.clone());
-                            let _ = tx.send(PaneEvent::Cwd(p));
-                        }
-                        TermEvent::Progress { state, pct } => {
-                            let _ = tx.send(PaneEvent::Progress { state, pct });
-                        }
-                        TermEvent::PromptMark(_) => {}
-                    }
-                }
-                if damaged {
-                    let _ = tx.send(PaneEvent::Output);
-                }
+                pump_bytes(&t, &a, &ti, &cw, &tx, &chunk);
             }
             let _ = tx.send(PaneEvent::Exited);
         });
 
         Ok(Pane {
             id,
-            pty,
+            backend: Backend::Local { pty },
             terminal,
             events,
             attention,
@@ -139,13 +172,78 @@ impl Pane {
         })
     }
 
-    /// Write raw input (keystrokes / VT) to the child.
-    pub fn write(&self, data: &[u8]) -> io::Result<()> {
-        self.pty.write(data)
+    /// Create a pane mirroring remote tmux pane `%remote_id`. No process and no pump thread: the
+    /// transport pushes `%output` bytes in via [`Pane::push_output`] and keystrokes flow out
+    /// through `input` (which the transport wraps in `send-keys`). The remote server owns the
+    /// real PTY; this side owns only the terminal grid + attention state.
+    pub fn remote(
+        remote_id: u64,
+        cols: u16,
+        rows: u16,
+        input: Box<dyn Fn(&[u8]) + Send + Sync>,
+    ) -> Pane {
+        let (tx, events) = channel::<PaneEvent>();
+        Pane {
+            id: PaneId::alloc(),
+            backend: Backend::Remote {
+                input,
+                alive: Arc::new(AtomicBool::new(true)),
+                remote_id,
+                tx,
+            },
+            terminal: Arc::new(Mutex::new(Terminal::new(cols, rows))),
+            events,
+            attention: Arc::new(Mutex::new(Attention::default())),
+            title: Arc::new(Mutex::new(String::new())),
+            cwd: Arc::new(Mutex::new(None)),
+            _pump: None,
+        }
     }
 
-    /// Resize both the pseudoconsole and the terminal grid. No-op when the size is unchanged, so
-    /// periodic geometry heartbeats don't spam `ResizePseudoConsole`.
+    /// Feed remote output through the terminal — the exact path the local pump takes
+    /// ([`pump_bytes`]), so OSC 9/777/99 from remote agents raise attention and emit the same
+    /// events. Events land on the pane's channel; drain with [`Pane::drain_events`]. No-op on
+    /// local panes (their PTY pump owns the terminal feed).
+    pub fn push_output(&self, bytes: &[u8]) {
+        if let Backend::Remote { tx, .. } = &self.backend {
+            pump_bytes(&self.terminal, &self.attention, &self.title, &self.cwd, tx, bytes);
+        }
+    }
+
+    /// The remote tmux pane id (the `N` of `%N`) backing this pane; `None` for local panes.
+    pub fn remote_id(&self) -> Option<u64> {
+        match &self.backend {
+            Backend::Local { .. } => None,
+            Backend::Remote { remote_id, .. } => Some(*remote_id),
+        }
+    }
+
+    /// Mark a remote pane dead (the transport saw the tmux pane exit or the link drop): flips
+    /// liveness and emits [`PaneEvent::Exited`] once. No-op on local panes — their pump emits
+    /// `Exited` at PTY EOF.
+    pub fn mark_exited(&self) {
+        if let Backend::Remote { alive, tx, .. } = &self.backend {
+            if alive.swap(false, Ordering::Relaxed) {
+                let _ = tx.send(PaneEvent::Exited);
+            }
+        }
+    }
+
+    /// Write raw input (keystrokes / VT) to the child — directly for local panes, via the
+    /// transport's input closure for remote ones.
+    pub fn write(&self, data: &[u8]) -> io::Result<()> {
+        match &self.backend {
+            Backend::Local { pty } => pty.write(data),
+            Backend::Remote { input, .. } => {
+                input(data);
+                Ok(())
+            }
+        }
+    }
+
+    /// Resize the pseudoconsole and the terminal grid. No-op when the size is unchanged, so
+    /// periodic geometry heartbeats don't spam `ResizePseudoConsole`. Remote panes resize the
+    /// grid only — pushing the new size to the remote tmux is the transport's job.
     pub fn resize(&self, size: PtySize) -> io::Result<()> {
         {
             let mut term = self.terminal.lock().unwrap();
@@ -154,7 +252,10 @@ impl Pane {
             }
             term.resize(size.cols, size.rows);
         }
-        self.pty.resize(size)
+        match &self.backend {
+            Backend::Local { pty } => pty.resize(size),
+            Backend::Remote { .. } => Ok(()),
+        }
     }
 
     /// Snapshot the visible grid for rendering.
@@ -201,10 +302,8 @@ impl Pane {
         self.events.try_iter().collect()
     }
 
-    /// Block for the next pane event (used by tests / event loops).
-    pub fn recv_event(&self) -> Option<PaneEvent> {
-        self.events.recv().ok()
-    }
+    // NOTE: no blocking `recv_event` — a remote pane's backend holds a live event Sender for the
+    // pane's lifetime, so a recv-until-disconnect loop would never terminate. Poll `drain_events`.
 
     pub fn attention(&self) -> Attention {
         *self.attention.lock().unwrap()
@@ -230,11 +329,15 @@ impl Pane {
     }
 
     pub fn is_alive(&self) -> bool {
-        self.pty.is_alive()
+        match &self.backend {
+            Backend::Local { pty } => pty.is_alive(),
+            Backend::Remote { alive, .. } => alive.load(Ordering::Relaxed),
+        }
     }
 }
 
-// On drop, fields drop in order: `pty` first (ClosePseudoConsole -> reader EOF -> the pump's input
-// channel closes -> the pump loop ends), then the `pump` JoinHandle drops and detaches the finished
-// thread. Joining here would deadlock, since `pty` is still open while this runs.
-
+// On drop, fields drop in order: `backend` (holding the `Pty`) before `_pump`, so for local panes
+// ClosePseudoConsole -> reader EOF -> the pump's input channel closes -> the pump loop ends, then
+// the `pump` JoinHandle drops and detaches the finished thread. Joining here would deadlock, since
+// the `Pty` is still open while this runs. Remote panes have no pump; dropping the backend drops
+// the input closure and the events sender.

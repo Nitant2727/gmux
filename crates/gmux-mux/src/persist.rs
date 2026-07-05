@@ -48,14 +48,22 @@ pub enum NodeSnapshot {
 }
 
 impl SessionSnapshot {
-    /// Capture a session's layout + per-pane cwd.
+    /// Capture a session's layout + per-pane cwd. Remote (tmux-mirror) panes are skipped — the
+    /// remote server owns their processes, so respawning them as local shells on restore would be
+    /// wrong (stage 2 re-attaches them by reconnecting the transport instead). Windows left with
+    /// no local panes are dropped, and the active index is remapped to the kept windows.
     pub fn capture(session: &Session) -> SessionSnapshot {
-        let windows = session
-            .windows()
-            .iter()
-            .map(WindowSnapshot::capture)
-            .collect();
-        SessionSnapshot { version: SNAPSHOT_VERSION, active: session.active_index(), windows }
+        let mut windows = Vec::new();
+        let mut active = 0;
+        for (i, w) in session.windows().iter().enumerate() {
+            if let Some(snap) = WindowSnapshot::capture(w) {
+                if i == session.active_index() {
+                    active = windows.len();
+                }
+                windows.push(snap);
+            }
+        }
+        SessionSnapshot { version: SNAPSHOT_VERSION, active, windows }
     }
 
     /// Restore a session by respawning a shell per pane. `spawn(record)` creates a pane (the caller
@@ -73,10 +81,27 @@ impl SessionSnapshot {
 }
 
 impl WindowSnapshot {
-    fn capture(window: &Window) -> WindowSnapshot {
-        // Collect leaf pane ids in tree order and map id -> index.
-        let mut ids = Vec::new();
-        window.root().leaves(&mut ids);
+    /// Capture one window, or `None` if it holds no local panes (remote panes are not persisted).
+    fn capture(window: &Window) -> Option<WindowSnapshot> {
+        // Collect leaf pane ids in tree order, keeping only local panes, and map id -> index.
+        let mut all = Vec::new();
+        window.root().leaves(&mut all);
+        let ids: Vec<PaneId> = all
+            .iter()
+            .copied()
+            .filter(|id| window.pane(*id).is_none_or(|p| p.remote_id().is_none()))
+            .collect();
+        if ids.is_empty() {
+            return None;
+        }
+        // Prune remote leaves from the layout so NodeSnapshot indices line up with `ids`. Safe:
+        // at least one local leaf remains, so no removal ever targets the sole leaf.
+        let mut root = window.root().clone();
+        for id in &all {
+            if !ids.contains(id) {
+                root = root.remove_leaf(*id);
+            }
+        }
         let mut index_of = HashMap::new();
         for (i, id) in ids.iter().enumerate() {
             index_of.insert(*id, i);
@@ -89,7 +114,7 @@ impl WindowSnapshot {
             })
             .collect();
         let active = index_of.get(&window.active_id()).copied().unwrap_or(0);
-        WindowSnapshot { panes, layout: node_to_snapshot(window.root(), &index_of), active }
+        Some(WindowSnapshot { panes, layout: node_to_snapshot(&root, &index_of), active })
     }
 
     fn restore<F>(&self, spawn: &mut F) -> io::Result<Window>
@@ -177,6 +202,40 @@ mod tests {
         let json = serde_json::to_string(&snap).unwrap();
         let back: SessionSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back, snap);
+    }
+
+    #[test]
+    fn capture_drops_remote_only_windows() {
+        // A session whose only pane mirrors a remote tmux pane persists nothing: the remote
+        // server owns the process, so there is nothing to respawn locally.
+        let remote = Pane::remote(9, 80, 24, Box::new(|_| {}));
+        let session = Session::start("s", remote);
+        let snap = SessionSnapshot::capture(&session);
+        assert!(snap.windows.is_empty(), "remote-only windows must not be persisted");
+        // Restoring the (empty) snapshot respawns nothing; the server then falls back to fresh.
+        let restored = snap.restore("s", |_| unreachable!("nothing to respawn")).unwrap();
+        assert_eq!(restored.pane_count(), 0);
+    }
+
+    #[test]
+    fn capture_prunes_remote_leaves_from_mixed_windows() {
+        // A window mixing a local and a remote pane keeps only the local leaf, with the split
+        // collapsed. The "local" pane is a bare leaf id with no Pane entry — capture treats
+        // unknown ids as local (empty record) — so no console is needed here.
+        let remote = Pane::remote(4, 80, 24, Box::new(|_| {}));
+        let rid = remote.id;
+        let local_id = PaneId::alloc();
+        let mut root = Node::leaf(local_id);
+        root.split_leaf(local_id, SplitDir::Horizontal, rid);
+        let mut map = HashMap::new();
+        map.insert(rid, remote);
+        let window = Window::from_parts(map, root, rid);
+        let session = Session::from_windows("s", vec![window], 0);
+
+        let snap = SessionSnapshot::capture(&session);
+        assert_eq!(snap.windows.len(), 1);
+        assert_eq!(snap.windows[0].panes.len(), 1, "the remote pane must not be captured");
+        assert_eq!(snap.windows[0].layout, NodeSnapshot::Leaf(0), "the remote leaf must be pruned");
     }
 
     #[test]
