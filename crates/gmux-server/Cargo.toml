@@ -9,3 +9,4 @@ publish = false
 gmux-mux = { path = "../gmux-mux" }
 gmux-proto = { path = "../gmux-proto" }
 gmux-pipe = { path = "../gmux-pipe" }
+serde_json = "1"

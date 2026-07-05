@@ -8,7 +8,9 @@
 use std::io::{self, BufReader};
 use std::sync::{Arc, Mutex};
 
-use gmux_mux::{FocusDir, Pane, PaneEvent, PaneId, PtySize, Session, SplitDir, Urgency};
+use std::path::PathBuf;
+
+use gmux_mux::{FocusDir, Pane, PaneEvent, PaneId, PtySize, Session, SessionSnapshot, SplitDir, Urgency};
 use gmux_pipe::{PipeServer, PipeStream};
 use gmux_proto::{
     read_msg, write_msg, Call, CellWire, GridWire, LayoutWire, NotifyWire, PaneInfo, PaneRectWire,
@@ -25,6 +27,8 @@ pub struct Server {
     last_view: (u32, u32),
     /// Notifications raised by panes, drained by `PollNotifications`.
     notifications: Vec<NotifyWire>,
+    /// Tick counter for debounced snapshot saves.
+    ticks: u32,
 }
 
 impl Server {
@@ -36,7 +40,42 @@ impl Server {
             shell,
             last_view: (1200, 720),
             notifications: Vec::new(),
+            ticks: 0,
         })
+    }
+
+    /// Restore the last session from disk (respawning shells in saved cwds), or start fresh.
+    pub fn restore_or_new(shell: String) -> io::Result<Server> {
+        if let Some(snap) = load_snapshot() {
+            let restored = snap.restore("gmux", |cwd| Pane::spawn_in(&shell, DEFAULT_SIZE, cwd));
+            if let Ok(session) = restored {
+                if session.pane_count() > 0 {
+                    eprintln!("gmux daemon: restored {} pane(s) from last session", session.pane_count());
+                    return Ok(Server {
+                        session,
+                        shell,
+                        last_view: (1200, 720),
+                        notifications: Vec::new(),
+                        ticks: 0,
+                    });
+                }
+            }
+        }
+        Server::new(shell)
+    }
+
+    /// Persist the current layout + per-pane cwd to disk (atomic).
+    pub fn save(&self) {
+        let snap = SessionSnapshot::capture(&self.session);
+        let Ok(json) = serde_json::to_string_pretty(&snap) else { return };
+        let path = state_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
 
     /// Drain every pane's events: queue notifications for `PollNotifications` and remove panes
@@ -67,6 +106,11 @@ impl Server {
         self.notifications.extend(notes);
         for id in exited {
             self.session.remove_pane(id);
+        }
+        // Debounced snapshot save (~every 2 s at a 100 ms tick).
+        self.ticks = self.ticks.wrapping_add(1);
+        if self.ticks % 20 == 0 {
+            self.save();
         }
     }
 
@@ -335,9 +379,20 @@ fn capture(p: &Pane) -> String {
     lines.join("\n")
 }
 
-/// Run the daemon: create the mux, serve the pipe, and block until all panes exit.
+/// Where the session snapshot lives: `%LOCALAPPDATA%\gmux\state\session.json`.
+fn state_path() -> PathBuf {
+    let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(base).join("gmux").join("state").join("session.json")
+}
+
+fn load_snapshot() -> Option<SessionSnapshot> {
+    let text = std::fs::read_to_string(state_path()).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Run the daemon: restore or create the mux, serve the pipe, and block until all panes exit.
 pub fn run(shell: String, pipe_base: &str) -> io::Result<()> {
-    let server = Arc::new(Mutex::new(Server::new(shell)?));
+    let server = Arc::new(Mutex::new(Server::restore_or_new(shell)?));
     let name = gmux_pipe::pipe_name_for_user(pipe_base);
     let handler_server = server.clone();
     let _pipe = PipeServer::start(&name, move |stream| {
@@ -357,6 +412,9 @@ pub fn run(shell: String, pipe_base: &str) -> io::Result<()> {
         };
         if done {
             eprintln!("gmux daemon: all panes exited, shutting down");
+            // Clean exit: clear the snapshot so the next start is fresh (a reboot, by contrast,
+            // kills the daemon and leaves the last periodic save to restore from).
+            let _ = std::fs::remove_file(state_path());
             return Ok(());
         }
     }

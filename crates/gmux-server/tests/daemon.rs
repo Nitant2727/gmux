@@ -69,6 +69,27 @@ fn server_owns_pane_and_serves_protocol() {
     assert!(found, "captured screen never showed the echoed marker");
 }
 
+#[test]
+#[ignore = "requires a real console; run via scripts/console-tests.ps1 gmux-server daemon"]
+fn snapshot_capture_and_restore_rebuilds_layout() {
+    use gmux_mux::{Pane, PtySize, SessionSnapshot};
+
+    let mut s = Server::new("cmd.exe".to_string()).expect("server");
+    // Split so there are two panes in a tree.
+    s.handle(&Request { id: 1, call: Call::SplitPane { dir: "h".into(), command: Some("cmd.exe".into()) } });
+    let snap = SessionSnapshot::capture(&s.session);
+    assert_eq!(snap.windows.len(), 1);
+    assert_eq!(snap.windows[0].panes.len(), 2, "snapshot must capture both panes");
+
+    // Restore into a brand-new session (as a fresh daemon would after reboot).
+    let restored = snap
+        .restore("gmux", |cwd| Pane::spawn_in("cmd.exe", PtySize { cols: 80, rows: 24 }, cwd))
+        .expect("restore");
+    assert_eq!(restored.pane_count(), 2, "restore must rebuild both panes");
+    assert_eq!(restored.windows().len(), 1);
+    assert_eq!(restored.active_window().unwrap().pane_count(), 2);
+}
+
 fn count_panes(s: &mut Server) -> usize {
     match s.handle(&Request { id: 100, call: Call::ListPanes }).result {
         Some(ResultBody::Panes(p)) => p.len(),

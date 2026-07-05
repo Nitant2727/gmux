@@ -168,9 +168,22 @@ impl Pty {
         size: PtySize,
         env: &[(String, String)],
     ) -> io::Result<(Pty, Receiver<Vec<u8>>)> {
+        Self::spawn_full(command_line, size, env, None)
+    }
+
+    /// Like [`Pty::spawn_with_env`] but also sets the child's working directory (`cwd`) — used by
+    /// session restore to reopen shells in their saved directory.
+    pub fn spawn_full(
+        command_line: &str,
+        size: PtySize,
+        env: &[(String, String)],
+        cwd: Option<&str>,
+    ) -> io::Result<(Pty, Receiver<Vec<u8>>)> {
         ensure_console();
-        // Keep the env block alive for the whole CreateProcessW call.
+        // Keep the env block + cwd alive for the whole CreateProcessW call.
         let mut env_block = if env.is_empty() { Vec::new() } else { build_env_block(env) };
+        let cwd_w = cwd.filter(|c| !c.is_empty()).map(wide);
+        let cwd_ptr = cwd_w.as_ref().map(|v| v.as_ptr()).unwrap_or(null());
         let (env_ptr, env_flag) = if env_block.is_empty() {
             (null(), 0)
         } else {
@@ -243,7 +256,7 @@ impl Pty {
                 0, // no handle inheritance; pseudoconsole binds stdio
                 EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | env_flag,
                 env_ptr,
-                null(),
+                cwd_ptr,
                 &si as *const STARTUPINFOEXW as *const _,
                 &mut pi,
             );

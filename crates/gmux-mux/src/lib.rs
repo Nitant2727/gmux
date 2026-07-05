@@ -6,12 +6,14 @@ pub mod attention;
 pub mod ids;
 pub mod layout;
 pub mod pane;
+pub mod persist;
 pub mod workspace;
 
 pub use attention::Attention;
 pub use ids::{PaneId, SessionId, WindowId};
 pub use layout::{FocusDir, Rect, SplitDir};
 pub use pane::{Pane, PaneEvent, PaneSnapshot};
+pub use persist::SessionSnapshot;
 pub use workspace::WorkspaceInfo;
 
 // Re-export the types callers need so they don't have to depend on gmux-pty / gmux-vt directly.
@@ -65,6 +67,14 @@ impl Window {
     }
     pub fn toggle_zoom(&mut self) {
         self.zoom = !self.zoom;
+    }
+    /// The split tree root (for persistence/inspection).
+    pub fn root(&self) -> &Node {
+        &self.root
+    }
+    /// Build a window from a pre-constructed pane map + split tree (used by session restore).
+    pub fn from_parts(panes: HashMap<PaneId, Pane>, root: Node, active: PaneId) -> Window {
+        Window { id: WindowId::alloc(), panes, root, active, zoom: false }
     }
 
     /// Split the active pane, insert `new_pane`, and focus it.
@@ -150,6 +160,12 @@ impl Session {
 
     fn empty(name: impl Into<String>) -> Self {
         Session { id: SessionId::alloc(), name: name.into(), windows: Vec::new(), active: 0 }
+    }
+
+    /// Build a session from pre-constructed windows (used by session restore).
+    pub fn from_windows(name: impl Into<String>, windows: Vec<Window>, active: usize) -> Session {
+        let active = if windows.is_empty() { 0 } else { active.min(windows.len() - 1) };
+        Session { id: SessionId::alloc(), name: name.into(), windows, active }
     }
 
     pub fn window_count(&self) -> usize {

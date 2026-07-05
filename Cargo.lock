@@ -592,6 +592,8 @@ version = "0.0.0"
 dependencies = [
  "gmux-pty",
  "gmux-vt",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -630,6 +632,7 @@ dependencies = [
  "gmux-mux",
  "gmux-pipe",
  "gmux-proto",
+ "serde_json",
 ]
 
 [[package]]
