@@ -46,16 +46,21 @@ ASCII for now), win32-input-mode + mouse (basic key mapping done), damage-tracke
 now), scrollback viewport (visible grid only), Git Bash/WSL shell matrix pass. *Next:* M2 (toasts —
 attention→`Pending` path already proven; productize the WinRT toast from the M0 spike).
 
-### M2 — Notification hooks, productized (the killer feature)
+### M2 — Notification hooks, productized (the killer feature) ✅ COMPLETE (2026-07-05)
 
-- Attention state machine in `gmux-mux`; `gmux-notify` toast layer (AUMID, XML, activation, History);
-  FlashWindowEx + ITaskbarList3 overlay badge + OSC 9;4 → taskbar progress; pane ring + unread badge in
-  the GUI; suppression matrix + clear-on-focus + rate limiting; BEL + OSC 133 idle detection.
-- Minimal pipe stub so `gmux notify` works (full API comes in M5); `GMUX_PANE` env injection.
-- `gmux hooks setup claude-code|codex|gemini|aider`.
-- *Demo:* three agents in three panes; each firing OSC 9/777/99 rings its pane and toasts when gmux is
-  unfocused; click the toast → the right pane focuses. *Tests:* the standing killer-feature integration
-  suite (§14.3 of ARCHITECTURE.md).
+- **`gmux-notify`** (built + verified by a workflow; a real toast fired on the live desktop): registry-AUMID
+  unpackaged toasts (sanitize + XML-escape, tag/group replace-in-place, urgent scenario, History clear,
+  in-proc click activation queue), `flash_window` (FlashWindowEx), `Taskbar` progress (ITaskbarList3).
+- **App wiring** (`gmux-gui`): pane attention → toast + flash (suppressed when focused), OSC 9;4 → taskbar
+  progress, clear-on-focus (toast removed + flash stopped), click-to-focus, per-pane 1 s rate limit; pane
+  ring already renders (M1).
+- **`GMUX_PANE` env injection** into every pane (+ `TERM_PROGRAM=gmux`, `COLORTERM`).
+- **`gmux notify --title --body`** emits OSC 777 to stdout (pane-attributed via the PTY stream, no pipe).
+- **`gmux hooks setup claude-code|codex|gemini|aider|all`** merges agent configs (idempotent, preserves
+  existing); **`gmux _hook claude-code`** turns a Notification event into Claude Code's `terminalSequence`.
+
+Deferred: OSC 133 idle→attention (BEL covered); overlay-icon count badge (flash+progress done); multi-pane
+toast attribution refinements land with M3 splits. *Next:* M3 (splits).
 
 ### M3 — Splits and multiplexing UI
 
