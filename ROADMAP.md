@@ -176,9 +176,16 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
   layout-string parser (recursive descent, 64-level depth cap — a remote-deliverable deep-nesting
   stack overflow was caught by adversarial review pre-commit); 1 MiB unterminated-line cap
   (bounded memory against a hostile peer). 43 tests + doc-test.
-- Stage 2: `gmux ssh-tmux user@host` — spawn `ssh … tmux -CC attach` (strip the DCS wrapper),
-  request queue over stdin, map session→session/window→window/pane→pane into the mux, bidirectional
-  (split/send-keys/paste), pause-based flow control; tmux ≥3.2 gate with degraded mode below.
+- **Stage 2a ✅ (2026-07-06): Pane local/remote backend** — `Pane` is now backed by either a local
+  ConPTY (unchanged semantics, teardown fix intact) or a remote tmux mirror (`Pane::remote` +
+  `push_output`; no local process). Both funnel through one `pump_bytes` mapping, so **OSC 9/777/99
+  from remote agents raise attention/toasts identically to local panes**. Persist prunes remote
+  leaves from the layout tree (indices stay consistent; remote panes re-attach via the transport,
+  never respawn as local shells). 152 tests; console suites green.
+- Stage 2b: `gmux-remote` transport — spawn `ssh -tt … tmux -CC new -As gmux` (injectable command
+  line; tested against stub processes — no WSL/tmux on the dev machine), strip the DCS wrapper,
+  ordered reply correlation, `send-keys -H` input, tmux-layout→`Node` converter; then server/CLI
+  wiring (`gmux ssh-tmux`), pause-based flow control; tmux ≥3.2 gate with degraded mode below.
 
 ### M10 — Keybindings & configuration polish
 
