@@ -1,0 +1,27 @@
+# Standalone spike crate — detached from any parent workspace.
+[workspace]
+
+[package]
+name = "toast-spike"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "toast-spike"
+path = "src/main.rs"
+
+[dependencies.windows]
+version = "0.62"
+features = [
+    "Data_Xml_Dom",
+    "UI_Notifications",
+    "Foundation",
+    "Foundation_Collections",
+    "Win32_Foundation",
+    "Win32_Security",           # required to gate in RegCreateKeyExW
+    "Win32_UI_Shell",           # SetCurrentProcessExplicitAppUserModelID
+    "Win32_System_Registry",    # RegSetKeyValueW etc.
+]
+
+[dependencies.windows-core]
+version = "0.62"

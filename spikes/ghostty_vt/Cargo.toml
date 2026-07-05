@@ -1,0 +1,15 @@
+# Standalone spike crate — detached from any parent workspace.
+[workspace]
+
+[package]
+name = "ghostty_vt_spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+libghostty-vt = "0.2"
+
+[[bin]]
+name = "ghostty_vt_spike"
+path = "src/main.rs"
