@@ -33,8 +33,10 @@ pub enum Call {
     ListPanes,
     /// Write text (and optionally a trailing Enter) to a pane.
     SendKeys { pane: u64, text: String, #[serde(default)] enter: bool },
-    /// Read a pane's visible screen text.
-    CapturePane { pane: u64 },
+    /// Read a pane's screen text. `scrollback` (the `-S` option) requests history above the
+    /// viewport: `Some(0)` = all retained scrollback + screen, `Some(n)` = the most-recent `n`
+    /// lines, `None` = the visible screen only.
+    CapturePane { pane: u64, #[serde(default)] scrollback: Option<usize> },
     /// Split the active pane. `dir` is "h" (side-by-side) or "v" (stacked).
     SplitPane { dir: String, #[serde(default)] command: Option<String> },
     /// Open a new window (tab).
@@ -45,8 +47,9 @@ pub enum Call {
     // --- rendering / control (used by the thin-client GUI, M6 stage 2) ---
     /// Get the active window's pane rectangles + tab list for a content area of `w`×`h` pixels.
     GetLayout { w: u32, h: u32 },
-    /// Get a pane's visible grid for rendering.
-    GetGrid { pane: u64 },
+    /// Get a pane's grid for rendering. `offset` scrolls the viewport `offset` lines up into
+    /// scrollback history (0 = the live screen); it is clamped server-side to available history.
+    GetGrid { pane: u64, #[serde(default)] offset: usize },
     /// Report the GUI's content-area geometry so the daemon resizes the active window's panes.
     ResizeView { w: u32, h: u32, cell_w: u32, cell_h: u32 },
     /// Move focus between panes: `dir` is "left" | "right" | "up" | "down".
@@ -125,6 +128,12 @@ pub struct GridWire {
     pub cursor_col: u16,
     pub cursor_row: u16,
     pub cells: Vec<CellWire>,
+    /// Scrollback lines available above the viewport (for scroll clamping / indicators).
+    #[serde(default)]
+    pub history: u32,
+    /// The scroll offset actually rendered (the requested offset clamped to `history`).
+    #[serde(default)]
+    pub offset: u32,
 }
 
 /// One pane's rectangle within the content area.
@@ -211,7 +220,7 @@ mod tests {
             Call::Hello { client_version: "0.0.0".into() },
             Call::ListPanes,
             Call::SendKeys { pane: 5, text: "ls".into(), enter: true },
-            Call::CapturePane { pane: 5 },
+            Call::CapturePane { pane: 5, scrollback: Some(100) },
             Call::SplitPane { dir: "h".into(), command: None },
             Call::NewWindow { command: Some("cmd.exe".into()) },
             Call::Notify { pane: Some(5), title: "T".into(), body: "B".into() },
@@ -263,7 +272,7 @@ mod tests {
     fn render_methods_and_results_roundtrip() {
         for call in [
             Call::GetLayout { w: 800, h: 600 },
-            Call::GetGrid { pane: 3 },
+            Call::GetGrid { pane: 3, offset: 25 },
             Call::ResizeView { w: 800, h: 600, cell_w: 9, cell_h: 18 },
             Call::FocusPane { dir: "right".into() },
             Call::ClosePane,
@@ -286,6 +295,8 @@ mod tests {
                 CellWire { ch: 'h', fg: [255, 255, 255], bg: [0, 0, 0], flags: CELL_BOLD },
                 CellWire { ch: 'i', fg: [10, 20, 30], bg: [1, 2, 3], flags: 0 },
             ],
+            history: 120,
+            offset: 25,
         });
         let resp = Response::ok(2, grid.clone());
         let mut buf = Vec::new();

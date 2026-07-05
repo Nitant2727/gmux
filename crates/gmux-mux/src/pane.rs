@@ -144,21 +144,56 @@ impl Pane {
         self.pty.write(data)
     }
 
-    /// Resize both the pseudoconsole and the terminal grid.
+    /// Resize both the pseudoconsole and the terminal grid. No-op when the size is unchanged, so
+    /// periodic geometry heartbeats don't spam `ResizePseudoConsole`.
     pub fn resize(&self, size: PtySize) -> io::Result<()> {
-        self.terminal.lock().unwrap().resize(size.cols, size.rows);
+        {
+            let mut term = self.terminal.lock().unwrap();
+            if term.cols() == size.cols && term.rows() == size.rows {
+                return Ok(());
+            }
+            term.resize(size.cols, size.rows);
+        }
         self.pty.resize(size)
     }
 
     /// Snapshot the visible grid for rendering.
     pub fn snapshot(&self) -> PaneSnapshot {
+        self.snapshot_at(0)
+    }
+
+    /// Snapshot the grid scrolled `offset` lines up into scrollback (0 = live screen; clamped to
+    /// available history). Backs the GUI scrollback viewport via `GetGrid { offset }`.
+    pub fn snapshot_at(&self, offset: usize) -> PaneSnapshot {
+        self.snapshot_scrolled(offset).0
+    }
+
+    /// Like [`snapshot_at`], but also returns `(history, clamped_offset)` read under the **same**
+    /// terminal lock, so the reported scroll position can't skew against the rendered cells when
+    /// the pump thread mutates history concurrently.
+    pub fn snapshot_scrolled(&self, offset: usize) -> (PaneSnapshot, usize, usize) {
         let term = self.terminal.lock().unwrap();
-        PaneSnapshot {
-            cells: term.visible_cells(),
+        let history = term.history_len();
+        let offset = offset.min(history);
+        let snap = PaneSnapshot {
+            cells: term.cells_at_offset(offset),
             cursor: term.cursor(),
             cols: term.cols(),
             rows: term.rows(),
-        }
+        };
+        (snap, history, offset)
+    }
+
+    /// Scrollback + visible content as plain text lines (oldest first). `max_lines == 0` returns all
+    /// retained history; otherwise the most-recent `max_lines`. Backs `capture-pane -S` and the
+    /// snapshot screen capture used by session restore.
+    pub fn scrollback_text(&self, max_lines: usize) -> Vec<String> {
+        self.terminal.lock().unwrap().scrollback_text(max_lines)
+    }
+
+    /// Number of scrollback (history) lines currently retained above the viewport.
+    pub fn history_len(&self) -> usize {
+        self.terminal.lock().unwrap().history_len()
     }
 
     /// Drain any pending pane events (non-blocking).

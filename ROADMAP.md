@@ -136,6 +136,11 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
 
 ### M8 — MVP hardening and release
 
+- **Scrollback viewport (in progress):** gmux-vt exposes history (`history_len` / `cells_at_offset` /
+  `scrollback_text` over alacritty's 10k-line grid history) ✅; `capture-pane -S` (protocol
+  `CapturePane.scrollback`, CLI `-S <n>|-S -`) ✅; `GetGrid.offset` + `GridWire.history/offset` for the
+  GUI viewport ✅; persist now snapshots the last 200 lines of scrollback+screen (M7b) ✅; GUI
+  wheel/PageUp scroll + daemon-reconnect — in flight.
 - x64+ARM64 CI matrix, code signing, installer (plus portable zip), first-run experience
   (shell-integration snippets, `hooks setup` prompt), docs site, crash reporting (opt-in, local dumps).
 - **MVP definition of done:** a developer on Windows 11 runs three parallel Claude Code sessions in three

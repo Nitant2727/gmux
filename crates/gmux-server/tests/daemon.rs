@@ -47,7 +47,7 @@ fn server_owns_pane_and_serves_protocol() {
     assert!(layout.panes.iter().any(|r| r.active), "one pane must be active");
 
     // GetGrid returns a full grid for a pane.
-    let grid = match s.handle(&Request { id: 11, call: Call::GetGrid { pane } }).result {
+    let grid = match s.handle(&Request { id: 11, call: Call::GetGrid { pane, offset: 0 } }).result {
         Some(ResultBody::Grid(g)) => g,
         other => panic!("expected grid, got {other:?}"),
     };
@@ -100,7 +100,7 @@ fn count_panes(s: &mut Server) -> usize {
 }
 
 fn capture_contains(s: &mut Server, pane: u64, needle: &str) -> bool {
-    match s.handle(&Request { id: 101, call: Call::CapturePane { pane } }).result {
+    match s.handle(&Request { id: 101, call: Call::CapturePane { pane, scrollback: None } }).result {
         Some(ResultBody::Text(t)) => t.contains(needle),
         _ => false,
     }

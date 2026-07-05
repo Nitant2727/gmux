@@ -212,37 +212,88 @@ impl Terminal {
 
     /// Visible grid, row-major, with fg/bg resolved to `Rgb` for the renderer.
     pub fn visible_cells(&self) -> Vec<Vec<Cell>> {
+        self.cells_at_offset(0)
+    }
+
+    /// Number of scrollback (history) lines currently retained above the viewport.
+    pub fn history_len(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
+    /// The viewport scrolled `offset` lines up into scrollback, row-major with resolved colors.
+    /// `offset == 0` is the live screen (identical to [`visible_cells`]); `offset` is clamped to the
+    /// available history so callers can over-scroll harmlessly. Used by the GUI scrollback viewport.
+    pub fn cells_at_offset(&self, offset: usize) -> Vec<Vec<Cell>> {
         let grid = self.term.grid();
         let rows = self.rows as usize;
         let cols = self.cols as usize;
+        let offset = offset.min(grid.history_size()) as i32;
         let mut out = Vec::with_capacity(rows);
         for r in 0..rows {
-            let line = Line(r as i32);
-            let row = &grid[line];
-            let mut cells = Vec::with_capacity(cols);
-            for c in 0..cols {
-                let cell = &row[Column(c)];
-                let flags = cell.flags;
-                let inverse = flags.contains(Flags::INVERSE);
-                let bold = flags.contains(Flags::BOLD);
-                let mut fg = resolve_color(cell.fg, DEFAULT_FG, bold);
-                let mut bg = resolve_color(cell.bg, DEFAULT_BG, false);
-                if inverse {
-                    std::mem::swap(&mut fg, &mut bg);
-                }
-                cells.push(Cell {
-                    ch: cell.c,
-                    fg,
-                    bg,
-                    bold,
-                    italic: flags.contains(Flags::ITALIC),
-                    underline: flags.intersects(Flags::ALL_UNDERLINES),
-                    inverse,
-                });
-            }
-            out.push(cells);
+            // Top visible row is `offset` lines above screen line 0 (negative == history).
+            let line = Line(r as i32 - offset);
+            out.push(self.row_cells(grid, line, cols));
         }
         out
+    }
+
+    /// Resolve one grid line into a row of renderer [`Cell`]s.
+    fn row_cells(
+        &self,
+        grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+        line: Line,
+        cols: usize,
+    ) -> Vec<Cell> {
+        let row = &grid[line];
+        let mut cells = Vec::with_capacity(cols);
+        for c in 0..cols {
+            let cell = &row[Column(c)];
+            let flags = cell.flags;
+            let inverse = flags.contains(Flags::INVERSE);
+            let bold = flags.contains(Flags::BOLD);
+            let mut fg = resolve_color(cell.fg, DEFAULT_FG, bold);
+            let mut bg = resolve_color(cell.bg, DEFAULT_BG, false);
+            if inverse {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+            cells.push(Cell {
+                ch: cell.c,
+                fg,
+                bg,
+                bold,
+                italic: flags.contains(Flags::ITALIC),
+                underline: flags.intersects(Flags::ALL_UNDERLINES),
+                inverse,
+            });
+        }
+        cells
+    }
+
+    /// Scrollback + visible content as plain text lines (oldest first), trailing blanks trimmed.
+    /// Returns at most `max_lines` of the *most recent* content (history nearest the viewport plus
+    /// the live screen); `max_lines == 0` means "all retained lines". Fully blank lines at the top
+    /// of the returned range are dropped so restored/idle terminals don't emit a wall of emptiness.
+    /// Backs the automation `capture-pane -S` scrollback query and session-restore replay.
+    pub fn scrollback_text(&self, max_lines: usize) -> Vec<String> {
+        let grid = self.term.grid();
+        let cols = self.cols as usize;
+        let top = grid.topmost_line().0; // negative: -history_size
+        let bottom = grid.bottommost_line().0; // screen_lines - 1
+        let total = (bottom - top + 1) as usize;
+        let take = if max_lines == 0 { total } else { max_lines.min(total) };
+        let start = bottom - (take as i32) + 1; // most-recent `take` lines
+        let mut lines: Vec<String> = Vec::with_capacity(take);
+        for l in start..=bottom {
+            let row = &grid[Line(l)];
+            let mut s: String = (0..cols).map(|c| row[Column(c)].c).collect();
+            let trimmed = s.trim_end_matches(' ').len();
+            s.truncate(trimmed);
+            lines.push(s);
+        }
+        // Drop leading fully-blank lines (common when scrollback isn't full yet).
+        let first_content = lines.iter().position(|l| !l.is_empty()).unwrap_or(lines.len());
+        lines.drain(0..first_content);
+        lines
     }
 }
 

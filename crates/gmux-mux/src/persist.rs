@@ -113,18 +113,14 @@ impl WindowSnapshot {
     }
 }
 
-/// The pane's visible screen as text lines, with trailing blank lines trimmed.
+/// How many lines of scrollback + screen to persist per pane. Enough to restore meaningful
+/// context without bloating the snapshot file.
+const SCREEN_CAPTURE_LINES: usize = 200;
+
+/// The pane's recent output (scrollback + visible screen, most-recent `SCREEN_CAPTURE_LINES`) as
+/// text lines, with trailing blank lines trimmed.
 fn screen_lines(p: &Pane) -> Vec<String> {
-    let snap = p.snapshot();
-    let mut lines: Vec<String> = snap
-        .cells
-        .iter()
-        .map(|row| {
-            let mut s: String = row.iter().map(|c| c.ch).collect();
-            s.truncate(s.trim_end_matches(' ').len());
-            s
-        })
-        .collect();
+    let mut lines = p.scrollback_text(SCREEN_CAPTURE_LINES);
     while lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
     }

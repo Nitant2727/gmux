@@ -9,7 +9,7 @@ use gmux_mux::{Attention, Cell, PaneSnapshot, Rect, Rgb};
 use gmux_notify::{flash_window, Notifier, ProgressState as NProgress, Taskbar, ToastRequest, Urgency as NUrgency};
 use gmux_proto::{Call, GridWire, LayoutWire, NotifyWire, ResultBody, CELL_BOLD, CELL_INVERSE, CELL_ITALIC, CELL_UNDERLINE};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -40,6 +40,12 @@ struct State {
     notifier: Option<Notifier>,
     taskbar: Option<Taskbar>,
     last_toast: std::collections::HashMap<u64, Instant>,
+    // Scrollback viewport for the active pane (0 = live screen), with the last-seen history
+    // depth and grid rows from the daemon for local clamping / page sizing.
+    scroll_offset: usize,
+    scroll_history: usize,
+    active_rows: usize,
+    heartbeat_ticks: u32,
 }
 
 /// Run the gmux GUI. `_shell` is currently unused (the daemon picks its shell); kept for the CLI
@@ -117,6 +123,10 @@ impl ApplicationHandler for App {
             notifier,
             taskbar,
             last_toast: std::collections::HashMap::new(),
+            scroll_offset: 0,
+            scroll_history: 0,
+            active_rows: 0,
+            heartbeat_ticks: 0,
         };
         st.sync_size();
         self.state = Some(st);
@@ -146,10 +156,21 @@ impl ApplicationHandler for App {
                     st.window.request_redraw();
                 }
             }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if let Some(st) = self.state.as_mut() {
+                    // Wheel up (positive y) scrolls deeper into history.
+                    let lines = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => (y * 3.0).round() as i64,
+                        MouseScrollDelta::PixelDelta(p) => (p.y / st.cell_dims().1 as f64).round() as i64,
+                    };
+                    st.scroll_by(lines);
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if !self.try_shortcut(&event) {
                     if let Some(bytes) = key_to_bytes(&event, self.mods) {
                         if let Some(st) = self.state.as_mut() {
+                            st.scroll_offset = 0; // typing snaps back to the live screen
                             let text = String::from_utf8_lossy(&bytes).into_owned();
                             st.client.control(Call::SendKeys { pane: st.active_pane, text, enter: false });
                         }
@@ -189,6 +210,14 @@ impl ApplicationHandler for App {
             }
         }
 
+        // Re-send our geometry roughly once per second (30 of the 33ms poll ticks) so a
+        // restarted daemon relearns pane sizes.
+        st.heartbeat_ticks += 1;
+        if st.heartbeat_ticks >= 30 {
+            st.heartbeat_ticks = 0;
+            st.sync_size();
+        }
+
         // Poll the daemon for fresh output by re-rendering.
         st.window.request_redraw();
         el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME));
@@ -211,6 +240,7 @@ impl App {
                     _ => None,
                 };
                 if let Some(d) = dir {
+                    st.scroll_offset = 0; // focus moves snap back to the live screen
                     st.client.control(Call::FocusPane { dir: d.to_string() });
                     st.window.request_redraw();
                     return true;
@@ -231,11 +261,33 @@ impl App {
                     _ => None,
                 };
                 if let Some(call) = control {
+                    st.scroll_offset = 0; // layout/focus changes snap back to the live screen
                     st.client.control(call);
                     st.sync_size();
                     st.window.request_redraw();
                     return true;
                 }
+            }
+        }
+
+        // Scrollback: Shift+PageUp/PageDown page through history; Escape while scrolled snaps
+        // back to live (consumed here so the pane never sees it).
+        if let Key::Named(named) = &event.logical_key {
+            match named {
+                NamedKey::PageUp if mods.shift_key() => {
+                    st.scroll_page(1);
+                    return true;
+                }
+                NamedKey::PageDown if mods.shift_key() => {
+                    st.scroll_page(-1);
+                    return true;
+                }
+                NamedKey::Escape if st.scroll_offset > 0 => {
+                    st.scroll_offset = 0;
+                    st.window.request_redraw();
+                    return true;
+                }
+                _ => {}
             }
         }
         false
@@ -251,6 +303,22 @@ impl State {
         let sidebar_w = self.renderer.sidebar_width().min(self.config.width / 3);
         let content_w = self.config.width.saturating_sub(sidebar_w).max(1);
         (sidebar_w, content_w, self.config.height)
+    }
+
+    /// Scroll the active pane's viewport by `lines` (positive = deeper into history), clamped
+    /// locally to the last-seen history depth; the daemon clamps again server-side.
+    fn scroll_by(&mut self, lines: i64) {
+        let next = (self.scroll_offset as i64 + lines).clamp(0, self.scroll_history as i64) as usize;
+        if next != self.scroll_offset {
+            self.scroll_offset = next;
+            self.window.request_redraw();
+        }
+    }
+
+    /// Scroll by one page (`dir` = +1 up into history, -1 back toward live).
+    fn scroll_page(&mut self, dir: i64) {
+        let page = if self.active_rows > 1 { self.active_rows - 1 } else { 24 };
+        self.scroll_by(dir * page as i64);
     }
 
     /// Tell the daemon our content geometry so it resizes its panes.
@@ -310,6 +378,11 @@ impl State {
             Ok(ResultBody::Layout(l)) => l,
             _ => return,
         };
+        if layout.active_pane != self.active_pane {
+            // The active pane changed daemon-side (e.g. the old one exited): the scroll offset
+            // belonged to the previous pane, so snap the new one to its live screen.
+            self.scroll_offset = 0;
+        }
         self.active_pane = layout.active_pane;
         let rows: Vec<SidebarRow> = layout
             .tabs
@@ -325,8 +398,21 @@ impl State {
 
         let mut snaps: Vec<(PaneSnapshot, Attention, bool, Rect)> = Vec::new();
         for pr in &layout.panes {
-            if let Ok(ResultBody::Grid(g)) = self.client.call(Call::GetGrid { pane: pr.id }) {
-                let snap = grid_to_snapshot(&g);
+            // Only the active pane scrolls; the rest always show the live screen.
+            let offset = if pr.active { self.scroll_offset } else { 0 };
+            if let Ok(ResultBody::Grid(g)) = self.client.call(Call::GetGrid { pane: pr.id, offset }) {
+                if pr.active {
+                    // Accept the server's clamp and remember the history depth / rows for
+                    // local wheel clamping and page sizing.
+                    self.scroll_offset = g.offset as usize;
+                    self.scroll_history = g.history as usize;
+                    self.active_rows = g.rows as usize;
+                }
+                let mut snap = grid_to_snapshot(&g);
+                if g.offset > 0 {
+                    // Scrolled into history: park the cursor off-grid so no cell draws it.
+                    snap.cursor = (g.cols, g.rows);
+                }
                 let att = if pr.attention { Attention::Pending } else { Attention::Quiet };
                 let rect = Rect { x: pr.x + sidebar_w, y: pr.y, w: pr.w, h: pr.h };
                 snaps.push((snap, att, pr.active, rect));

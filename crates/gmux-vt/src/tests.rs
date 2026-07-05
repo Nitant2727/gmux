@@ -303,3 +303,63 @@ fn newline_moves_cursor_down() {
     assert_eq!(text[0], "ab");
     assert_eq!(text[1], "cd");
 }
+
+// ---------------------------------------------------------------------------
+// Scrollback / history (M8 scrollback viewport + capture-pane -S).
+// ---------------------------------------------------------------------------
+
+/// Write more lines than fit on-screen and confirm the overflow lands in scrollback history,
+/// retrievable via `scrollback_text` and re-viewable via `cells_at_offset`.
+#[test]
+fn scrollback_retains_scrolled_off_lines() {
+    let mut t = Terminal::new(20, 5); // tiny 5-row viewport
+    // 12 numbered lines: the first ~7 scroll off the top.
+    let mut input = String::new();
+    for i in 1..=12 {
+        input.push_str(&format!("line{i}\r\n"));
+    }
+    t.advance(input.as_bytes());
+
+    // History now holds the lines pushed above the 5-row viewport.
+    assert!(t.history_len() >= 7, "expected >=7 history lines, got {}", t.history_len());
+
+    // Full scrollback (max_lines = 0) contains both the earliest and the latest content.
+    let all = t.scrollback_text(0);
+    assert!(all.iter().any(|l| l == "line1"), "earliest line missing from scrollback: {all:?}");
+    assert!(all.iter().any(|l| l == "line12"), "latest line missing from scrollback: {all:?}");
+
+    // Capping returns only the most-recent N lines.
+    let last3 = t.scrollback_text(3);
+    assert!(!last3.iter().any(|l| l == "line1"), "cap should drop oldest: {last3:?}");
+    assert!(last3.iter().any(|l| l == "line12"), "cap must keep newest: {last3:?}");
+}
+
+/// `cells_at_offset(0)` equals the live viewport; a positive offset reveals scrolled-off history.
+#[test]
+fn cells_at_offset_scrolls_into_history() {
+    let mut t = Terminal::new(20, 5);
+    let mut input = String::new();
+    for i in 1..=12 {
+        input.push_str(&format!("line{i}\r\n"));
+    }
+    t.advance(input.as_bytes());
+
+    // offset 0 == the live screen.
+    let live = t.cells_at_offset(0);
+    assert_eq!(live.len(), 5);
+    let row_text = |cells: &Vec<Cell>| -> String {
+        let s: String = cells.iter().map(|c| c.ch).collect();
+        s.trim_end_matches(' ').to_string()
+    };
+    let live_top = row_text(&live[0]);
+
+    // Scrolling up reveals older content than the live viewport's top row.
+    let scrolled = t.cells_at_offset(3);
+    assert_eq!(scrolled.len(), 5);
+    let scrolled_top = row_text(&scrolled[0]);
+    assert_ne!(scrolled_top, live_top, "scrolling should change the top row");
+
+    // Over-scrolling is clamped, not a panic/out-of-range.
+    let clamped = t.cells_at_offset(9999);
+    assert_eq!(clamped.len(), 5);
+}

@@ -152,8 +152,8 @@ impl Server {
                 }
                 None => Response::err(id, format!("no pane %{pane}")),
             },
-            Call::CapturePane { pane } => match self.find(*pane) {
-                Some(p) => Response::ok(id, ResultBody::Text(capture(p))),
+            Call::CapturePane { pane, scrollback } => match self.find(*pane) {
+                Some(p) => Response::ok(id, ResultBody::Text(capture(p, *scrollback))),
                 None => Response::err(id, format!("no pane %{pane}")),
             },
             Call::SplitPane { dir, command } => {
@@ -199,8 +199,8 @@ impl Server {
                 self.last_view = (*w, *h);
                 Response::ok(id, ResultBody::Layout(self.layout(*w, *h)))
             }
-            Call::GetGrid { pane } => match self.find(*pane) {
-                Some(p) => Response::ok(id, ResultBody::Grid(grid_wire(p))),
+            Call::GetGrid { pane, offset } => match self.find(*pane) {
+                Some(p) => Response::ok(id, ResultBody::Grid(grid_wire(p, *offset))),
                 None => Response::err(id, format!("no pane %{pane}")),
             },
             Call::ResizeView { w, h, cell_w, cell_h } => {
@@ -331,8 +331,11 @@ impl Server {
     }
 }
 
-fn grid_wire(p: &Pane) -> GridWire {
-    let snap = p.snapshot();
+/// Encode a pane's grid for the wire, scrolled `offset` lines into scrollback (clamped). The
+/// snapshot, history depth, and clamped offset are read under one terminal lock so they can't
+/// skew against each other while the pump thread appends output.
+fn grid_wire(p: &Pane, offset: usize) -> GridWire {
+    let (snap, history, offset) = p.snapshot_scrolled(offset);
     let mut cells = Vec::with_capacity(snap.cols as usize * snap.rows as usize);
     for row in &snap.cells {
         for c in row {
@@ -363,20 +366,28 @@ fn grid_wire(p: &Pane) -> GridWire {
         cursor_col: snap.cursor.0,
         cursor_row: snap.cursor.1,
         cells,
+        history: history as u32,
+        offset: offset as u32,
     }
 }
 
-fn capture(p: &Pane) -> String {
-    let snap = p.snapshot();
-    let mut lines: Vec<String> = snap
-        .cells
-        .iter()
-        .map(|row| {
-            let mut s: String = row.iter().map(|c| c.ch).collect();
-            s.truncate(s.trim_end_matches(' ').len());
-            s
-        })
-        .collect();
+/// Capture a pane's screen text. `scrollback` (the `-S` option) pulls history above the viewport:
+/// `Some(0)` = all retained scrollback + screen, `Some(n)` = the most-recent `n` lines, `None` =
+/// the visible screen only.
+fn capture(p: &Pane, scrollback: Option<usize>) -> String {
+    let mut lines: Vec<String> = match scrollback {
+        Some(n) => p.scrollback_text(n),
+        None => p
+            .snapshot()
+            .cells
+            .iter()
+            .map(|row| {
+                let mut s: String = row.iter().map(|c| c.ch).collect();
+                s.truncate(s.trim_end_matches(' ').len());
+                s
+            })
+            .collect(),
+    };
     while lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
     }
@@ -486,7 +497,7 @@ mod tests {
 
     #[test]
     fn unknown_method_targets_error_path_shape() {
-        let req = Request { id: 9, call: Call::CapturePane { pane: 999 } };
+        let req = Request { id: 9, call: Call::CapturePane { pane: 999, scrollback: None } };
         // A no-such-pane capture must be an error; verify the constructor used by handle().
         let resp = Response::err(req.id, "no pane %999");
         assert_eq!(resp.id, 9);

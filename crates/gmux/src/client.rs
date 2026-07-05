@@ -71,6 +71,15 @@ fn parse_pane(s: &str) -> Option<u64> {
     s.trim_start_matches('%').parse().ok()
 }
 
+/// Parse the `-S` argument into a line count. `-` (or missing / `0`) means "all retained history";
+/// a positive number `n` means "the most-recent n lines". `0` is the sentinel for "all".
+fn parse_scrollback(arg: Option<&str>) -> usize {
+    match arg {
+        None | Some("-") => 0,
+        Some(n) => n.parse().unwrap_or(0),
+    }
+}
+
 /// Entry: dispatch `gmux <subcommand> ...` API calls. Returns an exit code.
 pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
     match cmd {
@@ -99,10 +108,15 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
         "capture-pane" => {
             let pane = args.iter().position(|a| a == "-t").and_then(|i| args.get(i + 1)).and_then(|s| parse_pane(s));
             let Some(pane) = pane else {
-                eprintln!("usage: gmux capture-pane -t <pane>");
+                eprintln!("usage: gmux capture-pane -t <pane> [-S <n>|-S -]");
                 return Some(2);
             };
-            Some(run(Call::CapturePane { pane }))
+            // -S includes scrollback: `-S -` (or `-S 0`) = all history; `-S <n>` = last n lines.
+            let scrollback = args
+                .iter()
+                .position(|a| a == "-S")
+                .map(|i| parse_scrollback(args.get(i + 1).map(String::as_str)));
+            Some(run(Call::CapturePane { pane, scrollback }))
         }
         "split-pane" => {
             let dir = if args.iter().any(|a| a == "-v") { "v" } else { "h" }.to_string();
@@ -126,5 +140,15 @@ mod tests {
         assert_eq!(parse_pane("%5"), Some(5));
         assert_eq!(parse_pane("5"), Some(5));
         assert_eq!(parse_pane("nope"), None);
+    }
+
+    #[test]
+    fn scrollback_arg_parses() {
+        use super::parse_scrollback;
+        assert_eq!(parse_scrollback(Some("-")), 0); // all history
+        assert_eq!(parse_scrollback(None), 0); // bare -S = all
+        assert_eq!(parse_scrollback(Some("0")), 0);
+        assert_eq!(parse_scrollback(Some("200")), 200);
+        assert_eq!(parse_scrollback(Some("garbage")), 0);
     }
 }
