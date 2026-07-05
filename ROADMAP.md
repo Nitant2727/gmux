@@ -126,9 +126,13 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
   (`gmux-server`) debounce-saves to `%LOCALAPPDATA%\gmux\state\session.json` every ~2 s + clears it on clean
   exit; `restore_or_new` rebuilds on start. **Verified:** persist roundtrip unit tests + restore integration
   test + **live reboot simulation** (kill daemon abruptly → new daemon restored both panes).
-- **Stage B (next)** — scrollback/screen replay: capture each pane's VT-encoded screen in the snapshot and
-  replay it as inert history under a `[Restored …]` divider on respawn; secret scrubbing of env; optional
-  per-agent resume behind approval. *Next:* M7b, then M8 hardening.
+- **Stage B 🔶 infra done** — the snapshot now captures each pane's visible screen text (`PaneRecord.screen`),
+  and restore pre-seeds the fresh terminal with it under a dim `─── gmux: restored ───` divider
+  (`Pane::spawn_in(.., replay)`). **Limitation (honest):** PowerShell's startup `ESC[2J` clears the *visible*
+  screen, so restored history only survives in scrollback — **displaying it needs the scrollback viewport
+  (rendering + `capture-pane -S`), which is folded into M8.** The persisted screen data is forward-compatible.
+- Deferred to M8: scrollback viewport (view + capture restored/scrolled history), env secret-scrubbing,
+  per-agent resume behind approval. *Next:* M8 hardening (incl. the scrollback viewport that lights up M7b).
 
 ### M8 — MVP hardening and release
 
