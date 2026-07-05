@@ -636,6 +636,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "gmux-tmux"
+version = "0.0.0"
+
+[[package]]
 name = "gmux-vt"
 version = "0.0.0"
 dependencies = [
