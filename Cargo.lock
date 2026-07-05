@@ -566,6 +566,7 @@ dependencies = [
  "gmux-gui",
  "gmux-pipe",
  "gmux-proto",
+ "gmux-server",
  "serde_json",
  "toml_edit 0.22.27",
 ]
@@ -620,6 +621,15 @@ name = "gmux-pty"
 version = "0.0.0"
 dependencies = [
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "gmux-server"
+version = "0.0.0"
+dependencies = [
+ "gmux-mux",
+ "gmux-pipe",
+ "gmux-proto",
 ]
 
 [[package]]

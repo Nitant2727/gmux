@@ -18,6 +18,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None => launch_gui(default_shell()),
+        Some("--daemon") => daemon(),
         Some("notify") => notify(&args[1..]),
         Some("hooks") => cmd_hooks(&args[1..]),
         Some("_hook") => internal_hook(&args[1..]),
@@ -36,6 +37,14 @@ fn main() {
 fn launch_gui(shell: String) {
     if let Err(e) = gmux_gui::run(shell) {
         eprintln!("gmux: {e}");
+        std::process::exit(1);
+    }
+}
+
+/// `gmux --daemon` — run the headless multiplexer server (owns the panes; survives GUI detach).
+fn daemon() {
+    if let Err(e) = gmux_server::run(default_shell(), "gmux") {
+        eprintln!("gmux daemon: {e}");
         std::process::exit(1);
     }
 }
