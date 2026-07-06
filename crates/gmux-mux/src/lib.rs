@@ -269,6 +269,26 @@ impl Session {
         self.windows.iter().find_map(|w| w.pane(id))
     }
 
+    /// Take a pane out of whatever window holds it — collapsing its split, dropping the window if
+    /// it empties, fixing the active index — WITHOUT disposing of it. The remote mirror re-homes
+    /// panes moved between remote windows (`join-pane`/`break-pane`) this way: extracted here,
+    /// re-inserted into the destination window's tree.
+    pub fn extract_pane(&mut self, id: PaneId) -> Option<Pane> {
+        let wi = self.windows.iter().position(|w| w.pane(id).is_some())?;
+        if self.windows[wi].pane_count() <= 1 {
+            let mut win = self.windows.remove(wi);
+            if wi < self.active {
+                self.active -= 1;
+            } else if self.active >= self.windows.len() && self.active > 0 {
+                self.active = self.windows.len() - 1;
+            }
+            win.panes.remove(&id)
+        } else {
+            self.windows[wi].set_active(id);
+            self.windows[wi].close_active()
+        }
+    }
+
     /// Remove a pane by id (e.g. its process exited), collapsing its split and dropping the window
     /// if it becomes empty. Returns whether the pane was found.
     pub fn remove_pane(&mut self, id: PaneId) -> bool {

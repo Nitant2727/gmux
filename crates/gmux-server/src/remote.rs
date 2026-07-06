@@ -13,9 +13,9 @@
 //! Everything here is unit-testable without a console: remote panes have no ConPTY, and the
 //! transport accepts any stub command line that speaks control mode on stdio.
 //!
-//! Known limitation (deferred, like split/kill round-trips): a pane *moved between remote
-//! windows* (`break-pane`/`join-pane`) is not re-homed locally — its old mirror is pruned by the
-//! source window's `%layout-change`, but the destination window may briefly reference it.
+//! A pane *moved between remote windows* (`break-pane`/`join-pane`) is re-homed locally: the
+//! destination window's `%layout-change` extracts the mirror from its old window and re-inserts
+//! it, so no tree ever dangles.
 
 use std::collections::HashMap;
 use std::io;
@@ -87,6 +87,25 @@ impl RemoteAttachment {
     /// Everything the transport child wrote to stderr (ssh auth/host-key diagnostics).
     pub fn stderr_output(&self) -> Vec<u8> {
         self.transport.stderr_output()
+    }
+
+    /// The remote `%pane` id mirrored by local pane `id`, if this attachment owns it. The server
+    /// uses this to route pane operations (split/close) to the remote instead of mutating the
+    /// local mirror.
+    pub fn remote_id_of(&self, id: PaneId) -> Option<u64> {
+        self.panes.iter().find_map(|(remote, local)| (*local == id).then_some(*remote))
+    }
+
+    /// Ask the remote to split pane `%remote` (`-h` beside / `-v` below). The new pane arrives
+    /// via the resulting `%layout-change`; nothing changes locally until then.
+    pub fn split_remote(&mut self, remote: u64, horizontal: bool) {
+        self.transport.split_pane(remote, horizontal);
+    }
+
+    /// Ask the remote to kill pane `%remote`. The mirror is pruned by the resulting
+    /// `%layout-change` / `%window-close`.
+    pub fn kill_remote(&mut self, remote: u64) {
+        self.transport.kill_pane(remote);
     }
 
     /// Forward queued input and apply all pending transport events to `session`. Returns `false`
@@ -191,19 +210,39 @@ impl RemoteAttachment {
     }
 
     /// Mirror a `%layout-change`: convert the tmux layout to a split tree (creating panes for
-    /// leaves not seen before, sized from the layout cells), then replace the window's tree —
+    /// leaves not seen before, sized from the layout cells; **re-homing** panes the remote moved
+    /// in from another window via `join-pane`/`break-pane`), then replace the window's tree —
     /// pruned panes are marked exited and forgotten. Unknown windows (a fresh `%window-add`, or
     /// one the user closed locally) are (re)created outright.
     fn apply_layout(&mut self, window: u64, layout: &Layout, session: &mut Session) {
         let mut sizes = HashMap::new();
         leaf_sizes(&layout.root, &mut sizes);
+        // Re-home: a remote pane referenced by this layout but currently mirrored in a DIFFERENT
+        // window was moved here remotely. Extract it from its old window (collapsing that tree,
+        // keeping its active pane valid) and re-insert it below — leaving it referenced by two
+        // trees at once would dangle the old window's active pane and panic the layout path.
+        let target = self.windows.get(&window).copied();
+        let mut rehomed: Vec<Pane> = Vec::new();
+        for remote in sizes.keys() {
+            if let Some(&id) = self.panes.get(remote) {
+                let in_target = target
+                    .and_then(|wid| session.window_mut(wid))
+                    .is_some_and(|w| w.pane(id).is_some());
+                if !in_target {
+                    if let Some(pane) = session.extract_pane(id) {
+                        rehomed.push(pane);
+                    }
+                }
+            }
+        }
         let mut created: Vec<Pane> = Vec::new();
         let (root, _leaf_order) = {
             let panes = &mut self.panes;
             let input_tx = &self.input_tx;
+            let rehomed = &rehomed;
             layout_to_node(layout, &mut |remote| {
                 if let Some(&id) = panes.get(&remote) {
-                    if session.pane(id).is_some() {
+                    if session.pane(id).is_some() || rehomed.iter().any(|p| p.id == id) {
                         return id;
                     }
                     panes.remove(&remote); // stale: its window was closed locally
@@ -216,6 +255,7 @@ impl RemoteAttachment {
                 id
             })
         };
+        created.extend(rehomed);
         let known = self.windows.get(&window).copied();
         match known.and_then(|wid| session.window_mut(wid)) {
             Some(win) => {
@@ -563,5 +603,93 @@ mod tests {
         assert!((ratio - 0.5).abs() < 1e-6);
         assert!(even_split(&[]).is_none());
         assert!(matches!(even_split(&ids[..1]), Some(Node::Leaf(id)) if id == ids[0]));
+    }
+
+    /// F1/F2 regression (review of dc4322d): a remote `join-pane` moves %0 from @1 into @2 —
+    /// the destination's %layout-change must RE-HOME the mirror (extract from @1, insert into
+    /// @2), not leave one pane referenced by two trees with @1's active dangling (which
+    /// panicked workspace_info -> poisoned the server mutex -> killed the daemon).
+    #[test]
+    fn cross_window_pane_move_rehomes_the_mirror() {
+        let path = temp_path("rehome.bin");
+        let mut canned = Vec::new();
+        canned.extend_from_slice(b"P1000p");
+        canned.extend_from_slice(b"%begin 1000 5 1
+%end 1000 5 1
+");
+        canned.extend_from_slice(b"%begin 1000 6 1
+@1 %0 80 24
+@1 %1 80 24
+@2 %5 80 24
+%end 1000 6 1
+");
+        // Remote join-pane: %0 leaves @1 (its layout shrinks to just %1)...
+        canned.extend_from_slice(b"%layout-change @1 aaaa,80x24,0,0,1
+");
+        // ...and joins @2 (its layout now references %0 beside %5).
+        canned.extend_from_slice(b"%layout-change @2 bbbb,159x48,0,0{79x48,0,0,5,79x48,80,0,0}
+");
+        canned.extend_from_slice(b"%exit
+");
+        std::fs::write(&path, &canned).unwrap();
+
+        let mut session = empty_session();
+        let mut att =
+            RemoteAttachment::attach(&format!("cmd.exe /c type {}", path.display())).unwrap();
+        pump_until_finished(&mut att, &mut session, Duration::from_secs(20));
+
+        assert_eq!(session.window_count(), 2);
+        assert_eq!(session.pane_count(), 3, "no duplicate/dangling mirrors");
+        // Exactly ONE window references %0's mirror.
+        let homes = session
+            .windows()
+            .iter()
+            .filter(|w| w.panes().any(|p| p.remote_id() == Some(0)))
+            .count();
+        assert_eq!(homes, 1, "%0 must live in exactly one window");
+        // The reviewer's exact crash path: workspace_info on every window (GetLayout does this).
+        for w in session.windows() {
+            let _ = w.workspace_info(); // panicked before the fix
+        }
+    }
+
+    /// Ordering variant: the destination window's %layout-change arrives BEFORE the source
+    /// window's shrink. Re-homing must still hold (extract collapses the source tree first).
+    #[test]
+    fn cross_window_move_destination_layout_first() {
+        let path = temp_path("rehome2.bin");
+        let mut canned = Vec::new();
+        canned.extend_from_slice(b"P1000p");
+        canned.extend_from_slice(b"%begin 1000 5 1
+%end 1000 5 1
+");
+        canned.extend_from_slice(b"%begin 1000 6 1
+@1 %0 80 24
+@1 %1 80 24
+@2 %5 80 24
+%end 1000 6 1
+");
+        canned.extend_from_slice(b"%layout-change @2 bbbb,159x48,0,0{79x48,0,0,5,79x48,80,0,0}
+");
+        canned.extend_from_slice(b"%layout-change @1 aaaa,80x24,0,0,1
+");
+        canned.extend_from_slice(b"%exit
+");
+        std::fs::write(&path, &canned).unwrap();
+
+        let mut session = empty_session();
+        let mut att =
+            RemoteAttachment::attach(&format!("cmd.exe /c type {}", path.display())).unwrap();
+        pump_until_finished(&mut att, &mut session, Duration::from_secs(20));
+
+        let homes = session
+            .windows()
+            .iter()
+            .filter(|w| w.panes().any(|p| p.remote_id() == Some(0)))
+            .count();
+        assert_eq!(homes, 1, "%0 must live in exactly one window");
+        for w in session.windows() {
+            let _ = w.workspace_info();
+        }
     }
 }

@@ -140,6 +140,15 @@ impl Server {
         self.session.pane(PaneId(id))
     }
 
+    /// The attachment owning the active window's active pane (and its remote `%pane` id), if the
+    /// active pane is a remote mirror. Pane operations on mirrors round-trip to the remote.
+    fn active_remote(&mut self) -> Option<(&mut RemoteAttachment, u64)> {
+        let active = self.session.active_window().map(|w| w.active_id())?;
+        self.remotes
+            .iter_mut()
+            .find_map(|att| att.remote_id_of(active).map(|remote| (att, remote)))
+    }
+
     /// Execute one protocol request against the mux, returning the response.
     pub fn handle(&mut self, req: &Request) -> Response {
         let id = req.id;
@@ -175,6 +184,13 @@ impl Server {
                     "v" => SplitDir::Vertical,
                     other => return Response::err(id, format!("bad dir '{other}' (h|v)")),
                 };
+                // A remote mirror's layout is owned by the remote tmux: splitting locally would
+                // spawn a shell the next %layout-change silently discards. Round-trip instead;
+                // the new pane arrives via that %layout-change.
+                if let Some((att, remote)) = self.active_remote() {
+                    att.split_remote(remote, sd == SplitDir::Horizontal);
+                    return Response::ok(id, ResultBody::Done);
+                }
                 match self.spawn_pane(command) {
                     Ok(pane) => {
                         let pid = pane.id.0;
@@ -253,6 +269,12 @@ impl Server {
                 Response::ok(id, ResultBody::Done)
             }
             Call::ClosePane => {
+                // Remote mirror: ask the remote to kill the pane; its %layout-change (or
+                // %window-close) prunes the mirror. No local mutation now.
+                if let Some((att, remote)) = self.active_remote() {
+                    att.kill_remote(remote);
+                    return Response::ok(id, ResultBody::Done);
+                }
                 let closed = self.session.active_window_mut().and_then(|w| w.close_active());
                 if closed.is_none() {
                     self.session.close_active_window();
