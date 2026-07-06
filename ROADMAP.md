@@ -212,8 +212,12 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
 
 ### M10 — Keybindings & configuration polish
 
-- Full rebindable action map in `gmux.json` (no-prefix defaults), config hot-reload, profile editor UI,
-  theme support (import Windows Terminal / iTerm color schemes).
+- **Core ✅ (2026-07-06, 511967d):** `%APPDATA%\gmux\gmux.json` — rebindable action map (all 13
+  actions: splits, close, zoom, tabs, focus, scroll paging; chord strings like `"ctrl+shift+d"`,
+  defaults = the no-prefix M3 bindings), config hot-reload (mtime poll ~1 s, parse errors keep the
+  session alive), theme fg/bg hex + `font_px`. `gmux-gui/config.rs`, 184 workspace tests.
+- Remaining (polish, non-blocking): profile editor UI, Windows Terminal / iTerm color-scheme
+  import (full palette theming — needs runtime palette in gmux-vt's color resolution).
 
 ### M11 — Agent orchestration surfacing
 
