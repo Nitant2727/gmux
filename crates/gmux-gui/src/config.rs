@@ -91,7 +91,10 @@ impl Config {
             Ok(t) => t,
             Err(_) => return Config::default(), // no file yet is normal, stay quiet
         };
-        match serde_json::from_str(&text) {
+        // PowerShell's Set-Content and Notepad write a UTF-8 BOM by default; serde_json rejects
+        // it, which would silently discard the whole config on the most common Windows edit path.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        match serde_json::from_str(text) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("gmux: ignoring invalid config {}: {e}", path.display());
@@ -126,7 +129,9 @@ fn parse_hex(s: &str) -> Option<[u8; 3]> {
 }
 
 /// Parse a chord like `"ctrl+shift+d"`, `"alt+left"`, `"shift+pageup"` into `(mods, key)`.
-/// Case-insensitive. Returns `None` on an unknown key token.
+/// Case-insensitive. Returns `None` on an unknown key token, and on a chord with **no
+/// modifier** — a bare key binding would consume that key before it reaches the pane (every
+/// `q` closing a pane instead of typing).
 fn parse_chord(s: &str) -> Option<(ModifiersState, Key)> {
     let mut mods = ModifiersState::empty();
     let mut key: Option<Key> = None;
@@ -140,6 +145,9 @@ fn parse_chord(s: &str) -> Option<(ModifiersState, Key)> {
             "" => return None,
             other => key = Some(named_key(other)?),
         }
+    }
+    if mods.is_empty() {
+        return None;
     }
     Some((mods, key?))
 }
@@ -198,7 +206,11 @@ impl Keymap {
             }
         }
         if let Some(overrides) = &config.keys {
-            for (name, chord) in overrides {
+            // Sorted by action name so two overrides claiming the same chord resolve the same
+            // way every launch (HashMap iteration order would make the winner random).
+            let mut entries: Vec<(&String, &String)> = overrides.iter().collect();
+            entries.sort();
+            for (name, chord) in entries {
                 let Some(action) = Action::from_name(name) else {
                     eprintln!("gmux: unknown action '{name}' in config keys; ignoring");
                     continue;
@@ -214,7 +226,12 @@ impl Keymap {
                 // Drop any default that maps this same action elsewhere, so a rebind *moves* it
                 // rather than leaving the old chord live alongside the new one.
                 map.retain(|_, a| *a != action);
-                map.insert((mods, ck), action);
+                if let Some(shadowed) = map.insert((mods, ck), action) {
+                    eprintln!(
+                        "gmux: chord '{chord}' now runs '{name}', unbinding {shadowed:?} — \
+                         rebind it to keep it"
+                    );
+                }
             }
         }
         Keymap { map }
@@ -319,5 +336,46 @@ mod tests {
         };
         assert_eq!(cfg.fg([0, 0, 0]), [0xab, 0xcd, 0xef]);
         assert_eq!(cfg.bg([9, 9, 9]), [9, 9, 9]); // no bg -> default
+    }
+
+    // -- adversarial-review regressions (511967d review) --
+
+    /// PowerShell/Notepad write a UTF-8 BOM; the config must still parse (it was silently
+    /// discarded before).
+    #[test]
+    fn bom_prefixed_json_still_parses() {
+        let json = "\u{feff}{\"font_px\": 20.0}";
+        let stripped = json.strip_prefix('\u{feff}').unwrap_or(json);
+        let cfg: Config = serde_json::from_str(stripped).unwrap();
+        assert_eq!(cfg.font_px, Some(20.0));
+    }
+
+    /// A chord with no modifier would eat normal typing (every `q` closing a pane); it must be
+    /// rejected at parse time.
+    #[test]
+    fn bare_key_chords_are_rejected() {
+        assert!(parse_chord("q").is_none());
+        assert!(parse_chord("pageup").is_none());
+        assert!(parse_chord("ctrl+q").is_some());
+        assert!(parse_chord("shift+pageup").is_some());
+    }
+
+    /// Two overrides claiming the same chord must resolve deterministically (sorted by action
+    /// name) instead of varying with HashMap iteration order.
+    #[test]
+    fn colliding_overrides_resolve_deterministically() {
+        let mut keys = std::collections::HashMap::new();
+        keys.insert("split_h".to_string(), "ctrl+alt+9".to_string());
+        keys.insert("split_v".to_string(), "ctrl+alt+9".to_string());
+        let cfg = Config { keys: Some(keys), ..Default::default() };
+        let expected = Keymap::build(&cfg)
+            .action(ModifiersState::CONTROL | ModifiersState::ALT, &Key::Character("9".into()));
+        for _ in 0..20 {
+            let got = Keymap::build(&cfg).action(
+                ModifiersState::CONTROL | ModifiersState::ALT,
+                &Key::Character("9".into()),
+            );
+            assert_eq!(got, expected, "winner must not vary between builds");
+        }
     }
 }
