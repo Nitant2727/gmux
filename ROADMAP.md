@@ -230,10 +230,14 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
   verified against the real CLI.
 - Deferred: `subscribe` push API (poll via list-panes/capture-pane covers scripting today).
 
-### M12 — Browser pane (flag-gated)
+### M12 — Browser pane (flag-gated) ✅ STAGE 1 (2026-07-07, 951bdb1)
 
-- WebView2 split pane, scriptable over the same pipe (navigate/snapshot/click/type/eval/console/network)
-  — cmux's second differentiator, explicitly lower priority than terminal correctness.
+- **Stage 1:** `gmux-browser` crate (cargo feature `browser`, default OFF — WebView2/COM deps never
+  touch the default graph): `BrowserPane` hosts WebView2 in its own top-level window on its own
+  thread (COM apartment + message pump; the winit loop never blocks). `gmux browse <url>` →
+  `Call::Browse` queue in the daemon → GUI `PollBrowse` drain → open/navigate. `demos/m12-browser.ps1`.
+- Stage 2 (deferred): true split-embedding into the wgpu surface, `eval_js` result plumbing
+  (currently a labeled stub), snapshot/click/type/console/network scripting.
 
 ## Standing (every milestone)
 
