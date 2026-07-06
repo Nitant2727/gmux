@@ -216,8 +216,13 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
   actions: splits, close, zoom, tabs, focus, scroll paging; chord strings like `"ctrl+shift+d"`,
   defaults = the no-prefix M3 bindings), config hot-reload (mtime poll ~1 s, parse errors keep the
   session alive), theme fg/bg hex + `font_px`. `gmux-gui/config.rs`, 184 workspace tests.
-- Remaining (polish, non-blocking): profile editor UI, Windows Terminal / iTerm color-scheme
-  import (full palette theming — needs runtime palette in gmux-vt's color resolution).
+- **Palette theming ✅ (2026-07-07, 9ae02d4):** runtime `Palette` in gmux-vt (defaults
+  byte-identical to the old constants), `Call::SetPalette` applied daemon-side to every pane,
+  Windows Terminal scheme import (`theme.scheme`, relative paths resolve against the config dir)
+  + inline `theme.ansi`. The M9 tmux ≥3.2 version gate landed in the same commit (degraded mode
+  is the fail-safe default; `%pause` auto-continue only on ≥3.2).
+- Remaining (deliberately skipped as low-value): profile editor UI, installer (portable zip
+  covers distribution until signing exists).
 
 ### M11 — Agent orchestration surfacing ✅ CORE (2026-07-07, ac66697)
 
