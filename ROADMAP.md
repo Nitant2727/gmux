@@ -219,11 +219,16 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
 - Remaining (polish, non-blocking): profile editor UI, Windows Terminal / iTerm color-scheme
   import (full palette theming — needs runtime palette in gmux-vt's color resolution).
 
-### M11 — Agent orchestration surfacing
+### M11 — Agent orchestration surfacing ✅ CORE (2026-07-07, ac66697)
 
-- When an agent spawns teammates/subagents (Claude Code teams-style), surface them as real panes/splits:
-  detection via `gmux`-aware hooks (`gmux split-pane -- claude …` recipes + `subscribe` integration),
-  fleet overview in the sidebar (aggregate attention/progress).
+- **Fleet overview:** the daemon tracks each pane's OSC 9;4 progress (`Server.progress`, cleared on
+  Remove/exit) and aggregates per window (`Error` outranks pct; pct = the least-done active agent);
+  `TabWire.progress/progress_error` (serde-default wire compat); sidebar tabs render ` 42%` / ` !`.
+  Aggregation unit-tested via console-free remote panes pushing real OSC 9;4 bytes.
+- **Recipes:** [docs/agents.md](docs/agents.md) — hooks setup, pane-per-agent splits, send-keys/
+  capture-pane orchestration, subagent-spawn hook recipe, ssh-tmux remote agents. All syntax
+  verified against the real CLI.
+- Deferred: `subscribe` push API (poll via list-panes/capture-pane covers scripting today).
 
 ### M12 — Browser pane (flag-gated)
 
