@@ -1,0 +1,8 @@
+[book]
+title = "gmux"
+description = "A Windows-native GPU-accelerated terminal multiplexer built for running AI coding agents in parallel"
+src = "docs"
+
+[output.html]
+default-theme = "ayu"
+git-repository-url = "https://github.com/Nitant2727/gmux"
