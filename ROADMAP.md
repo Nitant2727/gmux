@@ -193,9 +193,16 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
   ratios (`(first+0.5)/span`) so `floor(span·ratio)` reproduces tmux sizes for every geometry
   (exhaustively tested to span 400). 13 tests. **Not yet live-tested against a real tmux** (no
   WSL/ssh peer on the dev machine) — needs a real remote before M9 is declared done.
-- Stage 2c: server/CLI wiring — `Call::SshTmux`/`gmux ssh-tmux`, daemon tick pumping transport
-  events into remote windows/panes (%output→push_output, %layout-change→layout_to_node,
-  %window-add/close, %exit→mark_exited), `%pause` flow control; tmux ≥3.2 gate with degraded mode.
+- **Stage 2c ✅ (2026-07-06): daemon/CLI wiring** — `Call::SshTmux{target, command override}` +
+  `gmux ssh-tmux <target> [--command <raw>]`; `gmux-server/remote.rs` `RemoteAttachment` (attach →
+  enumeration via `list-panes -a`, keystrokes over an mpsc channel into `send-keys -H`, pump per
+  tick: %output→`push_output` (remote OSC 777 raises toasts — verified in test), %layout-change→
+  `layout_to_node` + `Window::replace_tree` with prune/create, %window-close, %pause→
+  `refresh-client -A %N:continue`, %exit/Eof→mark_exited + drop); ResizeView also resizes remote
+  clients. 175 tests; daemon console suite exit 0 (incl. new SshTmux-over-stub E2E). Deferred to
+  2d: local split/kill of remote panes round-tripped to the remote, break-pane/join-pane re-homing.
+- **M9 remaining before done:** live test against a REAL tmux over ssh (no peer on the dev
+  machine — needs user-provided host or WSL), stage-2d bidirectional pane ops, ≥3.2 version gate.
 
 ### M10 — Keybindings & configuration polish
 
