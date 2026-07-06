@@ -163,6 +163,14 @@ pub struct TabWire {
     pub branch: Option<String>,
     pub attention: bool,
     pub active: bool,
+    /// Aggregate agent progress across the window's panes: `Some(pct)` = the least-done active
+    /// agent's percentage, `None` = no pane reporting progress. Indeterminate/paused panes count
+    /// as active but contribute no percentage.
+    #[serde(default)]
+    pub progress: Option<u8>,
+    /// A pane in the window reported an OSC 9;4 error state (takes visual precedence over `progress`).
+    #[serde(default)]
+    pub progress_error: bool,
 }
 
 /// The active window's layout + the tab list.
@@ -312,6 +320,29 @@ mod tests {
         write_msg(&mut buf, &resp).unwrap();
         let back: Response = read_msg(&mut Cursor::new(buf)).unwrap().unwrap();
         assert_eq!(back.result, Some(grid));
+    }
+
+    #[test]
+    fn tab_wire_progress_roundtrips_and_defaults() {
+        let layout = LayoutWire {
+            active_pane: 1,
+            tabs: vec![
+                TabWire { index: 0, name: "a".into(), branch: Some("main".into()), attention: false, active: true, progress: Some(42), progress_error: false },
+                TabWire { index: 1, name: "b".into(), branch: None, attention: true, active: false, progress: None, progress_error: true },
+            ],
+            panes: Vec::new(),
+        };
+        let resp = Response::ok(1, ResultBody::Layout(layout.clone()));
+        let mut buf = Vec::new();
+        write_msg(&mut buf, &resp).unwrap();
+        let back: Response = read_msg(&mut Cursor::new(buf)).unwrap().unwrap();
+        assert_eq!(back.result, Some(ResultBody::Layout(layout)));
+
+        // Old clients / hand-written JSON omitting the new fields still parse (serde default).
+        let line = r#"{"index":2,"name":"c","branch":null,"attention":false,"active":false}"#;
+        let tab: TabWire = serde_json::from_str(line).unwrap();
+        assert_eq!(tab.progress, None);
+        assert!(!tab.progress_error);
     }
 
     #[test]

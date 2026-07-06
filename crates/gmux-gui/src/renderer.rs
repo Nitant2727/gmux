@@ -33,6 +33,10 @@ pub struct SidebarRow {
     pub branch: Option<String>,
     pub attention: bool,
     pub active: bool,
+    /// Aggregate agent progress: `Some(pct)` renders " 42%" after the name.
+    pub progress: Option<u8>,
+    /// A pane reported a progress error: renders " !" after the name (takes precedence over pct).
+    pub progress_error: bool,
 }
 
 #[repr(C)]
@@ -491,6 +495,16 @@ impl Renderer {
                 quad(&mut bg, 8.0, y + 9.0, 16.0, y + 17.0, rgba(RING_COLOR));
             }
             self.text_run(&r.name, 24.0, y + 6.0, rgba(self.text), fw, fh, &mut gl);
+            // Progress suffix in the dim branch color: " !" on error, else " 42%".
+            let suffix = if r.progress_error {
+                Some(" !".to_string())
+            } else {
+                r.progress.map(|p| format!(" {p}%"))
+            };
+            if let Some(s) = suffix {
+                let x = 24.0 + r.name.chars().count() as f32 * self.atlas.cell_w as f32;
+                self.text_run(&s, x, y + 6.0, rgba(DIM), fw, fh, &mut gl);
+            }
             if let Some(b) = &r.branch {
                 self.text_run(&format!("git:{b}"), 24.0, y + 6.0 + ch, rgba(DIM), fw, fh, &mut gl);
             }

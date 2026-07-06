@@ -441,7 +441,7 @@ impl State {
         let rows: Vec<SidebarRow> = layout
             .tabs
             .iter()
-            .map(|t| SidebarRow { name: t.name.clone(), branch: t.branch.clone(), attention: t.attention, active: t.active })
+            .map(|t| SidebarRow { name: t.name.clone(), branch: t.branch.clone(), attention: t.attention, active: t.active, progress: t.progress, progress_error: t.progress_error })
             .collect();
 
         // Update the taskbar attention badge / progress based on overall attention.

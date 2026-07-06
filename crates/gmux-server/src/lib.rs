@@ -7,12 +7,16 @@
 
 pub mod remote;
 
+use std::collections::HashMap;
 use std::io::{self, BufReader};
 use std::sync::{Arc, Mutex};
 
 use std::path::PathBuf;
 
-use gmux_mux::{FocusDir, Pane, PaneEvent, PaneId, PtySize, Session, SessionSnapshot, SplitDir, Urgency};
+use gmux_mux::{
+    FocusDir, Pane, PaneEvent, PaneId, ProgressState, PtySize, Session, SessionSnapshot, SplitDir,
+    Urgency, Window,
+};
 use gmux_pipe::{PipeServer, PipeStream};
 use gmux_proto::{
     read_msg, write_msg, Call, CellWire, GridWire, LayoutWire, NotifyWire, PaneInfo, PaneRectWire,
@@ -35,6 +39,8 @@ pub struct Server {
     ticks: u32,
     /// Live remote tmux attachments; pumped every tick, dropped when finished.
     remotes: Vec<RemoteAttachment>,
+    /// Latest OSC 9;4 progress per pane (Remove clears the entry; so does pane removal).
+    progress: HashMap<PaneId, (ProgressState, Option<u8>)>,
 }
 
 impl Server {
@@ -48,6 +54,7 @@ impl Server {
             notifications: Vec::new(),
             ticks: 0,
             remotes: Vec::new(),
+            progress: HashMap::new(),
         })
     }
 
@@ -69,6 +76,7 @@ impl Server {
                         notifications: Vec::new(),
                         ticks: 0,
                         remotes: Vec::new(),
+                        progress: HashMap::new(),
                     });
                 }
             }
@@ -100,6 +108,7 @@ impl Server {
         self.remotes.retain_mut(|r| r.pump(session));
         let mut notes = Vec::new();
         let mut exited = Vec::new();
+        let mut progress = Vec::new();
         for w in self.session.windows() {
             for p in w.panes() {
                 for ev in p.drain_events() {
@@ -115,12 +124,26 @@ impl Server {
                             },
                         }),
                         PaneEvent::Exited => exited.push(p.id),
+                        PaneEvent::Progress { state, pct } => progress.push((p.id, state, pct)),
                         _ => {}
                     }
                 }
             }
         }
         self.notifications.extend(notes);
+        for (id, state, pct) in progress {
+            match state {
+                ProgressState::Remove => {
+                    self.progress.remove(&id);
+                }
+                _ => {
+                    self.progress.insert(id, (state, pct));
+                }
+            }
+        }
+        for id in &exited {
+            self.progress.remove(id);
+        }
         for id in exited {
             self.session.remove_pane(id);
         }
@@ -322,12 +345,15 @@ impl Server {
             .enumerate()
             .map(|(i, win)| {
                 let info = win.workspace_info();
+                let (progress, progress_error) = window_progress(win, &self.progress);
                 TabWire {
                     index: i,
                     name: info.name,
                     branch: info.branch,
                     attention: info.attention,
                     active: i == active_idx,
+                    progress,
+                    progress_error,
                 }
             })
             .collect();
@@ -384,6 +410,33 @@ impl Server {
         self.session.pane_count() == 0
             || self.session.windows().iter().all(|w| w.panes().all(|p| !p.is_alive()))
     }
+}
+
+/// Aggregate a window's per-pane progress into the sidebar's `(progress, error)` pair: an Error in
+/// any pane wins (returns `error = true`); otherwise `progress` is the lowest pct among Set panes
+/// (the least-done agent). Indeterminate/Paused panes count as active but report no pct, so a window
+/// with only those yields `(None, false)` — same as idle to the pct-only sidebar. ponytail: pct+error
+/// is all the sidebar renders; richer states go on the wire the day the UI grows a spinner.
+fn window_progress(
+    win: &Window,
+    progress: &HashMap<PaneId, (ProgressState, Option<u8>)>,
+) -> (Option<u8>, bool) {
+    let mut error = false;
+    let mut min_pct: Option<u8> = None;
+    for p in win.panes() {
+        if let Some((state, pct)) = progress.get(&p.id) {
+            match state {
+                ProgressState::Error => error = true,
+                ProgressState::Set => {
+                    if let Some(v) = pct {
+                        min_pct = Some(min_pct.map_or(*v, |m| m.min(*v)));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    (min_pct, error)
 }
 
 /// Encode a pane's grid for the wire, scrolled `offset` lines into scrollback (clamped). The
@@ -557,5 +610,62 @@ mod tests {
         let resp = Response::err(req.id, "no pane %999");
         assert_eq!(resp.id, 9);
         assert!(resp.result.is_none());
+    }
+
+    /// M11 fleet overview: OSC 9;4 from a (console-free) remote pane flows pump -> tick drain ->
+    /// per-pane progress map -> window aggregation; Error outranks pct; Remove clears.
+    #[test]
+    fn osc94_progress_aggregates_into_window() {
+        use gmux_mux::{Pane, Session, Window};
+        use std::collections::HashMap as Map;
+
+        let a = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        let b = Pane::remote(2, 80, 24, Box::new(|_| {}));
+        let (ida, idb) = (a.id, b.id);
+        let mut panes = Map::new();
+        let root = gmux_mux::layout::Node::Split {
+            dir: SplitDir::Horizontal,
+            ratio: 0.5,
+            a: Box::new(gmux_mux::layout::Node::Leaf(ida)),
+            b: Box::new(gmux_mux::layout::Node::Leaf(idb)),
+        };
+        panes.insert(ida, a);
+        panes.insert(idb, b);
+        let win = Window::from_parts(panes, root, ida);
+        let session = Session::from_windows("t", vec![win], 0);
+
+        // Two agents report progress; the sidebar shows the least-done one.
+        session.pane(ida).unwrap().push_output(b"\x1b]9;4;1;42\x07");
+        session.pane(idb).unwrap().push_output(b"\x1b]9;4;1;80\x07");
+        let mut progress: HashMap<PaneId, (ProgressState, Option<u8>)> = HashMap::new();
+        let mut drain = |progress: &mut HashMap<PaneId, (ProgressState, Option<u8>)>| {
+            for w in session.windows() {
+                for p in w.panes() {
+                    for ev in p.drain_events() {
+                        if let PaneEvent::Progress { state, pct } = ev {
+                            if state == ProgressState::Remove {
+                                progress.remove(&p.id);
+                            } else {
+                                progress.insert(p.id, (state, pct));
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        drain(&mut progress);
+        let win = &session.windows()[0];
+        assert_eq!(window_progress(win, &progress), (Some(42), false));
+
+        // An error state wins visually over any percentage.
+        session.pane(ida).unwrap().push_output(b"\x1b]9;4;2;0\x07");
+        drain(&mut progress);
+        assert_eq!(window_progress(win, &progress).1, true);
+
+        // Remove clears both entries -> no progress shown.
+        session.pane(ida).unwrap().push_output(b"\x1b]9;4;0;0\x07");
+        session.pane(idb).unwrap().push_output(b"\x1b]9;4;0;0\x07");
+        drain(&mut progress);
+        assert_eq!(window_progress(win, &progress), (None, false));
     }
 }
