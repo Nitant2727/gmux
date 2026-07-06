@@ -31,6 +31,14 @@ use gmux_tmux::{Cell, Event, Layout, Notification};
 /// `%layout-change` notifications tmux sends right after attach.
 const ENUMERATE: &str = "list-panes -a -F '#{window_id} #{pane_id} #{pane_width} #{pane_height}'";
 
+/// Query the remote tmux server version at attach. Flow control (`refresh-client -A` on
+/// `%pause`) needs tmux >= 3.2; older servers error on it, so a low/unknown version puts the
+/// attachment in [`RemoteAttachment::degraded`] mode.
+const VERSION: &str = "display-message -p '#{version}'";
+
+/// tmux versions below this lack `refresh-client -A` flow control.
+const MIN_VERSION: (u32, u32) = (3, 2);
+
 /// One live remote tmux session mirrored into the local [`Session`].
 pub struct RemoteAttachment {
     transport: RemoteTmux,
@@ -48,6 +56,13 @@ pub struct RemoteAttachment {
     /// positional (the transport excludes the attach greeting), so the reply whose ordinal
     /// matches this is the enumeration.
     enumeration: Option<u64>,
+    /// Local sequence number of the version query (see [`VERSION`]); `None` once answered.
+    version_cmd: Option<u64>,
+    /// Reported remote tmux version (major, minor); `None` until answered or if unparseable.
+    version: Option<(u32, u32)>,
+    /// Below [`MIN_VERSION`] or unknown: skip `refresh-client -A` on `%pause` (pre-3.2 tmux
+    /// errors on it). Assumed until the version reply proves otherwise.
+    degraded: bool,
     /// `Ctrl(Reply)` events drained so far — the other half of positional correlation.
     replies_seen: u64,
     /// Set once `%exit`/EOF tore the attachment down; `pump` then always reports finished.
@@ -59,6 +74,8 @@ impl RemoteAttachment {
     /// stub replaying a control-mode stream) and queue the initial enumeration.
     pub fn attach(command_line: &str) -> io::Result<RemoteAttachment> {
         let mut transport = RemoteTmux::spawn(command_line)?;
+        // Positional correlation tracks each seq independently, so either order works.
+        let version_cmd = Some(transport.send_command(VERSION));
         let enumeration = Some(transport.send_command(ENUMERATE));
         let (input_tx, input_rx) = channel();
         Ok(RemoteAttachment {
@@ -68,6 +85,9 @@ impl RemoteAttachment {
             panes: HashMap::new(),
             windows: HashMap::new(),
             enumeration,
+            version_cmd,
+            version: None,
+            degraded: true,
             replies_seen: 0,
             finished: false,
         })
@@ -87,6 +107,18 @@ impl RemoteAttachment {
     /// Everything the transport child wrote to stderr (ssh auth/host-key diagnostics).
     pub fn stderr_output(&self) -> Vec<u8> {
         self.transport.stderr_output()
+    }
+
+    /// The reported remote tmux version `(major, minor)`, or `None` until the version reply
+    /// arrives or if it was unparseable.
+    pub fn version(&self) -> Option<(u32, u32)> {
+        self.version
+    }
+
+    /// Whether flow control is disabled because the remote tmux is below [`MIN_VERSION`] or its
+    /// version is unknown. `true` until the version reply proves it >= 3.2.
+    pub fn degraded(&self) -> bool {
+        self.degraded
     }
 
     /// The remote `%pane` id mirrored by local pane `id`, if this attachment owns it. The server
@@ -127,9 +159,13 @@ impl RemoteAttachment {
                 TransportEvent::Ctrl(Event::Reply { body, error, .. }) => {
                     let seq = self.replies_seen;
                     self.replies_seen += 1;
-                    // Positional: the Nth reply answers the Nth send_command. Only the
-                    // enumeration needs its answer; send-keys / refresh-client replies are noise.
-                    if self.enumeration == Some(seq) {
+                    // Positional: the Nth reply answers the Nth send_command. Only the version
+                    // and enumeration replies need handling; send-keys / refresh-client replies
+                    // are noise.
+                    if self.version_cmd == Some(seq) {
+                        self.version_cmd = None;
+                        self.apply_version(&body, error);
+                    } else if self.enumeration == Some(seq) {
                         self.enumeration = None;
                         if !error {
                             self.enumerate(&body, session);
@@ -156,7 +192,12 @@ impl RemoteAttachment {
                     // backpressure valve, and the daemon drains every tick, so instant continue
                     // is safe; deferred-resume policy can layer on later without protocol change.
                     Notification::Pause { pane } => {
-                        self.transport.send_command(&format!("refresh-client -A %{pane}:continue"));
+                        // Pre-3.2 tmux errors on `refresh-client -A`; degraded mode leaves the
+                        // pane paused rather than sending a command the server rejects.
+                        if !self.degraded {
+                            self.transport
+                                .send_command(&format!("refresh-client -A %{pane}:continue"));
+                        }
                     }
                     Notification::Exit { .. } => self.finished = true,
                     _ => {}
@@ -174,6 +215,31 @@ impl RemoteAttachment {
             return false;
         }
         true
+    }
+
+    /// Handle the `#{version}` reply: parse it, and clear [`degraded`](Self::degraded) only if
+    /// the version is known and >= [`MIN_VERSION`]. An error reply or unparseable body leaves
+    /// the attachment degraded and warns once.
+    fn apply_version(&mut self, body: &[Vec<u8>], error: bool) {
+        let raw = (!error)
+            .then(|| body.first())
+            .flatten()
+            .map(|line| String::from_utf8_lossy(line).into_owned());
+        self.version = raw.as_deref().and_then(parse_version);
+        self.degraded = self.version.is_none_or(|v| v < MIN_VERSION);
+        // NOTE: a %pause arriving BEFORE this reply is dropped (degraded starts true — fail-safe
+        // for old servers). Dormant today: the attach command never enables pause-after, so tmux
+        // emits no %pause. If flow control is ever enabled at attach, track pauses seen while
+        // degraded and re-answer them here when the version clears.
+        if self.degraded {
+            eprintln!(
+                "gmux: remote tmux version {} lacks flow control (need {}.{}); \
+                 running degraded (no %pause auto-continue)",
+                raw.as_deref().unwrap_or("<unknown>"),
+                MIN_VERSION.0,
+                MIN_VERSION.1,
+            );
+        }
     }
 
     /// Build one window per remote window from the enumeration reply, with a minimal even-split
@@ -321,6 +387,23 @@ fn parse_enum_line(line: &[u8]) -> Option<(u64, u64, u16, u16)> {
     Some((window, pane, cols, rows))
 }
 
+/// Parse a tmux `#{version}` string into `(major, minor)`. tmux reports things like `3.4`,
+/// `3.2a` (patch letter), `next-3.5`, or `openbsd-7.4` — strip any non-numeric prefix, then read
+/// the leading integer of each of the first two dot-fields (trailing patch letters ignored).
+/// `None` if there's no numeric major.minor.
+fn parse_version(raw: &str) -> Option<(u32, u32)> {
+    // Skip to the first digit (drops `next-`, `openbsd-`, etc.).
+    let start = raw.find(|c: char| c.is_ascii_digit())?;
+    let mut fields = raw[start..].split('.');
+    let leading_num = |s: &str| -> Option<u32> {
+        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+        digits.parse().ok()
+    };
+    let major = leading_num(fields.next()?)?;
+    let minor = fields.next().and_then(leading_num).unwrap_or(0);
+    Some((major, minor))
+}
+
 /// A right-leaning chain of horizontal splits giving `ids` equal widths (the placeholder until
 /// the window's real `%layout-change` arrives). `None` when `ids` is empty.
 fn even_split(ids: &[PaneId]) -> Option<Node> {
@@ -427,11 +510,12 @@ mod tests {
         let mut canned = Vec::new();
         canned.extend_from_slice(b"\x1bP1000p"); // -CC DCS introducer
         canned.extend_from_slice(b"%begin 1000 5 1\n%end 1000 5 1\n"); // attach greeting
-        canned.extend_from_slice(b"%begin 1000 6 1\n"); // enumeration reply
+        canned.extend_from_slice(b"%begin 1000 6 1\n3.4\n%end 1000 6 1\n"); // version reply
+        canned.extend_from_slice(b"%begin 1000 7 1\n"); // enumeration reply
         canned.extend_from_slice(b"@1 %0 80 24\n");
         canned.extend_from_slice(b"@1 %1 80 23\n");
         canned.extend_from_slice(b"@2 %5 80 24\n");
-        canned.extend_from_slice(b"%end 1000 6 1\n");
+        canned.extend_from_slice(b"%end 1000 7 1\n");
         // Authoritative geometry for @1: two panes side by side.
         canned.extend_from_slice(b"%layout-change @1 bb62,159x48,0,0{79x48,0,0,0,79x48,80,0,1}\n");
         canned.extend_from_slice(b"%output %0 hello-from-remote\n");
@@ -496,8 +580,9 @@ mod tests {
         let path = temp_path("layouts.bin");
         let mut canned = Vec::new();
         canned.extend_from_slice(b"\x1bP1000p");
-        canned.extend_from_slice(b"%begin 1000 5 1\n%end 1000 5 1\n");
-        canned.extend_from_slice(b"%begin 1000 6 1\n@1 %0 80 24\n%end 1000 6 1\n");
+        canned.extend_from_slice(b"%begin 1000 5 1\n%end 1000 5 1\n"); // greeting
+        canned.extend_from_slice(b"%begin 1000 6 1\n3.4\n%end 1000 6 1\n"); // version reply
+        canned.extend_from_slice(b"%begin 1000 7 1\n@1 %0 80 24\n%end 1000 7 1\n"); // enumeration
         // Split appears: %2 joins %0…
         canned.extend_from_slice(b"%layout-change @1 aaaa,159x48,0,0{79x48,0,0,0,79x48,80,0,2}\n");
         // …then %0 goes away entirely.
@@ -540,9 +625,9 @@ mod tests {
         assert!(att.pump(&mut session), "stub is silent, so the attachment stays live");
         att.detach(); // EOF ends the stub's $input pipeline; it writes the file and exits
 
-        let written = wait_for_file(&out, Duration::from_secs(60), |t| t.lines().count() >= 2);
+        let written = wait_for_file(&out, Duration::from_secs(60), |t| t.lines().count() >= 3);
         let lines: Vec<&str> = written.lines().collect();
-        assert_eq!(lines, [ENUMERATE, "send-keys -t %5 -H 6c 73 0d"]);
+        assert_eq!(lines, [VERSION, ENUMERATE, "send-keys -t %5 -H 6c 73 0d"]);
         let _ = std::fs::remove_file(&out);
     }
 
@@ -555,8 +640,9 @@ mod tests {
         let out = temp_path("pause-out.txt");
         let mut canned = Vec::new();
         canned.extend_from_slice(b"\x1bP1000p");
-        canned.extend_from_slice(b"%begin 1000 5 1\n%end 1000 5 1\n");
-        canned.extend_from_slice(b"%begin 1000 6 1\n@1 %0 80 24\n%end 1000 6 1\n");
+        canned.extend_from_slice(b"%begin 1000 5 1\n%end 1000 5 1\n"); // greeting
+        canned.extend_from_slice(b"%begin 1000 6 1\n3.4\n%end 1000 6 1\n"); // version reply
+        canned.extend_from_slice(b"%begin 1000 7 1\n@1 %0 80 24\n%end 1000 7 1\n"); // enumeration
         canned.extend_from_slice(b"%pause %0\n");
         canned.extend_from_slice(b"%exit\n");
         std::fs::write(&canned_path, &canned).unwrap();
@@ -571,16 +657,137 @@ mod tests {
         let mut att = RemoteAttachment::attach(&cl).unwrap();
         // Events are ordered, so by the time pump sees %exit it has answered the %pause.
         pump_until_finished(&mut att, &mut session, Duration::from_secs(60));
+        assert_eq!(att.version(), Some((3, 4)), "3.4 parsed");
+        assert!(!att.degraded(), "3.4 >= 3.2, flow control on");
         att.detach();
 
+        let written = wait_for_file(&out, Duration::from_secs(60), |t| t.lines().count() >= 3);
+        let lines: Vec<&str> = written.lines().collect();
+        assert_eq!(lines, [VERSION, ENUMERATE, "refresh-client -A %0:continue"]);
+        let _ = std::fs::remove_file(&canned_path);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// Pre-3.2 tmux: version `3.1` reports degraded, and `%pause` is NOT answered — the recorded
+    /// stdin never contains `refresh-client` (sending it would error on the old server).
+    #[test]
+    fn old_version_degrades_and_pause_is_not_answered() {
+        let canned_path = temp_path("old.bin");
+        let out = temp_path("old-out.txt");
+        let mut canned = Vec::new();
+        canned.extend_from_slice(b"\x1bP1000p");
+        canned.extend_from_slice(b"%begin 1000 5 1\n%end 1000 5 1\n"); // greeting
+        canned.extend_from_slice(b"%begin 1000 6 1\n3.1\n%end 1000 6 1\n"); // version reply
+        canned.extend_from_slice(b"%begin 1000 7 1\n@1 %0 80 24\n%end 1000 7 1\n"); // enumeration
+        canned.extend_from_slice(b"%pause %0\n");
+        canned.extend_from_slice(b"%exit\n");
+        std::fs::write(&canned_path, &canned).unwrap();
+
+        let cl = format!(
+            "cmd.exe /c type {} & powershell -NoProfile -Command \"$input | Set-Content -Path {}\"",
+            canned_path.display(),
+            out.display(),
+        );
+        let mut session = empty_session();
+        let mut att = RemoteAttachment::attach(&cl).unwrap();
+        pump_until_finished(&mut att, &mut session, Duration::from_secs(60));
+        assert_eq!(att.version(), Some((3, 1)), "3.1 parsed");
+        assert!(att.degraded(), "3.1 < 3.2, degraded");
+        att.detach();
+
+        // Only the attach-time commands are ever written; no refresh-client for the %pause.
         let written = wait_for_file(&out, Duration::from_secs(60), |t| t.lines().count() >= 2);
         let lines: Vec<&str> = written.lines().collect();
-        assert_eq!(lines, [ENUMERATE, "refresh-client -A %0:continue"]);
+        assert_eq!(lines, [VERSION, ENUMERATE], "no refresh-client in degraded mode");
+        assert!(
+            !written.contains("refresh-client -A"),
+            "%pause must not be answered when degraded: {written:?}",
+        );
+        let _ = std::fs::remove_file(&canned_path);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    /// An unparseable `#{version}` (e.g. a stub tmux that prints garbage) is treated as unknown:
+    /// degraded, no reported version, and one warning line on stderr.
+    #[test]
+    fn garbage_version_degrades_with_warning() {
+        let path = temp_path("garbage.bin");
+        let mut canned = Vec::new();
+        canned.extend_from_slice(b"\x1bP1000p");
+        canned.extend_from_slice(b"%begin 1000 5 1\n%end 1000 5 1\n"); // greeting
+        canned.extend_from_slice(b"%begin 1000 6 1\nnot-a-version\n%end 1000 6 1\n"); // version
+        canned.extend_from_slice(b"%begin 1000 7 1\n@1 %0 80 24\n%end 1000 7 1\n"); // enumeration
+        canned.extend_from_slice(b"%exit\n");
+        std::fs::write(&path, &canned).unwrap();
+
+        let mut session = empty_session();
+        let mut att =
+            RemoteAttachment::attach(&format!("cmd.exe /c type {}", path.display())).unwrap();
+        pump_until_finished(&mut att, &mut session, Duration::from_secs(20));
+        assert_eq!(att.version(), None, "unparseable => unknown version");
+        assert!(att.degraded(), "unknown version => degraded");
+        // The mirror still built despite the bad version.
+        assert!(find_pane(&session, 0).is_some(), "enumeration still applied");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Ordering: a `%pause` that arrives BEFORE the version reply is seen must not be answered —
+    /// the attachment is degraded-by-default until the version reply clears it, so an early
+    /// `%pause` on an as-yet-unknown server is left paused (safe on pre-3.2). A later 3.4 reply
+    /// then clears degraded for subsequent pauses.
+    #[test]
+    fn pause_before_version_reply_is_not_answered() {
+        let canned_path = temp_path("early-pause.bin");
+        let out = temp_path("early-pause-out.txt");
+        let mut canned = Vec::new();
+        canned.extend_from_slice(b"\x1bP1000p");
+        canned.extend_from_slice(b"%begin 1000 5 1\n%end 1000 5 1\n"); // greeting
+        // %pause arrives before either attach reply — still degraded-by-default.
+        canned.extend_from_slice(b"%pause %0\n");
+        canned.extend_from_slice(b"%begin 1000 6 1\n3.4\n%end 1000 6 1\n"); // version reply
+        canned.extend_from_slice(b"%begin 1000 7 1\n@1 %0 80 24\n%end 1000 7 1\n"); // enumeration
+        canned.extend_from_slice(b"%exit\n");
+        std::fs::write(&canned_path, &canned).unwrap();
+
+        let cl = format!(
+            "cmd.exe /c type {} & powershell -NoProfile -Command \"$input | Set-Content -Path {}\"",
+            canned_path.display(),
+            out.display(),
+        );
+        let mut session = empty_session();
+        let mut att = RemoteAttachment::attach(&cl).unwrap();
+        pump_until_finished(&mut att, &mut session, Duration::from_secs(60));
+        assert_eq!(att.version(), Some((3, 4)), "version still parsed");
+        assert!(!att.degraded(), "cleared once the 3.4 reply landed");
+        att.detach();
+
+        // The early %pause was dropped (degraded at the time); no refresh-client written.
+        let written = wait_for_file(&out, Duration::from_secs(60), |t| t.lines().count() >= 2);
+        assert!(
+            !written.contains("refresh-client -A"),
+            "early %pause must not be answered: {written:?}",
+        );
         let _ = std::fs::remove_file(&canned_path);
         let _ = std::fs::remove_file(&out);
     }
 
     // -- pure helpers --
+
+    #[test]
+    fn version_strings_parse_and_reject_garbage() {
+        assert_eq!(parse_version("3.4"), Some((3, 4)));
+        assert_eq!(parse_version("3.2a"), Some((3, 2)), "patch letter ignored");
+        assert_eq!(parse_version("next-3.5"), Some((3, 5)), "prefix stripped");
+        assert_eq!(parse_version("openbsd-7.4"), Some((7, 4)), "os prefix stripped");
+        assert_eq!(parse_version("3"), Some((3, 0)), "no minor => 0");
+        assert_eq!(parse_version("3.2"), Some((3, 2)));
+        // The gate: below 3.2 is degraded, 3.2 and up is not.
+        assert!(parse_version("3.1a").unwrap() < MIN_VERSION);
+        assert!(parse_version("3.2").unwrap() >= MIN_VERSION);
+        assert_eq!(parse_version(""), None);
+        assert_eq!(parse_version("unknown"), None, "no digits at all");
+        assert_eq!(parse_version("next-"), None, "prefix but no number");
+    }
 
     #[test]
     fn enum_lines_parse_and_reject_garbage() {
@@ -618,10 +825,14 @@ mod tests {
 %end 1000 5 1
 ");
         canned.extend_from_slice(b"%begin 1000 6 1
+3.4
+%end 1000 6 1
+");
+        canned.extend_from_slice(b"%begin 1000 7 1
 @1 %0 80 24
 @1 %1 80 24
 @2 %5 80 24
-%end 1000 6 1
+%end 1000 7 1
 ");
         // Remote join-pane: %0 leaves @1 (its layout shrinks to just %1)...
         canned.extend_from_slice(b"%layout-change @1 aaaa,80x24,0,0,1
@@ -664,10 +875,14 @@ mod tests {
 %end 1000 5 1
 ");
         canned.extend_from_slice(b"%begin 1000 6 1
+3.4
+%end 1000 6 1
+");
+        canned.extend_from_slice(b"%begin 1000 7 1
 @1 %0 80 24
 @1 %1 80 24
 @2 %5 80 24
-%end 1000 6 1
+%end 1000 7 1
 ");
         canned.extend_from_slice(b"%layout-change @2 bbbb,159x48,0,0{79x48,0,0,5,79x48,80,0,0}
 ");

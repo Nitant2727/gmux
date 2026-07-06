@@ -203,6 +203,40 @@ fn sgr_red_text() {
 }
 
 // ---------------------------------------------------------------------------
+// (9b) Runtime palette: set_palette re-themes named colors; default stays byte-identical.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn default_palette_matches_old_constants() {
+    // The default palette must reproduce the historical hardcoded colors byte-for-byte.
+    let p = Palette::default();
+    assert_eq!(p.fg, Rgb { r: 0xcc, g: 0xcc, b: 0xcc });
+    assert_eq!(p.bg, Rgb { r: 0x11, g: 0x11, b: 0x11 });
+    assert_eq!(p.ansi[1], Rgb { r: 0x80, g: 0x00, b: 0x00 }); // red
+    assert_eq!(p.ansi[15], Rgb { r: 0xff, g: 0xff, b: 0xff }); // bright white
+
+    // SGR 31 with the default palette resolves to the old red constant exactly.
+    let mut t = Terminal::new(80, 24);
+    t.advance(b"\x1b[31mred\x1b[0m");
+    assert_eq!(t.visible_cells()[0][0].fg, Rgb { r: 0x80, g: 0x00, b: 0x00 });
+}
+
+#[test]
+fn set_palette_changes_named_color_resolution() {
+    let mut t = Terminal::new(80, 24);
+    let mut ansi = Palette::default().ansi;
+    ansi[1] = Rgb { r: 0xde, g: 0xad, b: 0xbe }; // custom "red" (index 1)
+    t.set_palette(Palette { fg: Rgb { r: 1, g: 2, b: 3 }, bg: Rgb { r: 4, g: 5, b: 6 }, ansi });
+
+    // SGR 31 (Named::Red) now resolves to the custom red, not the default 0x800000.
+    t.advance(b"\x1b[31mX\x1b[0m");
+    assert_eq!(t.visible_cells()[0][0].fg, Rgb { r: 0xde, g: 0xad, b: 0xbe });
+    // Computed 256-color entries (16..=255) stay untouched by the palette.
+    t.advance(b"\x1b[38;5;196mY\x1b[0m");
+    assert_eq!(t.visible_cells()[0][1].fg, Rgb { r: 0xff, g: 0x00, b: 0x00 });
+}
+
+// ---------------------------------------------------------------------------
 // (10) Cursor position after writing text.
 // ---------------------------------------------------------------------------
 

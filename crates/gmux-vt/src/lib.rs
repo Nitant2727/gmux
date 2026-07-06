@@ -100,6 +100,51 @@ const DEFAULT_FG: Rgb = Rgb { r: 0xcc, g: 0xcc, b: 0xcc };
 /// Default background: near-black.
 const DEFAULT_BG: Rgb = Rgb { r: 0x11, g: 0x11, b: 0x11 };
 
+/// The default 16 system colors (indices 0..=15), matching the historical hardcoded xterm table.
+const DEFAULT_ANSI: [Rgb; 16] = {
+    const C: [(u8, u8, u8); 16] = [
+        (0x00, 0x00, 0x00), // 0  black
+        (0x80, 0x00, 0x00), // 1  red
+        (0x00, 0x80, 0x00), // 2  green
+        (0x80, 0x80, 0x00), // 3  yellow
+        (0x00, 0x00, 0x80), // 4  blue
+        (0x80, 0x00, 0x80), // 5  magenta
+        (0x00, 0x80, 0x80), // 6  cyan
+        (0xc0, 0xc0, 0xc0), // 7  white
+        (0x80, 0x80, 0x80), // 8  bright black
+        (0xff, 0x00, 0x00), // 9  bright red
+        (0x00, 0xff, 0x00), // 10 bright green
+        (0xff, 0xff, 0x00), // 11 bright yellow
+        (0x00, 0x00, 0xff), // 12 bright blue
+        (0xff, 0x00, 0xff), // 13 bright magenta
+        (0x00, 0xff, 0xff), // 14 bright cyan
+        (0xff, 0xff, 0xff), // 15 bright white
+    ];
+    let mut out = [Rgb { r: 0, g: 0, b: 0 }; 16];
+    let mut i = 0;
+    while i < 16 {
+        out[i] = Rgb { r: C[i].0, g: C[i].1, b: C[i].2 };
+        i += 1;
+    }
+    out
+};
+
+/// Runtime terminal color palette: default fg/bg and the 16 system colors (indices 0..=15).
+/// The 216-color cube and grayscale ramp (indices 16..=255) stay computed and are not themeable.
+/// `Default` reproduces gmux's historical hardcoded colors byte-for-byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
+    pub fg: Rgb,
+    pub bg: Rgb,
+    pub ansi: [Rgb; 16],
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        Palette { fg: DEFAULT_FG, bg: DEFAULT_BG, ansi: DEFAULT_ANSI }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Dimensions helper (alacritty's own TermSize is test-only / not exported).
 // ---------------------------------------------------------------------------
@@ -134,6 +179,8 @@ pub struct Terminal {
     osc_parser: vte::Parser,
     /// Cross-call OSC state (OSC 99 chunk reassembly buffers).
     osc_state: OscState,
+    /// Runtime color palette used when resolving grid cells to `Rgb`.
+    palette: Palette,
     cols: u16,
     rows: u16,
 }
@@ -149,9 +196,17 @@ impl Terminal {
             ansi: Processor::new(),
             osc_parser: vte::Parser::new(),
             osc_state: OscState::default(),
+            palette: Palette::default(),
             cols,
             rows,
         }
+    }
+
+    /// Replace the color palette used to resolve grid cells (fg/bg, the 16 system colors, cursor).
+    /// Takes effect on the next `visible_cells`/`cells_at_offset` — the grid stores logical colors
+    /// (Named/Indexed), so re-theming is instant with no reparse.
+    pub fn set_palette(&mut self, palette: Palette) {
+        self.palette = palette;
     }
 
     /// Feed raw PTY bytes; drive both the grid and the side event parser. Returns the events seen
@@ -251,8 +306,8 @@ impl Terminal {
             let flags = cell.flags;
             let inverse = flags.contains(Flags::INVERSE);
             let bold = flags.contains(Flags::BOLD);
-            let mut fg = resolve_color(cell.fg, DEFAULT_FG, bold);
-            let mut bg = resolve_color(cell.bg, DEFAULT_BG, false);
+            let mut fg = resolve_color(cell.fg, &self.palette, self.palette.fg, bold);
+            let mut bg = resolve_color(cell.bg, &self.palette, self.palette.bg, false);
             if inverse {
                 std::mem::swap(&mut fg, &mut bg);
             }
@@ -305,19 +360,19 @@ fn ansi_to_rgb(c: AnsiRgb) -> Rgb {
     Rgb { r: c.r, g: c.g, b: c.b }
 }
 
-/// Resolve an alacritty [`Color`] to concrete [`Rgb`].
+/// Resolve an alacritty [`Color`] to concrete [`Rgb`] against `palette`.
 /// - `Spec` -> its bytes directly.
-/// - `Named` -> a standard 16-color / default palette (bold promotes normal colors to bright).
-/// - `Indexed` -> the xterm 256-color palette.
-fn resolve_color(color: Color, default: Rgb, bold: bool) -> Rgb {
+/// - `Named` -> the palette's 16 system colors / default fg/bg (bold promotes normal to bright).
+/// - `Indexed` -> the 256-color palette (0..=15 from `palette.ansi`, 16..=255 computed).
+fn resolve_color(color: Color, palette: &Palette, default: Rgb, bold: bool) -> Rgb {
     match color {
         Color::Spec(rgb) => ansi_to_rgb(rgb),
-        Color::Indexed(i) => xterm_256(i),
-        Color::Named(named) => named_color(named, default, bold),
+        Color::Indexed(i) => xterm_256(i, palette),
+        Color::Named(named) => named_color(named, palette, default, bold),
     }
 }
 
-fn named_color(named: NamedColor, default: Rgb, bold: bool) -> Rgb {
+fn named_color(named: NamedColor, palette: &Palette, default: Rgb, bold: bool) -> Rgb {
     use NamedColor::*;
     // Standard xterm-ish 16-color palette (indices 0..=15).
     let idx = match named {
@@ -346,52 +401,31 @@ fn named_color(named: NamedColor, default: Rgb, bold: bool) -> Rgb {
         DimMagenta => 5,
         DimCyan => 6,
         DimWhite => 7,
-        // Semantic colors resolve to gmux defaults.
+        // Semantic colors resolve to the palette's default fg/bg.
         Foreground | BrightForeground | DimForeground => {
             return if named == Foreground && bold {
                 // Bold text with the default fg brightens slightly (bright white).
-                xterm_256(15)
+                xterm_256(15, palette)
             } else {
                 default
             };
         }
         Background => return default,
-        Cursor => return DEFAULT_FG,
+        Cursor => return palette.fg,
     };
     // Bold promotes a normal (0..=7) named color to its bright (8..=15) counterpart, matching the
     // common terminal convention.
     let idx = if bold && idx < 8 { idx + 8 } else { idx };
-    xterm_256(idx)
+    xterm_256(idx, palette)
 }
 
-/// The standard xterm 256-color palette.
-/// 0..=15   : the 16 system colors.
-/// 16..=231 : a 6x6x6 color cube.
-/// 232..=255: a 24-step grayscale ramp.
-fn xterm_256(i: u8) -> Rgb {
-    const SYSTEM: [(u8, u8, u8); 16] = [
-        (0x00, 0x00, 0x00), // 0  black
-        (0x80, 0x00, 0x00), // 1  red
-        (0x00, 0x80, 0x00), // 2  green
-        (0x80, 0x80, 0x00), // 3  yellow
-        (0x00, 0x00, 0x80), // 4  blue
-        (0x80, 0x00, 0x80), // 5  magenta
-        (0x00, 0x80, 0x80), // 6  cyan
-        (0xc0, 0xc0, 0xc0), // 7  white
-        (0x80, 0x80, 0x80), // 8  bright black
-        (0xff, 0x00, 0x00), // 9  bright red
-        (0x00, 0xff, 0x00), // 10 bright green
-        (0xff, 0xff, 0x00), // 11 bright yellow
-        (0x00, 0x00, 0xff), // 12 bright blue
-        (0xff, 0x00, 0xff), // 13 bright magenta
-        (0x00, 0xff, 0xff), // 14 bright cyan
-        (0xff, 0xff, 0xff), // 15 bright white
-    ];
+/// The xterm 256-color palette, with the 16 system colors sourced from `palette`.
+/// 0..=15   : the 16 system colors (from `palette.ansi`).
+/// 16..=231 : a 6x6x6 color cube (computed).
+/// 232..=255: a 24-step grayscale ramp (computed).
+fn xterm_256(i: u8, palette: &Palette) -> Rgb {
     match i {
-        0..=15 => {
-            let (r, g, b) = SYSTEM[i as usize];
-            Rgb { r, g, b }
-        }
+        0..=15 => palette.ansi[i as usize],
         16..=231 => {
             let n = i - 16;
             let r = n / 36;

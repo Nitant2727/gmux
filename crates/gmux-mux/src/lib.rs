@@ -18,7 +18,7 @@ pub use workspace::WorkspaceInfo;
 
 // Re-export the types callers need so they don't have to depend on gmux-pty / gmux-vt directly.
 pub use gmux_pty::PtySize;
-pub use gmux_vt::{Cell, Notification, NotifyKind, ProgressState, Rgb, Urgency};
+pub use gmux_vt::{Cell, Notification, NotifyKind, Palette, ProgressState, Rgb, Urgency};
 
 use std::collections::HashMap;
 use std::io;

@@ -73,7 +73,43 @@ const DEFAULTS: &[(&str, &str, Action)] = &[
 pub struct Theme {
     pub fg: Option<String>,
     pub bg: Option<String>,
+    /// Path to a Windows Terminal color-scheme JSON fragment (`{ "background":"#0c0c0c",
+    /// "foreground":..., "black":..., ... "brightWhite":... }`). Its 18 well-known keys map to the
+    /// full palette; missing keys keep the built-in defaults. A relative path resolves against
+    /// the config directory (`%APPDATA%\gmux\`), not the process cwd.
+    pub scheme: Option<PathBuf>,
+    /// Non-WT inline path: 16 `"#rrggbb"` strings for the ANSI 0..=15 system colors. Applied over
+    /// the defaults (and over `scheme`, if both are given); entries past 16 or bad hex are ignored.
+    pub ansi: Option<Vec<String>>,
 }
+
+/// A resolved palette for the wire (`Call::SetPalette`): default fg/bg + the 16 system colors,
+/// each `[r, g, b]`. Mirrors `gmux_vt::Palette` without depending on it here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
+    pub fg: [u8; 3],
+    pub bg: [u8; 3],
+    pub ansi: [[u8; 3]; 16],
+}
+
+/// The gmux defaults, byte-identical to `gmux_vt::Palette::default()`.
+const DEFAULT_PALETTE: Palette = Palette {
+    fg: [0xcc, 0xcc, 0xcc],
+    bg: [0x11, 0x11, 0x11],
+    ansi: [
+        [0x00, 0x00, 0x00], [0x80, 0x00, 0x00], [0x00, 0x80, 0x00], [0x80, 0x80, 0x00],
+        [0x00, 0x00, 0x80], [0x80, 0x00, 0x80], [0x00, 0x80, 0x80], [0xc0, 0xc0, 0xc0],
+        [0x80, 0x80, 0x80], [0xff, 0x00, 0x00], [0x00, 0xff, 0x00], [0xff, 0xff, 0x00],
+        [0x00, 0x00, 0xff], [0xff, 0x00, 0xff], [0x00, 0xff, 0xff], [0xff, 0xff, 0xff],
+    ],
+};
+
+/// The 16 ANSI slots keyed by their Windows Terminal scheme names (index = ANSI color number).
+const WT_ANSI_KEYS: [&str; 16] = [
+    "black", "red", "green", "yellow", "blue", "purple", "cyan", "white",
+    "brightBlack", "brightRed", "brightGreen", "brightYellow", "brightBlue", "brightPurple",
+    "brightCyan", "brightWhite",
+];
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
@@ -110,6 +146,78 @@ impl Config {
     pub fn bg(&self, default: [u8; 3]) -> [u8; 3] {
         self.theme.as_ref().and_then(|t| t.bg.as_deref()).and_then(parse_hex).unwrap_or(default)
     }
+
+    /// Resolve the full terminal palette from `theme`, layering (in order) over the gmux defaults:
+    /// (1) a Windows Terminal `scheme` file's 18 well-known keys, (2) an inline `ansi` array of 16
+    /// hex strings, (3) the standalone `fg`/`bg` hex overrides. Missing keys / bad hex keep the
+    /// underlying value; a `scheme` path that can't be read logs and is skipped (defaults stand).
+    /// Returns [`DEFAULT_PALETTE`] when no theme customizes any color, so callers always have a
+    /// concrete palette to send.
+    pub fn palette(&self) -> Palette {
+        let mut p = DEFAULT_PALETTE;
+        let Some(theme) = self.theme.as_ref() else { return p };
+        if let Some(path) = &theme.scheme {
+            if let Some(map) = load_scheme(path) {
+                if let Some(c) = map.get("foreground").and_then(|s| parse_hex(s)) {
+                    p.fg = c;
+                }
+                if let Some(c) = map.get("background").and_then(|s| parse_hex(s)) {
+                    p.bg = c;
+                }
+                for (i, key) in WT_ANSI_KEYS.iter().enumerate() {
+                    if let Some(c) = map.get(*key).and_then(|s| parse_hex(s)) {
+                        p.ansi[i] = c;
+                    }
+                }
+            }
+        }
+        if let Some(inline) = &theme.ansi {
+            for (slot, s) in p.ansi.iter_mut().zip(inline) {
+                if let Some(c) = parse_hex(s) {
+                    *slot = c;
+                }
+            }
+        }
+        // The standalone fg/bg keys win over a scheme's foreground/background.
+        p.fg = theme.fg.as_deref().and_then(parse_hex).unwrap_or(p.fg);
+        p.bg = theme.bg.as_deref().and_then(parse_hex).unwrap_or(p.bg);
+        p
+    }
+}
+
+/// Read a Windows Terminal color-scheme JSON fragment into a `key -> hex` map. BOM-stripped like
+/// [`Config::load`]. A missing / unreadable / non-object file logs and yields `None` (defaults
+/// stand). We deserialize to `HashMap<String, serde_json::Value>` and keep only the string values,
+/// so a full `settings.json` fragment with nested objects doesn't blow up.
+fn load_scheme(path: &std::path::Path) -> Option<HashMap<String, String>> {
+    // A relative path resolves against the config dir (%APPDATA%\gmux\), NOT the process cwd —
+    // Explorer launches have an unpredictable cwd, which would make the theme silently vanish.
+    let resolved = if path.is_relative() {
+        config_path().parent().map(|d| d.join(path)).unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
+    };
+    let path = &resolved;
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("gmux: cannot read theme scheme {}: {e}", path.display());
+            return None;
+        }
+    };
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let raw: HashMap<String, serde_json::Value> = match serde_json::from_str(text) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("gmux: ignoring invalid theme scheme {}: {e}", path.display());
+            return None;
+        }
+    };
+    Some(
+        raw.into_iter()
+            .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+            .collect(),
+    )
 }
 
 /// `%APPDATA%\gmux\gmux.json` (ARCHITECTURE-specified location; falls back to `.` if unset).
@@ -331,11 +439,97 @@ mod tests {
         assert_eq!(parse_hex("#fff"), None); // too short
         assert_eq!(parse_hex("#gggggg"), None); // non-hex
         let cfg = Config {
-            theme: Some(Theme { fg: Some("#abcdef".into()), bg: None }),
+            theme: Some(Theme { fg: Some("#abcdef".into()), bg: None, ..Default::default() }),
             ..Default::default()
         };
         assert_eq!(cfg.fg([0, 0, 0]), [0xab, 0xcd, 0xef]);
         assert_eq!(cfg.bg([9, 9, 9]), [9, 9, 9]); // no bg -> default
+    }
+
+    // -- palette / Windows Terminal scheme import (M10) --
+
+    /// A unique temp path for a scheme fixture (scratch under the OS temp dir).
+    fn temp_scheme_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("gmux-scheme-{}-{}.json", std::process::id(), tag))
+    }
+
+    #[test]
+    fn no_theme_yields_default_palette() {
+        assert_eq!(Config::default().palette(), DEFAULT_PALETTE);
+    }
+
+    #[test]
+    fn wt_scheme_fragment_maps_keys_and_defaults_missing() {
+        // A partial Campbell-ish fragment: fg/bg + a couple ANSI slots, plus a nested key we must
+        // ignore rather than choke on. `red`/`brightPurple` exercise the WT->ANSI name mapping.
+        let path = temp_scheme_path("wt");
+        std::fs::write(
+            &path,
+            r##"{
+                "name": "Test",
+                "background": "#0c0c0c",
+                "foreground": "#cccccc",
+                "red": "#c50f1f",
+                "brightPurple": "#b4009e",
+                "nested": { "ignored": true }
+            }"##,
+        )
+        .unwrap();
+        let cfg = Config {
+            theme: Some(Theme { scheme: Some(path.clone()), ..Default::default() }),
+            ..Default::default()
+        };
+        let p = cfg.palette();
+        assert_eq!(p.bg, [0x0c, 0x0c, 0x0c]);
+        assert_eq!(p.fg, [0xcc, 0xcc, 0xcc]);
+        assert_eq!(p.ansi[1], [0xc5, 0x0f, 0x1f]); // red (ANSI 1)
+        assert_eq!(p.ansi[13], [0xb4, 0x00, 0x9e]); // brightPurple -> ANSI 13 (bright magenta)
+        // Keys absent from the fragment keep the built-in defaults.
+        assert_eq!(p.ansi[0], DEFAULT_PALETTE.ansi[0]); // black untouched
+        assert_eq!(p.ansi[2], DEFAULT_PALETTE.ansi[2]); // green untouched
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn garbage_scheme_file_falls_back_to_defaults() {
+        let path = temp_scheme_path("garbage");
+        std::fs::write(&path, "{ this is not json").unwrap();
+        let cfg = Config {
+            theme: Some(Theme { scheme: Some(path.clone()), ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(cfg.palette(), DEFAULT_PALETTE, "bad scheme -> defaults, no panic");
+        let _ = std::fs::remove_file(&path);
+
+        // A missing file likewise falls back.
+        let cfg = Config {
+            theme: Some(Theme {
+                scheme: Some(temp_scheme_path("does-not-exist")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(cfg.palette(), DEFAULT_PALETTE);
+    }
+
+    #[test]
+    fn inline_ansi_overrides_scheme_and_fg_bg_win() {
+        // Inline `ansi` applies over defaults; standalone fg/bg override the scheme's fg/bg.
+        let cfg = Config {
+            theme: Some(Theme {
+                fg: Some("#010203".into()),
+                bg: Some("#040506".into()),
+                ansi: Some(vec!["#111111".into(), "#deadbe".into()]), // slots 0,1
+                scheme: None,
+            }),
+            ..Default::default()
+        };
+        let p = cfg.palette();
+        assert_eq!(p.fg, [0x01, 0x02, 0x03]);
+        assert_eq!(p.bg, [0x04, 0x05, 0x06]);
+        assert_eq!(p.ansi[0], [0x11, 0x11, 0x11]);
+        assert_eq!(p.ansi[1], [0xde, 0xad, 0xbe]);
+        assert_eq!(p.ansi[2], DEFAULT_PALETTE.ansi[2]); // slot past the inline list keeps default
     }
 
     // -- adversarial-review regressions (511967d review) --

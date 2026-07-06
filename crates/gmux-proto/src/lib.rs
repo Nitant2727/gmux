@@ -62,6 +62,20 @@ pub enum Call {
     SwitchWindow { next: bool },
     /// Drain notifications raised since the last poll (for the GUI to toast).
     PollNotifications,
+    /// Set the color palette the daemon's terminals resolve grid cells against (fg/bg + the 16
+    /// system colors). The GUI sends this once after connecting and on config hot-reload; the
+    /// daemon applies it to every existing and future pane. `ansi` shorter than 16 leaves the
+    /// remaining indices at their defaults. Old daemons fail to parse the unknown method and
+    /// drop the connection after the error response — the GUI's reconnect heals it (SetPalette
+    /// is idempotent), at the cost of one connection churn per send.
+    SetPalette {
+        #[serde(default)]
+        fg: [u8; 3],
+        #[serde(default)]
+        bg: [u8; 3],
+        #[serde(default)]
+        ansi: Vec<[u8; 3]>,
+    },
 
     // --- browser pane (M12 stage 1, flag-gated in the GUI) ---
     /// Queue a browser request: open (or navigate the existing) browser pane to `url`. The daemon
@@ -304,6 +318,11 @@ mod tests {
             Call::ClosePane,
             Call::ToggleZoom,
             Call::SwitchWindow { next: true },
+            Call::SetPalette {
+                fg: [0xcc, 0xcc, 0xcc],
+                bg: [0x11, 0x11, 0x11],
+                ansi: vec![[0, 0, 0], [0xde, 0xad, 0xbe]],
+            },
         ] {
             let req = Request { id: 1, call };
             let mut buf = Vec::new();
@@ -384,6 +403,23 @@ mod tests {
         write_msg(&mut buf, &resp).unwrap();
         let back: Response = read_msg(&mut Cursor::new(buf)).unwrap().unwrap();
         assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn set_palette_is_kebab_case_and_fields_default() {
+        let s = serde_json::to_string(&Request {
+            id: 1,
+            call: Call::SetPalette { fg: [1, 2, 3], bg: [4, 5, 6], ansi: vec![] },
+        })
+        .unwrap();
+        assert!(s.contains("\"method\":\"set-palette\""), "{s}");
+        // Hand-written / partial JSON: omitted fields fall back to serde defaults.
+        let line = r#"{"id":2,"method":"set-palette","params":{"fg":[10,20,30]}}"#;
+        let req: Request = serde_json::from_str(line).unwrap();
+        assert_eq!(
+            req.call,
+            Call::SetPalette { fg: [10, 20, 30], bg: [0, 0, 0], ansi: vec![] }
+        );
     }
 
     #[test]

@@ -14,8 +14,8 @@ use std::sync::{Arc, Mutex};
 use std::path::PathBuf;
 
 use gmux_mux::{
-    FocusDir, Pane, PaneEvent, PaneId, ProgressState, PtySize, Session, SessionSnapshot, SplitDir,
-    Urgency, Window,
+    FocusDir, Pane, PaneEvent, PaneId, Palette, ProgressState, PtySize, Rgb, Session,
+    SessionSnapshot, SplitDir, Urgency, Window,
 };
 use gmux_pipe::{PipeServer, PipeStream};
 use gmux_proto::{
@@ -43,6 +43,9 @@ pub struct Server {
     remotes: Vec<RemoteAttachment>,
     /// Latest OSC 9;4 progress per pane (Remove clears the entry; so does pane removal).
     progress: HashMap<PaneId, (ProgressState, Option<u8>)>,
+    /// Color palette applied to every pane's terminal — set by the GUI via `SetPalette`, applied
+    /// to newly spawned panes so late arrivals match the theme. Defaults to gmux's built-in colors.
+    palette: Palette,
 }
 
 impl Server {
@@ -58,6 +61,7 @@ impl Server {
             ticks: 0,
             remotes: Vec::new(),
             progress: HashMap::new(),
+            palette: Palette::default(),
         })
     }
 
@@ -81,6 +85,7 @@ impl Server {
                         ticks: 0,
                         remotes: Vec::new(),
                         progress: HashMap::new(),
+                        palette: Palette::default(),
                     });
                 }
             }
@@ -162,7 +167,9 @@ impl Server {
 
     fn spawn_pane(&self, command: &Option<String>) -> io::Result<Pane> {
         let cmd = command.clone().unwrap_or_else(|| self.shell.clone());
-        Pane::spawn(&cmd, DEFAULT_SIZE)
+        let pane = Pane::spawn(&cmd, DEFAULT_SIZE)?;
+        pane.set_palette(self.palette); // late arrivals match the current theme
+        Ok(pane)
     }
 
     fn find(&self, id: u64) -> Option<&Pane> {
@@ -326,6 +333,22 @@ impl Server {
             }
             Call::PollNotifications => {
                 Response::ok(id, ResultBody::Notifications(std::mem::take(&mut self.notifications)))
+            }
+            Call::SetPalette { fg, bg, ansi } => {
+                let mut palette = Palette::default();
+                palette.fg = Rgb { r: fg[0], g: fg[1], b: fg[2] };
+                palette.bg = Rgb { r: bg[0], g: bg[1], b: bg[2] };
+                // `ansi` may be short (hand-written JSON / partial theme): keep defaults past its end.
+                for (slot, c) in palette.ansi.iter_mut().zip(ansi) {
+                    *slot = Rgb { r: c[0], g: c[1], b: c[2] };
+                }
+                self.palette = palette;
+                for w in self.session.windows() {
+                    for p in w.panes() {
+                        p.set_palette(palette);
+                    }
+                }
+                Response::ok(id, ResultBody::Done)
             }
             Call::Browse { url } => {
                 // The daemon only queues; the GUI (with the `browser` feature) drains via
@@ -645,6 +668,7 @@ mod tests {
             ticks: 0,
             remotes: Vec::new(),
             progress: HashMap::new(),
+            palette: Palette::default(),
         };
 
         let b1 = server.handle(&Request { id: 1, call: Call::Browse { url: "https://a.test".into() } });
@@ -659,6 +683,35 @@ mod tests {
         // A second poll is empty — the queue was taken, not copied.
         let again = server.handle(&Request { id: 4, call: Call::PollBrowse });
         assert_eq!(again.result, Some(ResultBody::Browses(Vec::new())));
+    }
+
+    /// `SetPalette` re-themes existing (console-free remote) panes: after it, SGR 31 red resolves
+    /// to the custom palette color, not the built-in 0x800000.
+    #[test]
+    fn set_palette_applies_to_existing_panes() {
+        let pane = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        let pid = pane.id.0;
+        let mut server = Server {
+            session: Session::start("t", pane),
+            shell: "pwsh".into(),
+            last_view: (800, 600),
+            notifications: Vec::new(),
+            browse_requests: Vec::new(),
+            ticks: 0,
+            remotes: Vec::new(),
+            progress: HashMap::new(),
+            palette: Palette::default(),
+        };
+
+        // Custom red in ANSI slot 1; other slots left at their defaults on the wire (short vec).
+        let call = Call::SetPalette { fg: [1, 2, 3], bg: [4, 5, 6], ansi: vec![[0, 0, 0], [0xde, 0xad, 0xbe]] };
+        assert_eq!(server.handle(&Request { id: 1, call }).result, Some(ResultBody::Done));
+
+        // Feed red text; the pane's grid now resolves Named::Red to the custom color.
+        server.session.pane(PaneId(pid)).unwrap().push_output(b"\x1b[31mX\x1b[0m");
+        let snap = server.session.pane(PaneId(pid)).unwrap().snapshot();
+        let fg = snap.cells[0][0].fg;
+        assert_eq!((fg.r, fg.g, fg.b), (0xde, 0xad, 0xbe));
     }
 
     /// M11 fleet overview: OSC 9;4 from a (console-free) remote pane flows pump -> tick drain ->

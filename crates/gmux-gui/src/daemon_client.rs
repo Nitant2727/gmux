@@ -101,6 +101,7 @@ fn idempotent(call: &Call) -> bool {
             | Call::GetGrid { .. }
             | Call::ResizeView { .. }
             | Call::PollNotifications
+            | Call::SetPalette { .. }
     )
 }
 

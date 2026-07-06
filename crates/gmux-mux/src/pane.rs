@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use gmux_pty::{Pty, PtySize};
-use gmux_vt::{Cell, Notification, ProgressState, TermEvent, Terminal};
+use gmux_vt::{Cell, Notification, Palette, ProgressState, TermEvent, Terminal};
 
 use crate::attention::Attention;
 use crate::ids::PaneId;
@@ -295,6 +295,12 @@ impl Pane {
     /// Number of scrollback (history) lines currently retained above the viewport.
     pub fn history_len(&self) -> usize {
         self.terminal.lock().unwrap().history_len()
+    }
+
+    /// Re-theme this pane's terminal (fg/bg + the 16 system colors). Takes `&self` — the terminal
+    /// is behind an `Arc<Mutex>`, so a shared pane ref suffices; the next snapshot reflects it.
+    pub fn set_palette(&self, palette: Palette) {
+        self.terminal.lock().unwrap().set_palette(palette);
     }
 
     /// Drain any pending pane events (non-blocking).

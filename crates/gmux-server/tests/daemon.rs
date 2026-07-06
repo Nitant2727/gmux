@@ -103,7 +103,8 @@ fn ssh_tmux_mirrors_a_stub_remote_through_ticks() {
     let mut canned: Vec<u8> = Vec::new();
     canned.extend_from_slice(b"\x1bP1000p"); // -CC DCS introducer
     canned.extend_from_slice(b"%begin 1000 5 1\n%end 1000 5 1\n"); // attach greeting
-    canned.extend_from_slice(b"%begin 1000 6 1\n@1 %0 80 24\n%end 1000 6 1\n"); // enumeration
+    canned.extend_from_slice(b"%begin 1000 6 1\n3.4\n%end 1000 6 1\n"); // version reply (queued first)
+    canned.extend_from_slice(b"%begin 1000 7 1\n@1 %0 80 24\n%end 1000 7 1\n"); // enumeration
     canned.extend_from_slice(b"%output %0 remote-marker-42\n");
     std::fs::write(&canned_path, &canned).unwrap();
 

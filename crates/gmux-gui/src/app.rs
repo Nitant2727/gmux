@@ -168,6 +168,7 @@ impl ApplicationHandler for App {
             browser: None,
         };
         st.sync_size();
+        st.send_palette(&user_config); // theme the daemon's panes to match config
         self.state = Some(st);
         el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME));
     }
@@ -361,6 +362,7 @@ impl State {
         let config = Config::load();
         self.keymap = Keymap::build(&config);
         apply_theme(&mut self.renderer, &config);
+        self.send_palette(&config); // re-theme the daemon's panes on hot-reload
         let new_font = config.font_px.unwrap_or(DEFAULT_FONT_PX);
         if (new_font - self.font_px).abs() > f32::EPSILON {
             eprintln!("gmux: font size change requires a restart to take effect");
@@ -400,6 +402,14 @@ impl State {
         let (_, content_w, h) = self.areas();
         let (cw, ch) = self.cell_dims();
         self.client.control(Call::ResizeView { w: content_w, h, cell_w: cw, cell_h: ch });
+    }
+
+    /// Push `config`'s full terminal palette to the daemon (fg/bg + 16 system colors), which
+    /// applies it to every pane. Sent once after connecting and on each config hot-reload. A
+    /// pre-palette daemon rejects the unknown method; `control` discards the error, so old daemons
+    /// simply keep their built-in colors.
+    fn send_palette(&mut self, config: &Config) {
+        self.client.control(palette_call(config));
     }
 
     fn clear_active_toast(&self) {
@@ -539,6 +549,12 @@ fn grid_to_snapshot(g: &GridWire) -> PaneSnapshot {
 /// Last-modified time of the config file, or `None` if it doesn't exist / can't be stat'd.
 fn config_mtime() -> Option<std::time::SystemTime> {
     std::fs::metadata(config_path()).and_then(|m| m.modified()).ok()
+}
+
+/// Build the `SetPalette` call from the config's resolved palette (defaults when no theme).
+fn palette_call(config: &Config) -> Call {
+    let p = config.palette();
+    Call::SetPalette { fg: p.fg, bg: p.bg, ansi: p.ansi.to_vec() }
 }
 
 /// Push the config's theme (fg/bg, with the built-in defaults as fallback) into the renderer.
