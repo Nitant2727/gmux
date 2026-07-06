@@ -14,11 +14,16 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
+use crate::config::{config_path, Action, Config, Keymap};
 use crate::daemon_client::DaemonClient;
 use crate::renderer::{PaneView, SidebarRow};
 use crate::Renderer;
 
-const FONT_PX: f32 = 18.0;
+/// Fallback font size when `config.font_px` is unset.
+const DEFAULT_FONT_PX: f32 = 18.0;
+/// Theme defaults (match the renderer's baked-in look): sidebar text and window background.
+const DEFAULT_FG: [u8; 3] = [0xcc, 0xcc, 0xcc];
+const DEFAULT_BG: [u8; 3] = [0x08, 0x08, 0x08]; // 0.03 * 255 ≈ 8
 const TOAST_GROUP: &str = "gmux-session";
 const TOAST_MIN_INTERVAL: Duration = Duration::from_millis(1000);
 const FRAME: Duration = Duration::from_millis(33); // ~30 fps poll of remote grids
@@ -46,6 +51,10 @@ struct State {
     scroll_history: usize,
     active_rows: usize,
     heartbeat_ticks: u32,
+    // Config-driven keybindings + the last config mtime we loaded, for hot-reload.
+    keymap: Keymap,
+    font_px: f32,
+    config_mtime: Option<std::time::SystemTime>,
 }
 
 /// Run the gmux GUI. `_shell` is currently unused (the daemon picks its shell); kept for the CLI
@@ -95,7 +104,14 @@ impl ApplicationHandler for App {
         config.format = format;
         surface.configure(&device, &config);
 
-        let renderer = Renderer::from_device(device, queue, format, FONT_PX);
+        // Load user config up front: font size feeds the atlas build, theme feeds the renderer.
+        let user_config = Config::load();
+        let font_px = user_config.font_px.unwrap_or(DEFAULT_FONT_PX);
+        let keymap = Keymap::build(&user_config);
+        let config_mtime = config_mtime();
+
+        let mut renderer = Renderer::from_device(device, queue, format, font_px);
+        apply_theme(&mut renderer, &user_config);
 
         // Attach to (or start) the daemon.
         let client = match DaemonClient::connect_or_spawn("gmux") {
@@ -141,6 +157,9 @@ impl ApplicationHandler for App {
             scroll_history: 0,
             active_rows: 0,
             heartbeat_ticks: 0,
+            keymap,
+            font_px,
+            config_mtime,
         };
         st.sync_size();
         self.state = Some(st);
@@ -230,6 +249,7 @@ impl ApplicationHandler for App {
         if st.heartbeat_ticks >= 30 {
             st.heartbeat_ticks = 0;
             st.sync_size();
+            st.maybe_reload_config();
         }
 
         // Poll the daemon for fresh output by re-rendering.
@@ -239,69 +259,23 @@ impl ApplicationHandler for App {
 }
 
 impl App {
-    /// Handle a gmux keyboard chord by forwarding a control call to the daemon.
+    /// Handle a gmux keyboard chord by dispatching the configured [`Action`] to the daemon.
     fn try_shortcut(&mut self, event: &KeyEvent) -> bool {
         let mods = self.mods;
         let Some(st) = self.state.as_mut() else { return false };
 
-        if mods.alt_key() && !mods.control_key() {
-            if let Key::Named(named) = &event.logical_key {
-                let dir = match named {
-                    NamedKey::ArrowLeft => Some("left"),
-                    NamedKey::ArrowRight => Some("right"),
-                    NamedKey::ArrowUp => Some("up"),
-                    NamedKey::ArrowDown => Some("down"),
-                    _ => None,
-                };
-                if let Some(d) = dir {
-                    st.scroll_offset = 0; // focus moves snap back to the live screen
-                    st.client.control(Call::FocusPane { dir: d.to_string() });
-                    st.window.request_redraw();
-                    return true;
-                }
-            }
+        if let Some(action) = st.keymap.action(mods, &event.logical_key) {
+            st.dispatch(action);
+            return true;
         }
 
-        if mods.control_key() && mods.shift_key() {
-            if let Key::Character(s) = &event.logical_key {
-                let control = match s.chars().next().map(|c| c.to_ascii_lowercase()) {
-                    Some('d') => Some(Call::SplitPane { dir: "h".into(), command: None }),
-                    Some('e') => Some(Call::SplitPane { dir: "v".into(), command: None }),
-                    Some('w') => Some(Call::ClosePane),
-                    Some('z') => Some(Call::ToggleZoom),
-                    Some('t') => Some(Call::NewWindow { command: None }),
-                    Some('n') => Some(Call::SwitchWindow { next: true }),
-                    Some('p') => Some(Call::SwitchWindow { next: false }),
-                    _ => None,
-                };
-                if let Some(call) = control {
-                    st.scroll_offset = 0; // layout/focus changes snap back to the live screen
-                    st.client.control(call);
-                    st.sync_size();
-                    st.window.request_redraw();
-                    return true;
-                }
-            }
-        }
-
-        // Scrollback: Shift+PageUp/PageDown page through history; Escape while scrolled snaps
-        // back to live (consumed here so the pane never sees it).
-        if let Key::Named(named) = &event.logical_key {
-            match named {
-                NamedKey::PageUp if mods.shift_key() => {
-                    st.scroll_page(1);
-                    return true;
-                }
-                NamedKey::PageDown if mods.shift_key() => {
-                    st.scroll_page(-1);
-                    return true;
-                }
-                NamedKey::Escape if st.scroll_offset > 0 => {
-                    st.scroll_offset = 0;
-                    st.window.request_redraw();
-                    return true;
-                }
-                _ => {}
+        // Escape while scrolled snaps back to live (not a rebindable action; consumed here so the
+        // pane never sees it).
+        if let Key::Named(NamedKey::Escape) = &event.logical_key {
+            if st.scroll_offset > 0 {
+                st.scroll_offset = 0;
+                st.window.request_redraw();
+                return true;
             }
         }
         false
@@ -309,6 +283,72 @@ impl App {
 }
 
 impl State {
+    /// Run a keybinding [`Action`] with the same side effects the old hardcoded matches had.
+    fn dispatch(&mut self, action: Action) {
+        // Layout/focus actions snap back to the live screen; the scroll actions must NOT (they
+        // move the viewport). scroll_page already requests its own redraw.
+        if !matches!(action, Action::ScrollPageUp | Action::ScrollPageDown) {
+            self.scroll_offset = 0;
+        }
+        match action {
+            Action::FocusLeft => self.client.control(Call::FocusPane { dir: "left".into() }),
+            Action::FocusRight => self.client.control(Call::FocusPane { dir: "right".into() }),
+            Action::FocusUp => self.client.control(Call::FocusPane { dir: "up".into() }),
+            Action::FocusDown => self.client.control(Call::FocusPane { dir: "down".into() }),
+            Action::SplitH => {
+                self.client.control(Call::SplitPane { dir: "h".into(), command: None });
+                self.sync_size();
+            }
+            Action::SplitV => {
+                self.client.control(Call::SplitPane { dir: "v".into(), command: None });
+                self.sync_size();
+            }
+            Action::ClosePane => {
+                self.client.control(Call::ClosePane);
+                self.sync_size();
+            }
+            Action::ToggleZoom => {
+                self.client.control(Call::ToggleZoom);
+                self.sync_size();
+            }
+            Action::NewWindow => {
+                self.client.control(Call::NewWindow { command: None });
+                self.sync_size();
+            }
+            Action::NextWindow => {
+                self.client.control(Call::SwitchWindow { next: true });
+                self.sync_size();
+            }
+            Action::PrevWindow => {
+                self.client.control(Call::SwitchWindow { next: false });
+                self.sync_size();
+            }
+            Action::ScrollPageUp => self.scroll_page(1),
+            Action::ScrollPageDown => self.scroll_page(-1),
+        }
+        self.window.request_redraw();
+    }
+
+    /// If the config file's mtime changed since we last loaded, reload it: keys and theme apply
+    /// live; a font-size change needs a renderer rebuild we don't do here, so it's logged and
+    /// deferred to the next launch.
+    fn maybe_reload_config(&mut self) {
+        let now = config_mtime();
+        if now == self.config_mtime {
+            return;
+        }
+        self.config_mtime = now;
+        let config = Config::load();
+        self.keymap = Keymap::build(&config);
+        apply_theme(&mut self.renderer, &config);
+        let new_font = config.font_px.unwrap_or(DEFAULT_FONT_PX);
+        if (new_font - self.font_px).abs() > f32::EPSILON {
+            eprintln!("gmux: font size change requires a restart to take effect");
+            self.font_px = new_font; // remember it so we don't warn again every reload
+        }
+        self.window.request_redraw();
+    }
+
     fn cell_dims(&self) -> (u32, u32) {
         (self.renderer.cell_w().max(1), self.renderer.cell_h().max(1))
     }
@@ -474,6 +514,18 @@ fn grid_to_snapshot(g: &GridWire) -> PaneSnapshot {
         cells.push(row);
     }
     PaneSnapshot { cells, cursor: (g.cursor_col, g.cursor_row), cols: g.cols, rows: g.rows }
+}
+
+/// Last-modified time of the config file, or `None` if it doesn't exist / can't be stat'd.
+fn config_mtime() -> Option<std::time::SystemTime> {
+    std::fs::metadata(config_path()).and_then(|m| m.modified()).ok()
+}
+
+/// Push the config's theme (fg/bg, with the built-in defaults as fallback) into the renderer.
+fn apply_theme(renderer: &mut Renderer, config: &Config) {
+    let [fr, fg, fb] = config.fg(DEFAULT_FG);
+    let [br, bg, bb] = config.bg(DEFAULT_BG);
+    renderer.set_theme(Rgb { r: fr, g: fg, b: fb }, Rgb { r: br, g: bg, b: bb });
 }
 
 /// Where the first-run marker lives: `%LOCALAPPDATA%\gmux\state`.

@@ -17,6 +17,7 @@ const SIDEBAR_ACTIVE: Rgb = Rgb { r: 0x26, g: 0x26, b: 0x30 };
 const TEXT: Rgb = Rgb { r: 0xcc, g: 0xcc, b: 0xcc };
 const DIM: Rgb = Rgb { r: 0x88, g: 0x88, b: 0x88 };
 const RING_PX: f32 = 3.0;
+const DEFAULT_CLEAR: wgpu::Color = wgpu::Color { r: 0.03, g: 0.03, b: 0.03, a: 1.0 };
 
 /// One pane to draw in a multi-pane frame.
 pub struct PaneView<'a> {
@@ -61,6 +62,10 @@ pub struct Renderer {
     glyph_pipeline: wgpu::RenderPipeline,
     atlas_bind_group: wgpu::BindGroup,
     atlas: Atlas,
+    // Theme knobs (see `set_theme`). Cell fg/bg still come from the daemon's grid; these only drive
+    // the window clear color and the sidebar text color.
+    clear: wgpu::Color,
+    text: Rgb,
 }
 
 impl Renderer {
@@ -236,7 +241,29 @@ impl Renderer {
             cache: None,
         });
 
-        Renderer { device, queue, format, bg_pipeline, glyph_pipeline, atlas_bind_group, atlas }
+        Renderer {
+            device,
+            queue,
+            format,
+            bg_pipeline,
+            glyph_pipeline,
+            atlas_bind_group,
+            atlas,
+            clear: DEFAULT_CLEAR,
+            text: TEXT,
+        }
+    }
+
+    /// Apply theme colors: `bg` becomes the window clear color, `fg` the sidebar text color.
+    /// (Terminal cell colors are owned by the daemon's grid, so they are unaffected.)
+    pub fn set_theme(&mut self, fg: Rgb, bg: Rgb) {
+        self.text = fg;
+        self.clear = wgpu::Color {
+            r: bg.r as f64 / 255.0,
+            g: bg.g as f64 / 255.0,
+            b: bg.b as f64 / 255.0,
+            a: 1.0,
+        };
     }
 
     pub fn cell_w(&self) -> u32 {
@@ -375,7 +402,7 @@ impl Renderer {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.03, g: 0.03, b: 0.03, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(self.clear),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -463,7 +490,7 @@ impl Renderer {
             if r.attention {
                 quad(&mut bg, 8.0, y + 9.0, 16.0, y + 17.0, rgba(RING_COLOR));
             }
-            self.text_run(&r.name, 24.0, y + 6.0, rgba(TEXT), fw, fh, &mut gl);
+            self.text_run(&r.name, 24.0, y + 6.0, rgba(self.text), fw, fh, &mut gl);
             if let Some(b) = &r.branch {
                 self.text_run(&format!("git:{b}"), 24.0, y + 6.0 + ch, rgba(DIM), fw, fh, &mut gl);
             }
@@ -524,7 +551,7 @@ impl Renderer {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.03, g: 0.03, b: 0.03, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(self.clear),
                         store: wgpu::StoreOp::Store,
                     },
                 })],

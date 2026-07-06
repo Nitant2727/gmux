@@ -582,6 +582,8 @@ dependencies = [
  "gmux-pipe",
  "gmux-proto",
  "pollster",
+ "serde",
+ "serde_json",
  "wgpu",
  "winit",
 ]
