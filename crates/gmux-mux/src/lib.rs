@@ -77,6 +77,27 @@ impl Window {
         Window { id: WindowId::alloc(), panes, root, active, zoom: false }
     }
 
+    /// Replace this window's split tree wholesale (the remote-tmux mirror path, where the remote's
+    /// `%layout-change` is authoritative): insert `added` panes, install `root`, and remove panes
+    /// the new tree no longer references, returning them so the caller can dispose of them (e.g.
+    /// mark remote mirrors exited). The active pane is kept when still present, else reset to the
+    /// tree's first leaf.
+    pub fn replace_tree(&mut self, root: Node, added: Vec<Pane>) -> Vec<Pane> {
+        for pane in added {
+            self.panes.insert(pane.id, pane);
+        }
+        self.root = root;
+        let mut keep = Vec::new();
+        self.root.leaves(&mut keep);
+        let pruned: Vec<PaneId> =
+            self.panes.keys().filter(|id| !keep.contains(id)).copied().collect();
+        let removed = pruned.into_iter().filter_map(|id| self.panes.remove(&id)).collect();
+        if !self.panes.contains_key(&self.active) {
+            self.active = self.root.first_leaf();
+        }
+        removed
+    }
+
     /// Split the active pane, insert `new_pane`, and focus it.
     pub fn split(&mut self, dir: SplitDir, new_pane: Pane) -> PaneId {
         let nid = new_pane.id;
@@ -192,6 +213,32 @@ impl Session {
         self.windows.push(w);
         self.active = self.windows.len() - 1;
         id
+    }
+
+    /// Append a pre-built window without stealing focus (remote windows appearing in the
+    /// background must not yank the user off their active tab).
+    pub fn push_window(&mut self, window: Window) -> WindowId {
+        let id = window.id;
+        self.windows.push(window);
+        id
+    }
+
+    /// Find a window by id (ids are never reused, so a stale id can only miss, never alias).
+    pub fn window_mut(&mut self, id: WindowId) -> Option<&mut Window> {
+        self.windows.iter_mut().find(|w| w.id == id)
+    }
+
+    /// Remove a window by id, fixing the active index. Unlike [`Session::close_active_window`]
+    /// this may remove the last window (a remote `%window-close` is not a user gesture to guard).
+    pub fn remove_window(&mut self, id: WindowId) -> Option<Window> {
+        let idx = self.windows.iter().position(|w| w.id == id)?;
+        let win = self.windows.remove(idx);
+        if idx < self.active {
+            self.active -= 1;
+        } else if self.active >= self.windows.len() && self.active > 0 {
+            self.active = self.windows.len() - 1;
+        }
+        Some(win)
     }
 
     pub fn next_window(&mut self) {
@@ -331,5 +378,55 @@ mod tests {
         assert_eq!(mux.session_by_name("work").unwrap().id, a);
         assert_eq!(mux.session(b).unwrap().window_count(), 0);
         assert_eq!(mux.pane_count(), 0);
+    }
+
+    /// A one-remote-pane window (no console needed — remote panes have no ConPTY).
+    fn remote_window() -> Window {
+        let pane = Pane::remote(0, 80, 24, Box::new(|_| {}));
+        let id = pane.id;
+        let mut panes = HashMap::new();
+        panes.insert(id, pane);
+        Window::from_parts(panes, Node::leaf(id), id)
+    }
+
+    #[test]
+    fn push_window_does_not_steal_focus_and_remove_window_fixes_active() {
+        let mut s = Session::from_windows("t", vec![remote_window(), remote_window()], 1);
+        let kept = s.windows()[1].id;
+        let added = s.push_window(remote_window());
+        assert_eq!(s.active_index(), 1, "push_window must not move focus");
+        assert_eq!(s.window_count(), 3);
+
+        // Removing a window BEFORE the active one shifts the index down with it.
+        let first = s.windows()[0].id;
+        assert!(s.remove_window(first).is_some());
+        assert_eq!(s.active_window().map(|w| w.id), Some(kept));
+
+        // Removing a trailing window leaves the active index clamped and valid.
+        assert!(s.remove_window(added).is_some());
+        assert_eq!(s.active_window().map(|w| w.id), Some(kept));
+
+        // Unlike close_active_window, the last window may go (a remote %window-close is not a
+        // user gesture to guard).
+        assert!(s.remove_window(kept).is_some());
+        assert_eq!(s.window_count(), 0);
+        assert!(s.active_window().is_none());
+        assert!(s.remove_window(kept).is_none(), "ids are never reused; a second remove misses");
+    }
+
+    #[test]
+    fn replace_tree_inserts_prunes_and_reactivates() {
+        let mut win = remote_window();
+        let old = win.active_id();
+        let new_pane = Pane::remote(1, 40, 10, Box::new(|_| {}));
+        let new_id = new_pane.id;
+
+        // New tree keeps only the new pane: the old one must be pruned and handed back.
+        let removed = win.replace_tree(Node::leaf(new_id), vec![new_pane]);
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].id, old);
+        assert_eq!(win.pane_count(), 1);
+        assert_eq!(win.active_id(), new_id, "active must fall back to a live leaf");
+        assert!(win.pane(old).is_none());
     }
 }

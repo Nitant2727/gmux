@@ -5,6 +5,7 @@
 //!   gmux notify --title T [--body B] [--urgency low|normal|critical]
 //!                                emit an OSC 777 notification to stdout (run inside a gmux pane;
 //!                                gmux attributes it to that pane and shows a toast)
+//!   gmux ssh-tmux <target>       mirror a remote tmux session over ssh (tmux -CC)
 //!   gmux hooks setup <agent>     configure claude-code | codex | gemini | aider | all
 //!   gmux shell-integration       print (or --install into $PROFILE) the PowerShell snippet
 //!
@@ -161,6 +162,8 @@ USAGE:
   gmux                                 open a window running the default shell
   gmux <command...>                    open a window running that command
   gmux notify --title T [--body B]     emit an OSC 777 notification (run inside a pane)
+  gmux ssh-tmux <target>               mirror a remote tmux session over ssh (tmux -CC);
+                                       --command <raw> overrides the transport command line
   gmux hooks setup <agent>             configure claude-code | codex | gemini | aider | all
   gmux shell-integration [--install]   print (or install into $PROFILE) the PowerShell snippet
   gmux --help                          show this help

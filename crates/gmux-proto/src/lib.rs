@@ -62,6 +62,13 @@ pub enum Call {
     SwitchWindow { next: bool },
     /// Drain notifications raised since the last poll (for the GUI to toast).
     PollNotifications,
+
+    // --- remote (M9 stage 2c) ---
+    /// Attach a remote tmux session and mirror its windows/panes into this session. `target` is
+    /// an ssh destination (the daemon runs `ssh -tt <target> -- tmux -CC new -As gmux`);
+    /// `command` overrides the entire transport command line (tests / power users can inject any
+    /// process that speaks control mode on stdio).
+    SshTmux { target: String, #[serde(default)] command: Option<String> },
 }
 
 /// A response envelope: exactly one of `result` / `error` is set.
@@ -224,6 +231,8 @@ mod tests {
             Call::SplitPane { dir: "h".into(), command: None },
             Call::NewWindow { command: Some("cmd.exe".into()) },
             Call::Notify { pane: Some(5), title: "T".into(), body: "B".into() },
+            Call::SshTmux { target: "dev@build-box".into(), command: None },
+            Call::SshTmux { target: String::new(), command: Some("cmd.exe /c type canned.bin".into()) },
         ];
         for (i, call) in calls.into_iter().enumerate() {
             let req = Request { id: i as u64, call };
@@ -303,6 +312,16 @@ mod tests {
         write_msg(&mut buf, &resp).unwrap();
         let back: Response = read_msg(&mut Cursor::new(buf)).unwrap().unwrap();
         assert_eq!(back.result, Some(grid));
+    }
+
+    #[test]
+    fn ssh_tmux_is_kebab_case_and_command_defaults_to_none() {
+        // Hand-written client JSON may omit the optional command override entirely.
+        let line = r#"{"id":4,"method":"ssh-tmux","params":{"target":"dev@build-box"}}"#;
+        let req: Request = serde_json::from_str(line).unwrap();
+        assert_eq!(req.call, Call::SshTmux { target: "dev@build-box".into(), command: None });
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains("\"method\":\"ssh-tmux\""), "{s}");
     }
 
     #[test]

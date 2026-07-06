@@ -5,6 +5,8 @@
 //! Panes render at a default cell size until a client reports its geometry (M6b adds resize/grid
 //! streaming so a thin GUI can attach).
 
+pub mod remote;
+
 use std::io::{self, BufReader};
 use std::sync::{Arc, Mutex};
 
@@ -16,6 +18,8 @@ use gmux_proto::{
     read_msg, write_msg, Call, CellWire, GridWire, LayoutWire, NotifyWire, PaneInfo, PaneRectWire,
     Request, Response, ResultBody, TabWire, CELL_BOLD, CELL_INVERSE, CELL_ITALIC, CELL_UNDERLINE,
 };
+
+use remote::RemoteAttachment;
 
 const DEFAULT_SIZE: PtySize = PtySize { cols: 120, rows: 30 };
 
@@ -29,6 +33,8 @@ pub struct Server {
     notifications: Vec<NotifyWire>,
     /// Tick counter for debounced snapshot saves.
     ticks: u32,
+    /// Live remote tmux attachments; pumped every tick, dropped when finished.
+    remotes: Vec<RemoteAttachment>,
 }
 
 impl Server {
@@ -41,6 +47,7 @@ impl Server {
             last_view: (1200, 720),
             notifications: Vec::new(),
             ticks: 0,
+            remotes: Vec::new(),
         })
     }
 
@@ -61,6 +68,7 @@ impl Server {
                         last_view: (1200, 720),
                         notifications: Vec::new(),
                         ticks: 0,
+                        remotes: Vec::new(),
                     });
                 }
             }
@@ -85,6 +93,11 @@ impl Server {
     /// Drain every pane's events: queue notifications for `PollNotifications` and remove panes
     /// whose process exited. Called periodically by the daemon loop.
     pub fn tick(&mut self) {
+        // Pump remote attachments first so their output/exits are visible to the pane-event
+        // drain below within the same tick. Finished attachments are dropped — their panes were
+        // marked exited, so the normal Exited sweep removes them.
+        let session = &mut self.session;
+        self.remotes.retain_mut(|r| r.pump(session));
         let mut notes = Vec::new();
         let mut exited = Vec::new();
         for w in self.session.windows() {
@@ -215,6 +228,14 @@ impl Server {
                         }
                     }
                 }
+                // Every remote tmux lays its windows out at the client size; tell them all (the
+                // active window may or may not be remote — keeping every attachment current is
+                // simpler than tracking which one is showing).
+                let cols = (*w / cw).max(1) as u16;
+                let rows = (*h / ch).max(1) as u16;
+                for r in &mut self.remotes {
+                    r.resize_client(cols, rows);
+                }
                 Response::ok(id, ResultBody::Done)
             }
             Call::FocusPane { dir } => {
@@ -254,6 +275,18 @@ impl Server {
             }
             Call::PollNotifications => {
                 Response::ok(id, ResultBody::Notifications(std::mem::take(&mut self.notifications)))
+            }
+            Call::SshTmux { target, command } => {
+                let cl = command
+                    .clone()
+                    .unwrap_or_else(|| format!("ssh -tt {target} -- tmux -CC new -As gmux"));
+                match RemoteAttachment::attach(&cl) {
+                    Ok(att) => {
+                        self.remotes.push(att);
+                        Response::ok(id, ResultBody::Done)
+                    }
+                    Err(e) => Response::err(id, format!("ssh-tmux spawn failed: {e}")),
+                }
             }
         }
     }

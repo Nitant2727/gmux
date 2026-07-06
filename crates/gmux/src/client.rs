@@ -80,6 +80,30 @@ fn parse_scrollback(arg: Option<&str>) -> usize {
     }
 }
 
+/// Parse `ssh-tmux` arguments: the first non-flag argument is the ssh target; `--command <raw>`
+/// overrides the entire transport command line. `None` when no target (and no override) is given.
+fn parse_ssh_tmux(args: &[String]) -> Option<(String, Option<String>)> {
+    let (mut target, mut command) = (None, None);
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--command" => {
+                i += 1;
+                command = args.get(i).cloned();
+            }
+            other if target.is_none() => target = Some(other.to_string()),
+            _ => {}
+        }
+        i += 1;
+    }
+    // A raw --command needs no target (the override replaces the ssh line entirely).
+    match (target, command) {
+        (Some(t), c) => Some((t, c)),
+        (None, Some(c)) => Some((String::new(), Some(c))),
+        (None, None) => None,
+    }
+}
+
 /// Entry: dispatch `gmux <subcommand> ...` API calls. Returns an exit code.
 pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
     match cmd {
@@ -127,6 +151,13 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
             let command = args.iter().position(|a| a == "--").map(|i| args[i + 1..].join(" ")).filter(|s| !s.is_empty());
             Some(run(Call::NewWindow { command }))
         }
+        "ssh-tmux" => {
+            let Some((target, command)) = parse_ssh_tmux(args) else {
+                eprintln!("usage: gmux ssh-tmux <target> [--command <raw transport command>]");
+                return Some(2);
+            };
+            Some(run(Call::SshTmux { target, command }))
+        }
         _ => None, // not an API subcommand
     }
 }
@@ -150,5 +181,22 @@ mod tests {
         assert_eq!(parse_scrollback(Some("0")), 0);
         assert_eq!(parse_scrollback(Some("200")), 200);
         assert_eq!(parse_scrollback(Some("garbage")), 0);
+    }
+
+    #[test]
+    fn ssh_tmux_args_parse() {
+        use super::parse_ssh_tmux;
+        let a = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(parse_ssh_tmux(&a(&["dev@box"])), Some(("dev@box".into(), None)));
+        assert_eq!(
+            parse_ssh_tmux(&a(&["dev@box", "--command", "cmd.exe /c type x"])),
+            Some(("dev@box".into(), Some("cmd.exe /c type x".into()))),
+        );
+        // A raw override needs no target.
+        assert_eq!(
+            parse_ssh_tmux(&a(&["--command", "stub.exe"])),
+            Some((String::new(), Some("stub.exe".into()))),
+        );
+        assert_eq!(parse_ssh_tmux(&[]), None);
     }
 }

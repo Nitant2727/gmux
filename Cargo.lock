@@ -641,6 +641,8 @@ dependencies = [
  "gmux-mux",
  "gmux-pipe",
  "gmux-proto",
+ "gmux-remote",
+ "gmux-tmux",
  "serde_json",
 ]
 
