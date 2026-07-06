@@ -201,8 +201,14 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
   `refresh-client -A %N:continue`, %exit/Eof→mark_exited + drop); ResizeView also resizes remote
   clients. 175 tests; daemon console suite exit 0 (incl. new SshTmux-over-stub E2E). Deferred to
   2d: local split/kill of remote panes round-tripped to the remote, break-pane/join-pane re-homing.
+- **Stage 2d ✅ (2026-07-06, from adversarial review of 2c):** cross-window pane moves
+  (`join-pane`/`break-pane`) re-homed via `Session::extract_pane` — the review proved the old
+  "known limitation" was actually a daemon-wide crash (dual-homed pane → dangling active →
+  `workspace_info` panic → poisoned mutex); regression tests cover both event orderings. Local
+  `SplitPane`/`ClosePane` on a remote mirror now round-trip (`split-window`/`kill-pane` to the
+  remote; the mirror updates via `%layout-change`) instead of spawning/dropping local shells.
 - **M9 remaining before done:** live test against a REAL tmux over ssh (no peer on the dev
-  machine — needs user-provided host or WSL), stage-2d bidirectional pane ops, ≥3.2 version gate.
+  machine — needs a user-provided host or WSL), tmux ≥3.2 version gate/degraded mode.
 
 ### M10 — Keybindings & configuration polish
 
