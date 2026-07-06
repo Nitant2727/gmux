@@ -55,6 +55,10 @@ struct State {
     keymap: Keymap,
     font_px: f32,
     config_mtime: Option<std::time::SystemTime>,
+    /// M12: the flag-gated WebView2 browser pane (its own top-level window), opened on the first
+    /// `Browse` request drained from the daemon.
+    #[cfg(feature = "browser")]
+    browser: Option<gmux_browser::BrowserPane>,
 }
 
 /// Run the gmux GUI. `_shell` is currently unused (the daemon picks its shell); kept for the CLI
@@ -160,6 +164,8 @@ impl ApplicationHandler for App {
             keymap,
             font_px,
             config_mtime,
+            #[cfg(feature = "browser")]
+            browser: None,
         };
         st.sync_size();
         self.state = Some(st);
@@ -240,6 +246,20 @@ impl ApplicationHandler for App {
                 st.window.focus_window();
                 st.clear_active_toast();
                 flash_window(st.hwnd, false);
+            }
+        }
+
+        // M12 (feature "browser"): drain queued Browse requests into the WebView2 pane.
+        #[cfg(feature = "browser")]
+        if let Ok(ResultBody::Browses(urls)) = st.client.call(Call::PollBrowse) {
+            for url in urls {
+                match &st.browser {
+                    Some(b) => b.navigate(&url),
+                    None => match gmux_browser::BrowserPane::open(&url) {
+                        Ok(b) => st.browser = Some(b),
+                        Err(e) => eprintln!("gmux: browser pane failed: {e}"),
+                    },
+                }
             }
         }
 

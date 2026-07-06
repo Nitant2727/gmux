@@ -63,6 +63,13 @@ pub enum Call {
     /// Drain notifications raised since the last poll (for the GUI to toast).
     PollNotifications,
 
+    // --- browser pane (M12 stage 1, flag-gated in the GUI) ---
+    /// Queue a browser request: open (or navigate the existing) browser pane to `url`. The daemon
+    /// only queues it; the GUI drains it via [`Call::PollBrowse`] and drives the WebView2 window.
+    Browse { url: String },
+    /// Drain browser requests queued since the last poll (mirrors `PollNotifications`).
+    PollBrowse,
+
     // --- remote (M9 stage 2c) ---
     /// Attach a remote tmux session and mirror its windows/panes into this session. `target` is
     /// an ssh destination (the daemon runs `ssh -tt <target> -- tmux -CC new -As gmux`);
@@ -101,6 +108,8 @@ pub enum ResultBody {
     Layout(LayoutWire),
     Grid(GridWire),
     Notifications(Vec<NotifyWire>),
+    /// Browser requests drained by `PollBrowse` (M12): a list of urls to open/navigate to.
+    Browses(Vec<String>),
     Done,
 }
 
@@ -353,6 +362,28 @@ mod tests {
         assert_eq!(req.call, Call::SshTmux { target: "dev@build-box".into(), command: None });
         let s = serde_json::to_string(&req).unwrap();
         assert!(s.contains("\"method\":\"ssh-tmux\""), "{s}");
+    }
+
+    #[test]
+    fn browse_calls_and_result_roundtrip_kebab_case() {
+        for call in [Call::Browse { url: "https://example.com".into() }, Call::PollBrowse] {
+            let req = Request { id: 1, call };
+            let mut buf = Vec::new();
+            write_msg(&mut buf, &req).unwrap();
+            let back: Request = read_msg(&mut Cursor::new(buf)).unwrap().unwrap();
+            assert_eq!(back, req);
+        }
+        // Method names are kebab-case like the rest of the protocol.
+        let s = serde_json::to_string(&Request { id: 1, call: Call::PollBrowse }).unwrap();
+        assert!(s.contains("\"method\":\"poll-browse\""), "{s}");
+        let s = serde_json::to_string(&Request { id: 1, call: Call::Browse { url: "u".into() } }).unwrap();
+        assert!(s.contains("\"method\":\"browse\""), "{s}");
+
+        let resp = Response::ok(2, ResultBody::Browses(vec!["https://a.test".into(), "https://b.test".into()]));
+        let mut buf = Vec::new();
+        write_msg(&mut buf, &resp).unwrap();
+        let back: Response = read_msg(&mut Cursor::new(buf)).unwrap().unwrap();
+        assert_eq!(back, resp);
     }
 
     #[test]

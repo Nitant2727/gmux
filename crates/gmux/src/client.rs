@@ -49,7 +49,7 @@ fn print_result(body: &ResultBody) {
         ResultBody::Panes(panes) => print_panes(panes),
         ResultBody::Text(t) => println!("{t}"),
         ResultBody::PaneId(id) => println!("%{id}"),
-        ResultBody::Layout(_) | ResultBody::Grid(_) | ResultBody::Notifications(_) => {} // not for the CLI
+        ResultBody::Layout(_) | ResultBody::Grid(_) | ResultBody::Notifications(_) | ResultBody::Browses(_) => {} // not for the CLI
         ResultBody::Done => {}
     }
 }
@@ -69,6 +69,23 @@ fn print_panes(panes: &[PaneInfo]) {
 /// Parse `%5` / `5` into a pane id.
 fn parse_pane(s: &str) -> Option<u64> {
     s.trim_start_matches('%').parse().ok()
+}
+
+/// Rebuild a command line from argv pieces after `--`, re-quoting arguments the shell had
+/// unwrapped: a plain `join(" ")` would turn `claude -p "work on auth"` into
+/// `claude -p work on auth`, splintering the prompt into stray positionals when the child
+/// re-parses its command line.
+fn join_command(args: &[String]) -> String {
+    args.iter()
+        .map(|a| {
+            if a.is_empty() || a.chars().any(|c| c == ' ' || c == '\t') {
+                format!("\"{}\"", a.replace('"', "\\\""))
+            } else {
+                a.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Parse the `-S` argument into a line count. `-` (or missing / `0`) means "all retained history";
@@ -144,11 +161,11 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
         }
         "split-pane" => {
             let dir = if args.iter().any(|a| a == "-v") { "v" } else { "h" }.to_string();
-            let command = args.iter().position(|a| a == "--").map(|i| args[i + 1..].join(" ")).filter(|s| !s.is_empty());
+            let command = args.iter().position(|a| a == "--").map(|i| join_command(&args[i + 1..])).filter(|s| !s.is_empty());
             Some(run(Call::SplitPane { dir, command }))
         }
         "new-window" => {
-            let command = args.iter().position(|a| a == "--").map(|i| args[i + 1..].join(" ")).filter(|s| !s.is_empty());
+            let command = args.iter().position(|a| a == "--").map(|i| join_command(&args[i + 1..])).filter(|s| !s.is_empty());
             Some(run(Call::NewWindow { command }))
         }
         "ssh-tmux" => {
@@ -157,6 +174,13 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
                 return Some(2);
             };
             Some(run(Call::SshTmux { target, command }))
+        }
+        "browse" => {
+            let Some(url) = args.iter().find(|a| !a.starts_with('-')).cloned() else {
+                eprintln!("usage: gmux browse <url>");
+                return Some(2);
+            };
+            Some(run(Call::Browse { url }))
         }
         _ => None, // not an API subcommand
     }
@@ -198,5 +222,20 @@ mod tests {
             Some((String::new(), Some("stub.exe".into()))),
         );
         assert_eq!(parse_ssh_tmux(&[]), None);
+    }
+
+    /// M11 review regression: multi-word quoted args after `--` must survive re-joining
+    /// (`claude -p "work on the auth module"` was splintered by a plain join).
+    #[test]
+    fn join_command_requotes_multiword_args() {
+        use super::join_command;
+        let a = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(join_command(&a(&["claude"])), "claude");
+        assert_eq!(
+            join_command(&a(&["claude", "-p", "work on the auth module"])),
+            "claude -p \"work on the auth module\"",
+        );
+        assert_eq!(join_command(&a(&["run", "say \"hi\" now"])), "run \"say \\\"hi\\\" now\"");
+        assert_eq!(join_command(&a(&["x", ""])), "x \"\"");
     }
 }

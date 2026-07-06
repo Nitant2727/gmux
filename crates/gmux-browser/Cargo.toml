@@ -1,0 +1,19 @@
+[package]
+name = "gmux-browser"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# M12 stage 1: a flag-gated WebView2 browser pane. This crate is only pulled in when gmux-gui is
+# built with `--features browser`, so its WebView2/COM deps never touch the default build graph.
+[dependencies]
+webview2-com = "0.39"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+] }
+windows-core = "0.62"

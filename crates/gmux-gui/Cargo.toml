@@ -17,3 +17,10 @@ bytemuck = { version = "1", features = ["derive"] }
 ab_glyph = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# M12: only pulled in with `--features browser`; keeps WebView2/COM out of the default graph.
+gmux-browser = { path = "../gmux-browser", optional = true }
+
+[features]
+# Off by default: the WebView2 browser pane is lower priority than terminal correctness (ROADMAP M12).
+default = []
+browser = ["dep:gmux-browser"]

@@ -35,6 +35,8 @@ pub struct Server {
     last_view: (u32, u32),
     /// Notifications raised by panes, drained by `PollNotifications`.
     notifications: Vec<NotifyWire>,
+    /// Browser-open requests queued by `Browse`, drained by `PollBrowse` (M12).
+    browse_requests: Vec<String>,
     /// Tick counter for debounced snapshot saves.
     ticks: u32,
     /// Live remote tmux attachments; pumped every tick, dropped when finished.
@@ -52,6 +54,7 @@ impl Server {
             shell,
             last_view: (1200, 720),
             notifications: Vec::new(),
+            browse_requests: Vec::new(),
             ticks: 0,
             remotes: Vec::new(),
             progress: HashMap::new(),
@@ -74,6 +77,7 @@ impl Server {
                         shell,
                         last_view: (1200, 720),
                         notifications: Vec::new(),
+                        browse_requests: Vec::new(),
                         ticks: 0,
                         remotes: Vec::new(),
                         progress: HashMap::new(),
@@ -141,12 +145,14 @@ impl Server {
                 }
             }
         }
-        for id in &exited {
-            self.progress.remove(id);
-        }
         for id in exited {
+            self.progress.remove(&id);
             self.session.remove_pane(id);
         }
+        // Panes can also leave the session without an observable Exited drain (remote layout
+        // prunes / window closes drop them from the tree before this loop sees the event), which
+        // would leak their progress entries forever. Sweep against the live session.
+        self.progress.retain(|id, _| self.session.pane(*id).is_some());
         // Debounced snapshot save (~every 2 s at a 100 ms tick).
         self.ticks = self.ticks.wrapping_add(1);
         if self.ticks % 20 == 0 {
@@ -320,6 +326,16 @@ impl Server {
             }
             Call::PollNotifications => {
                 Response::ok(id, ResultBody::Notifications(std::mem::take(&mut self.notifications)))
+            }
+            Call::Browse { url } => {
+                // The daemon only queues; the GUI (with the `browser` feature) drains via
+                // PollBrowse and drives the WebView2 window. A daemon with no GUI attached simply
+                // accumulates requests until one attaches.
+                self.browse_requests.push(url.clone());
+                Response::ok(id, ResultBody::Done)
+            }
+            Call::PollBrowse => {
+                Response::ok(id, ResultBody::Browses(std::mem::take(&mut self.browse_requests)))
             }
             Call::SshTmux { target, command } => {
                 let cl = command
@@ -612,6 +628,39 @@ mod tests {
         assert!(resp.result.is_none());
     }
 
+    /// M12 browser pane: `Browse` queues urls; `PollBrowse` drains them in order and leaves the
+    /// queue empty (mirrors PollNotifications). No pane/console needed — pure queue plumbing, so it
+    /// runs headless in the default `cargo test`.
+    #[test]
+    fn browse_queues_and_poll_browse_drains_in_order() {
+        use gmux_mux::{Pane, Session};
+        // Build a Server with a console-free remote pane so no ConPTY is bound.
+        let pane = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        let mut server = Server {
+            session: Session::start("t", pane),
+            shell: "pwsh".into(),
+            last_view: (800, 600),
+            notifications: Vec::new(),
+            browse_requests: Vec::new(),
+            ticks: 0,
+            remotes: Vec::new(),
+            progress: HashMap::new(),
+        };
+
+        let b1 = server.handle(&Request { id: 1, call: Call::Browse { url: "https://a.test".into() } });
+        assert_eq!(b1.result, Some(ResultBody::Done));
+        server.handle(&Request { id: 2, call: Call::Browse { url: "https://b.test".into() } });
+
+        let drained = server.handle(&Request { id: 3, call: Call::PollBrowse });
+        assert_eq!(
+            drained.result,
+            Some(ResultBody::Browses(vec!["https://a.test".into(), "https://b.test".into()]))
+        );
+        // A second poll is empty — the queue was taken, not copied.
+        let again = server.handle(&Request { id: 4, call: Call::PollBrowse });
+        assert_eq!(again.result, Some(ResultBody::Browses(Vec::new())));
+    }
+
     /// M11 fleet overview: OSC 9;4 from a (console-free) remote pane flows pump -> tick drain ->
     /// per-pane progress map -> window aggregation; Error outranks pct; Remove clears.
     #[test]
@@ -667,5 +716,29 @@ mod tests {
         session.pane(idb).unwrap().push_output(b"\x1b]9;4;0;0\x07");
         drain(&mut progress);
         assert_eq!(window_progress(win, &progress), (None, false));
+    }
+
+    /// M11 review regression: a pane that leaves the session without a drained Exited event
+    /// (remote layout prune path) must not leak its progress entry — the tick sweep clears it.
+    #[test]
+    fn progress_entries_swept_for_vanished_panes() {
+        use gmux_mux::{Pane, Session};
+        let p = Pane::remote(9, 80, 24, Box::new(|_| {}));
+        let gone = p.id; // never inserted into any window: simulates a pruned pane
+        drop(p);
+        let live = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        let live_id = live.id;
+        let win = gmux_mux::Window::from_parts(
+            std::collections::HashMap::from([(live_id, live)]),
+            gmux_mux::layout::Node::Leaf(live_id),
+            live_id,
+        );
+        let mut progress = HashMap::new();
+        progress.insert(gone, (ProgressState::Set, Some(50)));
+        progress.insert(live_id, (ProgressState::Set, Some(10)));
+        let session = Session::from_windows("t", vec![win], 0);
+        progress.retain(|id, _| session.pane(*id).is_some()); // the tick() sweep
+        assert!(!progress.contains_key(&gone), "vanished pane's entry must be swept");
+        assert!(progress.contains_key(&live_id), "live pane's entry must survive");
     }
 }
