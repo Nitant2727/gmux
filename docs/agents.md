@@ -41,7 +41,19 @@ gmux capture-pane -t %2 -S -              # full scrollback (or -S 200 for the l
 ```
 
 `send-keys` + `capture-pane` is enough to drive an agent from another agent — an orchestrator
-pane can spawn teammates and poll their output.
+pane can spawn teammates and read their output.
+
+Instead of polling `list-panes` / `capture-pane` in a loop to notice when a teammate needs
+attention, subscribe to the daemon's event stream and block until something happens:
+
+```powershell
+gmux subscribe            # one JSON line per event batch, until Ctrl+C
+```
+
+Each line is a `{"id":0,"result":{"notifications":[...]}}` envelope: an agent's OSC 777 toast
+arrives as a notification (with its `pane`), and a pane exiting arrives as a notification with
+`"title":"pane-exited"` and the pane id in `pane`. Pipe it to a script that reacts (capture that
+pane, re-prompt it, spawn the next task) the moment an event lands, no busy-wait.
 
 ## Subagent panes (teammates as real panes)
 

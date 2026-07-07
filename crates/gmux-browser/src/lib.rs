@@ -13,19 +13,28 @@
 //! window exists (so a failure to create it surfaces synchronously); WebView2 creation completes
 //! asynchronously on the browser thread.
 //!
-//! `eval_js` is intentionally a stub returning a clear error — script execution + result plumbing
-//! lands with stage 2 (it needs the async `ExecuteScript` result routed back over a channel).
+//! `eval_js` (M12 stage 2a) runs a script in the pane's WebView2 and routes the JSON result back:
+//! since the controller is thread-affine, the GUI thread posts an [`Cmd::Eval`] carrying the
+//! script + a reply channel; the browser thread calls `ExecuteScript` with a completion handler
+//! that sends the result string back, and `eval_js` blocks on the reply with a ~10 s timeout.
+//!
+//! It is deliberately **not** exposed over the automation pipe. Eval needs a synchronous reply and
+//! the WebView2 lives in the GUI process, not the daemon that serves the pipe — a `browser-eval`
+//! call would require a daemon↔GUI RPC bridge, which is out of scope. `eval_js` stays a crate API
+//! with real plumbing plus an `#[ignore]`d manual test; pipe-exposed eval waits for that bridge.
 
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use webview2_com::Microsoft::Web::WebView2::Win32::{
     ICoreWebView2Controller, CreateCoreWebView2Environment,
 };
 use webview2_com::{
     CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
+    ExecuteScriptCompletedHandler,
 };
-use windows::core::{w, Error as WinError, PCWSTR};
+use windows::core::{w, Error as WinError, Result as WinResult, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM, E_POINTER};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -39,8 +48,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// A command sent from the GUI thread to a browser pane's own thread.
 enum Cmd {
     Navigate(String),
+    /// Run `script` in the WebView2 and send the JSON result (or an error) back over `reply`.
+    Eval { script: String, reply: Sender<Result<String, String>> },
     Close,
 }
+
+/// How long [`BrowserPane::eval_js`] waits for the async `ExecuteScript` result before giving up.
+const EVAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A handle to a browser pane hosted on its own thread. Dropping it (or calling [`close`]) tears
 /// down the window and the WebView2. `open`/`navigate`/`close` are the M12 stage-1 API.
@@ -90,10 +104,22 @@ impl BrowserPane {
         self.post(Cmd::Close);
     }
 
-    /// M12 stage 2. `ExecuteScript` is async and its result must be routed back over a channel;
-    /// stage 1 ships the window + navigation only.
-    pub fn eval_js(&self, _script: &str) -> Result<String, String> {
-        Err("eval_js is not implemented in M12 stage 1 (WebView2 window + navigation only)".into())
+    /// Run `script` in the pane's WebView2 and return its JSON-encoded result (WebView2's
+    /// `ExecuteScript` returns `"null"` for a script with no value, `"\"text\""` for a string, etc).
+    ///
+    /// Blocks until the async `ExecuteScript` completion handler fires on the browser thread, up to
+    /// [`EVAL_TIMEOUT`]. Errors if the WebView2 has not finished initializing yet (its creation is
+    /// asynchronous — call after the page has had a moment to load), or if the browser thread is gone.
+    pub fn eval_js(&self, script: &str) -> Result<String, String> {
+        let (reply, rx) = mpsc::channel();
+        self.post(Cmd::Eval { script: script.to_string(), reply });
+        match rx.recv_timeout(EVAL_TIMEOUT) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err("eval_js timed out".into()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("browser thread gone before eval_js replied".into())
+            }
+        }
     }
 
     /// Queue a command and kick the browser thread's message pump so it is handled promptly. The
@@ -257,6 +283,40 @@ unsafe fn create_webview(hwnd: HWND) -> Result<ICoreWebView2Controller, String> 
     Ok(controller)
 }
 
+/// Run `script` in the controller's WebView2, sending the JSON result (or an error) over `reply`.
+/// Called on the browser thread; the completion handler fires later on this thread's message pump.
+unsafe fn eval_on_thread(
+    controller: &Option<ICoreWebView2Controller>,
+    script: &str,
+    reply: Sender<Result<String, String>>,
+) {
+    let wv = match controller.as_ref().and_then(|c| c.CoreWebView2().ok()) {
+        Some(wv) => wv,
+        None => {
+            let _ = reply.send(Err("browser not ready (WebView2 still initializing)".into()));
+            return;
+        }
+    };
+    // The handler owns one clone; the dispatch-failure arm keeps its own so a failed ExecuteScript
+    // still reports a clear error rather than surfacing as a channel disconnect. Only one send
+    // reaches the single-value receiver; the loser is a harmless no-op.
+    let dispatch_reply = reply.clone();
+    // The macro hands the closure a converted `(Result<()>, String)`: `code` is the completion
+    // HRESULT and `result` the JSON-encoded value (empty on an error HRESULT).
+    let handler = ExecuteScriptCompletedHandler::create(Box::new(move |code: WinResult<()>, result: String| {
+        let msg = match code {
+            Ok(()) => Ok(result),
+            Err(e) => Err(format!("ExecuteScript failed: {e}")),
+        };
+        let _ = reply.send(msg);
+        Ok(())
+    }));
+    let target = pcwstr(script);
+    if let Err(e) = wv.ExecuteScript(target.as_pcwstr(), &handler) {
+        let _ = dispatch_reply.send(Err(format!("ExecuteScript dispatch failed: {e}")));
+    }
+}
+
 /// Fit the WebView2 controller to the window's client rect.
 unsafe fn resize_to_client(controller: &ICoreWebView2Controller, hwnd: HWND) {
     let mut rect = RECT::default();
@@ -300,6 +360,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                             }
                         }
                         Cmd::Navigate(_) => {} // the keep-alive hint from post(); ignore
+                        Cmd::Eval { script, reply } => eval_on_thread(&state.controller, &script, reply),
                         Cmd::Close => {
                             let _ = DestroyWindow(hwnd);
                         }
@@ -357,5 +418,18 @@ mod tests {
         // Round-trips (minus the terminator) back to the source string.
         let back = String::from_utf16(&w.0[..w.0.len() - 1]).unwrap();
         assert_eq!(back, "hi");
+    }
+
+    /// Manual (ignored): needs a live WebView2 runtime + an interactive desktop, so it can't run
+    /// under headless `cargo test`. Run with `cargo test -p gmux-browser -- --ignored` on a desktop.
+    /// Opens example.com, gives the page a moment to load, evals `1+1`, and expects the JSON `"2"`.
+    #[test]
+    #[ignore = "requires a live WebView2 runtime + interactive desktop"]
+    fn eval_js_returns_json_result() {
+        let pane = BrowserPane::open("https://example.com").expect("open browser pane");
+        // WebView2 creation + first navigation are async; wait before evaluating.
+        std::thread::sleep(Duration::from_secs(3));
+        let out = pane.eval_js("1 + 1").expect("eval_js should return a result");
+        assert_eq!(out, "2", "ExecuteScript returns the JSON-encoded value");
     }
 }

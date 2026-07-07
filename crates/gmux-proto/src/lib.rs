@@ -62,6 +62,12 @@ pub enum Call {
     SwitchWindow { next: bool },
     /// Drain notifications raised since the last poll (for the GUI to toast).
     PollNotifications,
+    /// Register this connection as a push subscriber: the daemon replies `ok(Done)`, then streams
+    /// every subsequent event batch as an unsolicited `Response{id:0}` carrying
+    /// [`ResultBody::Notifications`] — one line per tick that produced events. Pane exits arrive in
+    /// the same stream as a [`NotifyWire`] with `title == "pane-exited"` and the pane id in `pane`.
+    /// The connection stays usable for further requests. Replaces the poll-in-a-loop pattern.
+    Subscribe,
     /// Set the color palette the daemon's terminals resolve grid cells against (fg/bg + the 16
     /// system colors). The GUI sends this once after connecting and on config hot-reload; the
     /// daemon applies it to every existing and future pane. `ansi` shorter than 16 leaves the
@@ -403,6 +409,26 @@ mod tests {
         write_msg(&mut buf, &resp).unwrap();
         let back: Response = read_msg(&mut Cursor::new(buf)).unwrap().unwrap();
         assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn subscribe_roundtrips_and_is_kebab_case() {
+        let req = Request { id: 1, call: Call::Subscribe };
+        let mut buf = Vec::new();
+        write_msg(&mut buf, &req).unwrap();
+        let s = String::from_utf8(buf.clone()).unwrap();
+        assert!(s.contains("\"method\":\"subscribe\""), "{s}");
+        let back: Request = read_msg(&mut Cursor::new(buf)).unwrap().unwrap();
+        assert_eq!(back, req);
+
+        // A pushed event batch is an id:0 Response carrying Notifications.
+        let push = Response::ok(0, ResultBody::Notifications(vec![NotifyWire {
+            pane: 7, title: "pane-exited".into(), body: String::new(), urgency: 1,
+        }]));
+        let mut buf = Vec::new();
+        write_msg(&mut buf, &push).unwrap();
+        let back: Response = read_msg(&mut Cursor::new(buf)).unwrap().unwrap();
+        assert_eq!(back, push);
     }
 
     #[test]

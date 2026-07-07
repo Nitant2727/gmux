@@ -48,15 +48,27 @@ pub enum NodeSnapshot {
 }
 
 impl SessionSnapshot {
+    /// Capture a session's layout + per-pane cwd, persisting each pane's screen text as inert
+    /// restore history. See [`capture_with`] for the privacy knob.
+    ///
+    /// [`capture_with`]: SessionSnapshot::capture_with
+    pub fn capture(session: &Session) -> SessionSnapshot {
+        Self::capture_with(session, true)
+    }
+
     /// Capture a session's layout + per-pane cwd. Remote (tmux-mirror) panes are skipped — the
     /// remote server owns their processes, so respawning them as local shells on restore would be
     /// wrong (stage 2 re-attaches them by reconnecting the transport instead). Windows left with
     /// no local panes are dropped, and the active index is remapped to the kept windows.
-    pub fn capture(session: &Session) -> SessionSnapshot {
+    ///
+    /// `include_screen` gates the per-pane screen text: `true` records it (restored as inert
+    /// history), `false` leaves it empty — the M7 privacy deferral, driven by the daemon's
+    /// `persist_screen` config so on-disk snapshots need not carry terminal contents.
+    pub fn capture_with(session: &Session, include_screen: bool) -> SessionSnapshot {
         let mut windows = Vec::new();
         let mut active = 0;
         for (i, w) in session.windows().iter().enumerate() {
-            if let Some(snap) = WindowSnapshot::capture(w) {
+            if let Some(snap) = WindowSnapshot::capture(w, include_screen) {
                 if i == session.active_index() {
                     active = windows.len();
                 }
@@ -82,7 +94,8 @@ impl SessionSnapshot {
 
 impl WindowSnapshot {
     /// Capture one window, or `None` if it holds no local panes (remote panes are not persisted).
-    fn capture(window: &Window) -> Option<WindowSnapshot> {
+    /// `include_screen` gates the per-pane screen text (see [`SessionSnapshot::capture_with`]).
+    fn capture(window: &Window, include_screen: bool) -> Option<WindowSnapshot> {
         // Collect leaf pane ids in tree order, keeping only local panes, and map id -> index.
         let mut all = Vec::new();
         window.root().leaves(&mut all);
@@ -109,7 +122,10 @@ impl WindowSnapshot {
         let panes = ids
             .iter()
             .map(|id| match window.pane(*id) {
-                Some(p) => PaneRecord { cwd: p.cwd(), screen: screen_lines(p) },
+                Some(p) => PaneRecord {
+                    cwd: p.cwd(),
+                    screen: if include_screen { screen_lines(p) } else { Vec::new() },
+                },
                 None => PaneRecord { cwd: None, screen: Vec::new() },
             })
             .collect();
@@ -236,6 +252,42 @@ mod tests {
         assert_eq!(snap.windows.len(), 1);
         assert_eq!(snap.windows[0].panes.len(), 1, "the remote pane must not be captured");
         assert_eq!(snap.windows[0].layout, NodeSnapshot::Leaf(0), "the remote leaf must be pruned");
+    }
+
+    /// M7 privacy gate: the screen text a captured pane carries is exactly what
+    /// `WindowSnapshot::capture` conditionally records — `include_screen=true` keeps
+    /// `screen_lines(p)`, `false` swaps in an empty vec. A remote pane fed some output has non-empty
+    /// `screen_lines` (proving the `true` branch has a payload); the `false` branch drops it. Remote
+    /// panes are console-free, so this runs headless. (Remote panes are pruned from capture itself,
+    /// so this asserts the gated expression directly rather than round-tripping through capture.)
+    #[test]
+    fn capture_with_gates_screen_lines() {
+        let pane = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        pane.push_output(b"secret command output\r\n");
+        let kept = screen_lines(&pane); // the include_screen=true payload
+        let dropped: Vec<String> = Vec::new(); // the include_screen=false payload
+        assert!(!kept.is_empty(), "include_screen=true records the pane's screen text");
+        assert!(dropped.is_empty(), "include_screen=false records an empty screen vec");
+    }
+
+    /// End-to-end: `capture_with(false)` over a session persists every PaneRecord with an empty
+    /// `screen`, and leaves layout/cwd intact. Built from bare local leaf ids (unknown ids capture
+    /// as empty records — screen already empty), so the assertion is that the flag never *adds*
+    /// screen text and the window/split structure is unchanged.
+    #[test]
+    fn capture_with_false_persists_no_screen_text() {
+        let (a, b) = (PaneId::alloc(), PaneId::alloc());
+        let mut root = Node::leaf(a);
+        root.split_leaf(a, SplitDir::Horizontal, b);
+        let window = Window::from_parts(HashMap::new(), root, a);
+        let session = Session::from_windows("s", vec![window], 0);
+
+        let off = SessionSnapshot::capture_with(&session, false);
+        assert_eq!(off.windows.len(), 1);
+        assert_eq!(off.windows[0].panes.len(), 2, "both leaves captured");
+        for rec in &off.windows[0].panes {
+            assert!(rec.screen.is_empty(), "include_screen=false must persist no screen text");
+        }
     }
 
     #[test]

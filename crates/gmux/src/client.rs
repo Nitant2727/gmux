@@ -121,10 +121,56 @@ fn parse_ssh_tmux(args: &[String]) -> Option<(String, Option<String>)> {
     }
 }
 
+/// `gmux subscribe` — register as a push subscriber and print one JSON line per event batch the
+/// daemon streams, until the connection closes or Ctrl+C. Reuses the raw `Response` JSON as the
+/// output line (each is `{"id":0,"result":{"notifications":[...]}}`), so scripts can parse it with
+/// the same reader they use for any other reply.
+fn subscribe() -> i32 {
+    let name = gmux_pipe::pipe_name_for_user("gmux");
+    let stream = match gmux_pipe::client_connect(&name) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("gmux: cannot reach gmux at \\\\.\\pipe\\{name} — is gmux running? ({e})");
+            return 1;
+        }
+    };
+    let mut writer = match stream.try_clone() {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("gmux: {e}");
+            return 1;
+        }
+    };
+    let mut reader = BufReader::new(stream);
+    if let Err(e) = write_msg(&mut writer, &Request { id: 1, call: Call::Subscribe }) {
+        eprintln!("gmux: {e}");
+        return 1;
+    }
+    // First reply is the ok(Done) ack; every subsequent line is a pushed batch. Print each raw
+    // Response line as it arrives (the ack included — it's a valid, harmless line for scripts).
+    loop {
+        match read_msg::<Response>(&mut reader) {
+            Ok(Some(resp)) => match serde_json::to_string(&resp) {
+                Ok(line) => println!("{line}"),
+                Err(e) => {
+                    eprintln!("gmux: {e}");
+                    return 1;
+                }
+            },
+            Ok(None) => return 0, // daemon closed the connection
+            Err(e) => {
+                eprintln!("gmux: {e}");
+                return 1;
+            }
+        }
+    }
+}
+
 /// Entry: dispatch `gmux <subcommand> ...` API calls. Returns an exit code.
 pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
     match cmd {
         "list-panes" => Some(run(Call::ListPanes)),
+        "subscribe" => Some(subscribe()),
         "hello" => Some(run(Call::Hello { client_version: env!("CARGO_PKG_VERSION").into() })),
         "send-keys" => {
             let (mut pane, mut enter, mut text_parts) = (None, false, Vec::new());

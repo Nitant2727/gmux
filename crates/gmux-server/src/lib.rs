@@ -46,6 +46,9 @@ pub struct Server {
     /// Color palette applied to every pane's terminal — set by the GUI via `SetPalette`, applied
     /// to newly spawned panes so late arrivals match the theme. Defaults to gmux's built-in colors.
     palette: Palette,
+    /// M7 privacy: whether session snapshots persist each pane's screen text. Read once from
+    /// `gmux.json` at daemon start (default true); `false` writes snapshots with empty screens.
+    persist_screen: bool,
 }
 
 impl Server {
@@ -62,6 +65,7 @@ impl Server {
             remotes: Vec::new(),
             progress: HashMap::new(),
             palette: Palette::default(),
+            persist_screen: load_persist_screen(),
         })
     }
 
@@ -86,6 +90,7 @@ impl Server {
                         remotes: Vec::new(),
                         progress: HashMap::new(),
                         palette: Palette::default(),
+                        persist_screen: load_persist_screen(),
                     });
                 }
             }
@@ -95,7 +100,7 @@ impl Server {
 
     /// Persist the current layout + per-pane cwd to disk (atomic).
     pub fn save(&self) {
-        let snap = SessionSnapshot::capture(&self.session);
+        let snap = SessionSnapshot::capture_with(&self.session, self.persist_screen);
         let Ok(json) = serde_json::to_string_pretty(&snap) else { return };
         let path = state_path();
         if let Some(parent) = path.parent() {
@@ -107,9 +112,11 @@ impl Server {
         }
     }
 
-    /// Drain every pane's events: queue notifications for `PollNotifications` and remove panes
-    /// whose process exited. Called periodically by the daemon loop.
-    pub fn tick(&mut self) {
+    /// Drain every pane's events: queue notifications for `PollNotifications`, remove panes whose
+    /// process exited, and return this tick's event batch for the push subscribers (notifications
+    /// plus one `title == "pane-exited"` [`NotifyWire`] per removed pane). Called periodically by
+    /// the daemon loop; empty when nothing happened.
+    pub fn tick(&mut self) -> Vec<NotifyWire> {
         // Pump remote attachments first so their output/exits are visible to the pane-event
         // drain below within the same tick. Finished attachments are dropped — their panes were
         // marked exited, so the normal Exited sweep removes them.
@@ -139,6 +146,11 @@ impl Server {
                 }
             }
         }
+        // The push batch is the notifications plus a synthetic wire per exit; subscribers see both.
+        let mut batch = notes.clone();
+        for id in &exited {
+            batch.push(exit_notify(id.0));
+        }
         self.notifications.extend(notes);
         for (id, state, pct) in progress {
             match state {
@@ -163,6 +175,7 @@ impl Server {
         if self.ticks % 20 == 0 {
             self.save();
         }
+        batch
     }
 
     fn spawn_pane(&self, command: &Option<String>) -> io::Result<Pane> {
@@ -334,6 +347,9 @@ impl Server {
             Call::PollNotifications => {
                 Response::ok(id, ResultBody::Notifications(std::mem::take(&mut self.notifications)))
             }
+            // Registration happens in serve_connection (it owns the writer clone to add to the
+            // subscriber list); handle() only acks so the client knows the stream is armed.
+            Call::Subscribe => Response::ok(id, ResultBody::Done),
             Call::SetPalette { fg, bg, ansi } => {
                 let mut palette = Palette::default();
                 palette.fg = Rgb { r: fg[0], g: fg[1], b: fg[2] };
@@ -541,6 +557,57 @@ fn capture(p: &Pane, scrollback: Option<usize>) -> String {
     lines.join("\n")
 }
 
+/// The wire form of a pane exit for push subscribers: a `NotifyWire` with the reserved
+/// `"pane-exited"` title and the pane id in `pane` (see `Call::Subscribe` docs).
+fn exit_notify(pane: u64) -> NotifyWire {
+    NotifyWire { pane, title: "pane-exited".into(), body: String::new(), urgency: 1 }
+}
+
+/// Push one event `batch` to every subscriber as a `Response{id:0}` line, dropping (via
+/// `retain`) any subscriber whose write fails — a disconnected client is simply removed. A empty
+/// batch is a no-op. Split out so it can be unit-tested with an in-process pipe pair (no console).
+///
+/// Deliberately writes WITHOUT flushing: `PipeStream::flush` is `FlushFileBuffers`, which blocks
+/// until the peer has **read** the data — a subscriber that isn't mid-`read` at push time would
+/// deadlock the pusher. A plain `WriteFile` completes once the bytes are in the 64 KiB pipe
+/// buffer; the reader gets them without any flush.
+// ponytail: a subscriber that stops reading entirely can still fill its 64 KiB buffer and block
+// the push thread (stalling delivery to other subscribers, never the daemon loop) — per-subscriber
+// writer threads if that ever matters.
+fn push_to_subscribers(subscribers: &mut Vec<PipeStream>, batch: &[NotifyWire]) {
+    use std::io::Write;
+    if batch.is_empty() {
+        return;
+    }
+    let push = Response::ok(0, ResultBody::Notifications(batch.to_vec()));
+    let Ok(mut line) = serde_json::to_string(&push) else { return };
+    line.push('\n');
+    subscribers.retain_mut(|w| w.write_all(line.as_bytes()).is_ok());
+}
+
+/// Read the `persist_screen` flag from the same `%APPDATA%\gmux\gmux.json` the GUI reads (M7
+/// privacy). The daemon does the persisting, so it reads this itself rather than importing
+/// gmux-gui (which would drag winit/wgpu into the daemon). A missing/unreadable/malformed file or
+/// absent key defaults to `true` (persist screen text). BOM-stripped like the GUI's loader, since
+/// PowerShell/Notepad write a UTF-8 BOM that would otherwise make serde_json reject the whole file.
+/// Parses via `Value` — no serde-derive dep for one bool. Exposed for the config-parse unit test.
+fn load_persist_screen() -> bool {
+    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
+    let path = PathBuf::from(base).join("gmux").join("gmux.json");
+    let Ok(text) = std::fs::read_to_string(&path) else { return true };
+    persist_screen_from_json(&text)
+}
+
+/// The pure parse half of [`load_persist_screen`]: BOM-strip, read the top-level `persist_screen`
+/// bool, default `true` when the file is malformed or the key is absent/non-bool.
+fn persist_screen_from_json(text: &str) -> bool {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| v.get("persist_screen").and_then(serde_json::Value::as_bool))
+        .unwrap_or(true)
+}
+
 /// Where the session snapshot lives: `%LOCALAPPDATA%\gmux\state\session.json`.
 fn state_path() -> PathBuf {
     let base = std::env::var("LOCALAPPDATA").unwrap_or_else(|_| ".".to_string());
@@ -571,23 +638,45 @@ fn restore_replay(screen: &[String]) -> Option<String> {
 /// Run the daemon: restore or create the mux, serve the pipe, and block until all panes exit.
 pub fn run(shell: String, pipe_base: &str) -> io::Result<()> {
     let server = Arc::new(Mutex::new(Server::restore_or_new(shell)?));
+    // Push subscribers, kept in their own mutex (not the Server one): tick() runs under the Server
+    // lock, but the push writes go through these separate writer handles *after* the Server lock is
+    // released, so a slow/blocked subscriber can never stall a request thread holding the Server.
+    let subscribers: Arc<Mutex<Vec<PipeStream>>> = Arc::new(Mutex::new(Vec::new()));
     let name = gmux_pipe::pipe_name_for_user(pipe_base);
     let handler_server = server.clone();
+    let handler_subs = subscribers.clone();
     let _pipe = PipeServer::start(&name, move |stream| {
-        serve_connection(stream, &handler_server);
+        serve_connection(stream, &handler_server, &handler_subs);
     })?;
     eprintln!("gmux daemon: serving \\\\.\\pipe\\{name}");
+
+    // Pushes run on their own thread, fed over a channel: even the no-flush pipe write can block
+    // when a subscriber stops reading and its 64 KiB buffer fills, and that must stall only this
+    // thread — never the tick loop that keeps every pane serviced.
+    let (push_tx, push_rx) = std::sync::mpsc::channel::<Vec<NotifyWire>>();
+    let push_subs = subscribers.clone();
+    std::thread::spawn(move || {
+        while let Ok(batch) = push_rx.recv() {
+            if let Ok(mut subs) = push_subs.lock() {
+                push_to_subscribers(&mut subs, &batch);
+            }
+        }
+    });
 
     // Drain pane events (notifications + exits) and stop once every pane has exited.
     loop {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        let done = match server.lock() {
+        let (batch, done) = match server.lock() {
             Ok(mut s) => {
-                s.tick();
-                s.all_exited()
+                let batch = s.tick();
+                (batch, s.all_exited())
             }
-            Err(_) => true,
+            Err(_) => (Vec::new(), true),
         };
+        // Hand the batch to the push thread (never blocks the tick loop).
+        if !batch.is_empty() {
+            let _ = push_tx.send(batch);
+        }
         if done {
             eprintln!("gmux daemon: all panes exited, shutting down");
             // Clean exit: clear the snapshot so the next start is fresh (a reboot, by contrast,
@@ -598,7 +687,11 @@ pub fn run(shell: String, pipe_base: &str) -> io::Result<()> {
     }
 }
 
-fn serve_connection(stream: PipeStream, server: &Arc<Mutex<Server>>) {
+fn serve_connection(
+    stream: PipeStream,
+    server: &Arc<Mutex<Server>>,
+    subscribers: &Arc<Mutex<Vec<PipeStream>>>,
+) {
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
         Err(_) => return,
@@ -613,12 +706,25 @@ fn serve_connection(stream: PipeStream, server: &Arc<Mutex<Server>>) {
                 return;
             }
         };
+        let is_subscribe = matches!(req.call, Call::Subscribe);
         let resp = match server.lock() {
             Ok(mut s) => s.handle(&req),
             Err(_) => Response::err(req.id, "server lock poisoned"),
         };
         if write_msg(&mut writer, &resp).is_err() {
             return;
+        }
+        // On a successful Subscribe, register a second writer handle so the daemon loop can push
+        // event batches on this connection. The read loop continues (further requests still serve).
+        if is_subscribe && resp.error.is_none() {
+            match writer.try_clone() {
+                Ok(w) => {
+                    if let Ok(mut subs) = subscribers.lock() {
+                        subs.push(w);
+                    }
+                }
+                Err(_) => return,
+            }
         }
     }
 }
@@ -669,6 +775,7 @@ mod tests {
             remotes: Vec::new(),
             progress: HashMap::new(),
             palette: Palette::default(),
+            persist_screen: true,
         };
 
         let b1 = server.handle(&Request { id: 1, call: Call::Browse { url: "https://a.test".into() } });
@@ -701,6 +808,7 @@ mod tests {
             remotes: Vec::new(),
             progress: HashMap::new(),
             palette: Palette::default(),
+            persist_screen: true,
         };
 
         // Custom red in ANSI slot 1; other slots left at their defaults on the wire (short vec).
@@ -793,5 +901,104 @@ mod tests {
         progress.retain(|id, _| session.pane(*id).is_some()); // the tick() sweep
         assert!(!progress.contains_key(&gone), "vanished pane's entry must be swept");
         assert!(progress.contains_key(&live_id), "live pane's entry must survive");
+    }
+
+    /// M7 privacy config parse: `persist_screen` reads as-written, defaults true when absent /
+    /// malformed, and survives a UTF-8 BOM (PowerShell/Notepad write one).
+    #[test]
+    fn persist_screen_config_parse() {
+        assert!(persist_screen_from_json(r#"{"persist_screen": true}"#));
+        assert!(!persist_screen_from_json(r#"{"persist_screen": false}"#));
+        assert!(persist_screen_from_json(r#"{"font_px": 14}"#), "absent key defaults true");
+        assert!(persist_screen_from_json("not json at all"), "malformed defaults true");
+        assert!(!persist_screen_from_json("\u{feff}{\"persist_screen\": false}"), "BOM is stripped");
+        // A non-bool value is ignored (defaults true), not coerced.
+        assert!(persist_screen_from_json(r#"{"persist_screen": "no"}"#));
+    }
+
+    /// A pane exit is encoded on the subscribe stream as a `NotifyWire` with the reserved
+    /// `"pane-exited"` title and the pane id — the convention `Call::Subscribe` documents.
+    #[test]
+    fn exit_notify_uses_reserved_title() {
+        let n = super::exit_notify(42);
+        assert_eq!(n.title, "pane-exited");
+        assert_eq!(n.pane, 42);
+    }
+
+    /// A connected subscriber receives a pushed batch as a `Response{id:0}` with the notifications;
+    /// `push_to_subscribers` writes one line per batch. Uses an in-process gmux_pipe pair — no
+    /// console/ConPTY, so it runs under the default headless `cargo test`.
+    #[test]
+    fn subscriber_receives_pushed_batch() {
+        use gmux_pipe::{client_connect, PipeServer};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::mpsc;
+
+        static N: AtomicU32 = AtomicU32::new(0);
+        let name = format!("gmux-subtest-recv-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
+
+        // The server handler hands its connected stream back so the test can push to it directly.
+        let (tx, rx) = mpsc::channel();
+        let _server = PipeServer::start(&name, move |stream| {
+            let _ = tx.send(stream);
+        })
+        .unwrap();
+
+        let client = client_connect(&name).unwrap();
+        let mut server_side = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+
+        let batch = vec![
+            NotifyWire { pane: 3, title: "hi".into(), body: "there".into(), urgency: 2 },
+            exit_notify(7),
+        ];
+        let mut subs = vec![server_side.try_clone().unwrap()];
+        push_to_subscribers(&mut subs, &batch);
+        assert_eq!(subs.len(), 1, "a live subscriber is retained");
+
+        let mut reader = BufReader::new(client);
+        let resp: Response = read_msg(&mut reader).unwrap().unwrap();
+        assert_eq!(resp.id, 0, "pushes are unsolicited id:0 envelopes");
+        assert_eq!(resp.result, Some(ResultBody::Notifications(batch)));
+        // Keep server_side alive until after the read (dropping it would EOF the client).
+        let _ = &mut server_side;
+    }
+
+    /// An empty batch is a no-op (no line written), and a subscriber whose peer has hung up is
+    /// dropped from the list on the next push (its write fails).
+    #[test]
+    fn dead_subscriber_is_dropped_and_empty_batch_is_noop() {
+        use gmux_pipe::{client_connect, PipeServer};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::mpsc;
+
+        static N: AtomicU32 = AtomicU32::new(0);
+        let name = format!("gmux-subtest-dead-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
+
+        let (tx, rx) = mpsc::channel();
+        let _server = PipeServer::start(&name, move |stream| {
+            let _ = tx.send(stream);
+        })
+        .unwrap();
+
+        let client = client_connect(&name).unwrap();
+        let server_side = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let mut subs = vec![server_side];
+
+        // Empty batch: nothing written, subscriber untouched.
+        push_to_subscribers(&mut subs, &[]);
+        assert_eq!(subs.len(), 1, "empty batch must not touch the subscriber list");
+
+        // Peer hangs up: the next non-empty push fails to write and drops the subscriber.
+        drop(client);
+        // Writes to a broken pipe may buffer once before erroring; push until the list drains or a
+        // small bound is hit (a broken pipe surfaces within a couple of writes).
+        let batch = vec![exit_notify(1)];
+        for _ in 0..8 {
+            if subs.is_empty() {
+                break;
+            }
+            push_to_subscribers(&mut subs, &batch);
+        }
+        assert!(subs.is_empty(), "a subscriber whose peer hung up must be dropped");
     }
 }
