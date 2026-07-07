@@ -233,7 +233,15 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
 - **Recipes:** [docs/agents.md](docs/agents.md) — hooks setup, pane-per-agent splits, send-keys/
   capture-pane orchestration, subagent-spawn hook recipe, ssh-tmux remote agents. All syntax
   verified against the real CLI.
-- Deferred: `subscribe` push API (poll via list-panes/capture-pane covers scripting today).
+- **`subscribe` push API ✅ (2026-07-07, 5e1438b):** `Call::Subscribe` turns a pipe connection
+  into an event stream — the daemon pushes `Response{id:0}` batches (notifications + reserved
+  `pane-exited` wires) from a dedicated push thread. Push writes deliberately skip
+  `FlushFileBuffers` (it blocks until the peer reads — a not-currently-reading subscriber would
+  have frozen the daemon; caught by a hanging test and fixed with a live repro). `gmux subscribe`
+  CLI streams the lines; docs/agents.md orchestration recipe updated. Same commit: `eval_js` real
+  ExecuteScript plumbing in gmux-browser (crate API; pipe exposure needs a daemon↔GUI bridge,
+  documented), and `persist_screen: false` in gmux.json writes snapshots without screen text
+  (M7 privacy deferral closed).
 
 ### M12 — Browser pane (flag-gated) ✅ STAGE 1 (2026-07-07, 951bdb1)
 
