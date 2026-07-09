@@ -1,0 +1,42 @@
+# gmux CI — Windows x64 test + ARM64 cross-build (M8).
+#
+# ConPTY integration tests are #[ignore]'d because they need a real console (see
+# scripts/console-tests.ps1); plain `cargo test` on the runner skips them, so this matrix
+# covers everything that can run headless. The console suites run on developer machines.
+name: ci
+
+on:
+  push:
+    branches: ["main", "m0-spikes"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test-x64:
+    name: test (windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build workspace
+        run: cargo build --workspace --locked
+      - name: Test workspace
+        run: cargo test --workspace --locked
+
+  build-arm64:
+    name: build (windows arm64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: arm64
+      - name: Cross-build workspace
+        run: cargo build --workspace --locked --target aarch64-pc-windows-msvc

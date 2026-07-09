@@ -1,0 +1,17 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.bak
+
+# Vendored redistributables (fetched, not committed — see spikes/fetch-conpty.ps1)
+**/vendor/
+
+# Local toolchains (spike-installed Zig, etc.)
+/.tools/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

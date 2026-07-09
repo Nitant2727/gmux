@@ -1,0 +1,10 @@
+[package]
+name = "gmux-vt"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+alacritty_terminal = "0.25"
+vte = { version = "0.15", features = ["ansi"] }
