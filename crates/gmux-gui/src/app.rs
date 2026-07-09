@@ -507,6 +507,9 @@ impl State {
             .map(|(s, a, active, rect)| PaneView { snap: s, attention: *a, active: *active, rect: *rect })
             .collect();
         self.renderer.render_frame(&view, &rows, sidebar_w, &views, w, h);
+        // Present explicitly: dropping a SurfaceTexture does NOT present it — unpresented frames
+        // exhaust the swapchain and every later acquire times out (window stays white/stale).
+        self.renderer.queue.present(frame);
     }
 }
 
