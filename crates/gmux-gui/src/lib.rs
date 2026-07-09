@@ -130,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_ring_draws_blue_border() {
+    fn attention_ring_draws_attention_border() {
         let bg = Rgb { r: 0x11, g: 0x11, b: 0x11 };
         let fg = Rgb { r: 0xcc, g: 0xcc, b: 0xcc };
         let snap = PaneSnapshot {
@@ -146,7 +146,8 @@ mod tests {
         drop(r);
         let (w, _h, px) = render_offscreen(&snap, Attention::Pending, cw, ch).expect("render");
         let corner = pixel(&px, w, 1, 1);
-        assert!(corner[2] > 150 && corner[1] > 80 && corner[0] < 120, "expected blue ring, got {corner:?}");
+        // Attention ring is now the pink ATTENTION token (#f38ba8), not blue.
+        assert!(corner[0] > 150 && corner[1] > 80 && corner[2] > 100, "expected pink ring, got {corner:?}");
     }
 
     #[test]

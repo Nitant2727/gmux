@@ -241,6 +241,28 @@ impl Session {
         Some(win)
     }
 
+    /// Activate the window at `index` (a sidebar click). No-op (returns `false`) if out of range.
+    pub fn select_window(&mut self, index: usize) -> bool {
+        if index < self.windows.len() {
+            self.active = index;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Focus a specific pane by id, activating its window and making it that window's active pane.
+    /// No-op (returns `false`) if no window holds the pane.
+    pub fn focus_pane(&mut self, id: PaneId) -> bool {
+        if let Some(wi) = self.windows.iter().position(|w| w.pane(id).is_some()) {
+            self.active = wi;
+            self.windows[wi].set_active(id);
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn next_window(&mut self) {
         if !self.windows.is_empty() {
             self.active = (self.active + 1) % self.windows.len();
@@ -432,6 +454,33 @@ mod tests {
         assert_eq!(s.window_count(), 0);
         assert!(s.active_window().is_none());
         assert!(s.remove_window(kept).is_none(), "ids are never reused; a second remove misses");
+    }
+
+    #[test]
+    fn select_window_and_focus_pane_target_by_index_and_id() {
+        let mut s = Session::from_windows("t", vec![remote_window(), remote_window()], 0);
+        let w1_pane = s.windows()[1].active_id();
+
+        // Out-of-range select is a no-op; in-range moves the active index.
+        assert!(!s.select_window(5));
+        assert_eq!(s.active_index(), 0);
+        assert!(s.select_window(1));
+        assert_eq!(s.active_index(), 1);
+
+        // focus_pane jumps to whichever window holds the pane and activates it there.
+        let w0_pane = s.windows()[0].active_id();
+        assert!(s.focus_pane(w0_pane));
+        assert_eq!(s.active_index(), 0);
+        assert_eq!(s.active_window().unwrap().active_id(), w0_pane);
+
+        // A pane in another window pulls focus back to that window.
+        assert!(s.focus_pane(w1_pane));
+        assert_eq!(s.active_index(), 1);
+
+        // An unknown pane id is a no-op.
+        let orphan = Pane::remote(99, 80, 24, Box::new(|_| {}));
+        assert!(!s.focus_pane(orphan.id));
+        assert_eq!(s.active_index(), 1);
     }
 
     #[test]

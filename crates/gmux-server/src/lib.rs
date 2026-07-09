@@ -281,14 +281,16 @@ impl Server {
                 Some(p) => Response::ok(id, ResultBody::Grid(grid_wire(p, *offset))),
                 None => Response::err(id, format!("no pane %{pane}")),
             },
-            Call::ResizeView { w, h, cell_w, cell_h } => {
+            Call::ResizeView { w, h, cell_w, cell_h, pane_chrome } => {
                 self.last_view = (*w, *h);
                 let (cw, ch) = ((*cell_w).max(1), (*cell_h).max(1));
                 if let Some(win) = self.session.active_window() {
                     for (pid, rect) in win.layout_rects(*w, *h) {
                         if let Some(p) = win.pane(pid) {
-                            let cols = (rect.w / cw).max(1) as u16;
-                            let rows = (rect.h / ch).max(1) as u16;
+                            // Grids fit the VISIBLE cell area: the GUI draws margins/borders/
+                            // insets inside each rect, so those pixels can't hold cells.
+                            let cols = (rect.w.saturating_sub(*pane_chrome) / cw).max(1) as u16;
+                            let rows = (rect.h.saturating_sub(*pane_chrome) / ch).max(1) as u16;
                             let _ = p.resize(PtySize { cols, rows });
                         }
                     }
@@ -342,6 +344,14 @@ impl Server {
                 } else {
                     self.session.prev_window();
                 }
+                Response::ok(id, ResultBody::Done)
+            }
+            Call::SelectWindow { index } => {
+                self.session.select_window(*index);
+                Response::ok(id, ResultBody::Done)
+            }
+            Call::FocusPaneId { pane } => {
+                self.session.focus_pane(PaneId(*pane));
                 Response::ok(id, ResultBody::Done)
             }
             Call::PollNotifications => {
