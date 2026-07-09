@@ -365,16 +365,21 @@ fn job_for(child: &Child) -> isize {
 /// The `-CC` DCS introducer tmux prints before the first control-mode line.
 const DCS_INTRO: &[u8] = b"\x1bP1000p";
 
-/// Strips the `-CC` DCS introducer [`DCS_INTRO`] at stream start, recognized across chunk
-/// boundaries; a stream-start prefix that only *looks* like the introducer (then diverges) is
-/// replayed as data. Deliberately does NOT scan for ST (`ESC \`): reply bodies may contain
-/// raw `ESC \` legitimately (OSC 8 hyperlinks in `capture-pane -e` output), and the protocol's
-/// real goodbye is the `%exit` notification — the reader stops parsing there, so the trailing
-/// ST never reaches the parser as anything but ignored post-exit noise.
+/// Strips the first occurrence of the `-CC` DCS introducer [`DCS_INTRO`] **anywhere** in the
+/// stream, recognized across chunk boundaries. Anywhere, not just stream start: the pty layer
+/// (ssh -tt, or a `script` wrapper) echoes commands sent before tmux enters raw mode, and that
+/// echo lands *before* the introducer — a start-anchored match would let the intro leak into the
+/// greeting's `%begin` line, demoting it from a guard and shifting reply correlation by one
+/// (found against a real tmux 3.6 over WSL). Bytes before the intro pass through as ordinary
+/// lines (the parser surfaces them as harmless `Unknown`s). Deliberately does NOT scan for ST
+/// (`ESC \`): reply bodies may contain raw `ESC \` legitimately (OSC 8 hyperlinks in
+/// `capture-pane -e` output), and the protocol's real goodbye is the `%exit` notification — the
+/// reader stops parsing there, so the trailing ST never reaches the parser as anything but
+/// ignored post-exit noise.
 struct DcsFilter {
     /// Bytes of [`DCS_INTRO`] matched so far; only meaningful while `intro_active`.
     intro_matched: usize,
-    /// Still at stream start, matching the introducer.
+    /// Still scanning for the introducer (not yet found once).
     intro_active: bool,
 }
 
@@ -393,17 +398,21 @@ impl DcsFilter {
             if b == DCS_INTRO[self.intro_matched] {
                 self.intro_matched += 1;
                 if self.intro_matched == DCS_INTRO.len() {
-                    self.intro_active = false; // introducer fully stripped
+                    self.intro_active = false; // introducer found and stripped
                     out.extend_from_slice(&bytes[i + 1..]);
-                    break;
+                    return out;
                 }
                 continue;
             }
-            // Divergence: the matched prefix was real data — replay it, then pass the rest.
-            self.intro_active = false;
+            // Divergence: the matched prefix was real data — replay it and keep scanning.
+            // DCS_INTRO has no repeated prefix, so only state 0 can restart on this byte.
             out.extend_from_slice(&DCS_INTRO[..self.intro_matched]);
-            out.extend_from_slice(&bytes[i..]);
-            break;
+            self.intro_matched = 0;
+            if b == DCS_INTRO[0] {
+                self.intro_matched = 1;
+            } else {
+                out.push(b);
+            }
         }
         out
     }
@@ -472,6 +481,29 @@ mod tests {
         out.extend(f.feed(b"body \x1b")); // ESC split from its backslash…
         out.extend(f.feed(b"\\ more\n"));
         assert_eq!(out, b"body \x1b\\ more\n");
+    }
+
+    /// Live-tmux regression: a pty (ssh -tt / `script`) echoes commands sent before tmux enters
+    /// raw mode, so the DCS introducer arrives AFTER that echo. It must still be stripped —
+    /// start-anchored matching let it leak into the greeting's `%begin` line, demoting the guard
+    /// and shifting reply correlation by one.
+    #[test]
+    fn dcs_filter_strips_intro_after_echoed_command_lines() {
+        let mut f = DcsFilter::new();
+        let mut out = Vec::new();
+        out.extend(f.feed(b"display-message -p '#{version}'
+"));
+        out.extend(f.feed(b"list-panes -a
+P10"));
+        out.extend(f.feed(b"00p%begin 1 271 0
+"));
+        assert_eq!(
+            out,
+            b"display-message -p '#{version}'
+list-panes -a
+%begin 1 271 0
+".to_vec(),
+        );
     }
 
     #[test]
