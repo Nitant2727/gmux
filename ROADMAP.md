@@ -207,8 +207,18 @@ toast attribution refinements land with M3 splits. *Next:* M3 (splits).
   `workspace_info` panic → poisoned mutex); regression tests cover both event orderings. Local
   `SplitPane`/`ClosePane` on a remote mirror now round-trip (`split-window`/`kill-pane` to the
   remote; the mirror updates via `%layout-change`) instead of spawning/dropping local shells.
-- **M9 remaining before done:** live test against a REAL tmux over ssh (no peer on the dev
-  machine — needs a user-provided host or WSL), tmux ≥3.2 version gate/degraded mode.
+- **M9 LIVE-VERIFIED ✅ (2026-07-10, 140d6a1):** real tmux 3.6 in WSL Ubuntu, attached via
+  `gmux ssh-tmux wsl --command 'wsl.exe -d Ubuntu -u root -e script -qec "tmux -CC new -As gmux" /dev/null'`
+  (the `script` pty wrapper stands in for `ssh -tt` — the tmux client needs a tty even in control
+  mode). Verified end-to-end: version gate cleared (`(3,6)`, not degraded), windows/panes mirrored,
+  `send-keys` → real bash → output captured back, **remote OSC 777 raised the pane attention flag**,
+  daemon kill left the tmux session alive in WSL, re-attach re-mirrored. The live run exposed one
+  real transport bug, fixed with a regression test: the pty echoes attach-time commands *before*
+  the DCS introducer, so the intro must be stripped at first occurrence anywhere, not stream start
+  (start-anchored matching demoted the greeting and shifted reply correlation by one).
+- Known wrinkle (noted, minor): `list-panes -a` enumerates ALL remote sessions, so a host with
+  multiple tmux sessions mirrors them all; scoping to the attached session is a one-line format
+  filter when it matters.
 
 ### M10 — Keybindings & configuration polish
 
