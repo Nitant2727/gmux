@@ -61,6 +61,18 @@ pub enum Call {
     ClosePane,
     /// Toggle zoom on the active pane.
     ToggleZoom,
+    /// Drag-resize the split at a divider: grow `pane` (the top/left pane of the dragged divider)
+    /// by a fractional split-ratio delta. `dx` moves a vertical divider (adjusts the pane's
+    /// horizontal split), `dy` a horizontal divider; the idle axis is 0. Ignored if the pane is
+    /// gone. Sent throttled while dragging.
+    ResizeSplit {
+        #[serde(default)]
+        pane: u64,
+        #[serde(default)]
+        dx: f32,
+        #[serde(default)]
+        dy: f32,
+    },
     /// Switch tabs: `next` true = next window, false = previous.
     SwitchWindow { next: bool },
     /// Activate a window (tab) by its index in the sidebar (a sidebar click). Out-of-range
@@ -338,6 +350,7 @@ mod tests {
             Call::FocusPane { dir: "right".into() },
             Call::ClosePane,
             Call::ToggleZoom,
+            Call::ResizeSplit { pane: 4, dx: 0.5, dy: -0.25 },
             Call::SwitchWindow { next: true },
             Call::SelectWindow { index: 2 },
             Call::FocusPaneId { pane: 7 },
@@ -477,6 +490,15 @@ mod tests {
         assert_eq!(req.call, Call::SelectWindow { index: 0 });
         let req: Request = serde_json::from_str(r#"{"id":3,"method":"focus-pane-id","params":{}}"#).unwrap();
         assert_eq!(req.call, Call::FocusPaneId { pane: 0 });
+    }
+
+    #[test]
+    fn resize_split_is_kebab_case_and_fields_default() {
+        let s = serde_json::to_string(&Request { id: 1, call: Call::ResizeSplit { pane: 4, dx: 0.5, dy: 0.0 } }).unwrap();
+        assert!(s.contains("\"method\":\"resize-split\""), "{s}");
+        // Hand-written JSON may omit the (defaulted) deltas / pane.
+        let req: Request = serde_json::from_str(r#"{"id":2,"method":"resize-split","params":{"pane":7}}"#).unwrap();
+        assert_eq!(req.call, Call::ResizeSplit { pane: 7, dx: 0.0, dy: 0.0 });
     }
 
     #[test]

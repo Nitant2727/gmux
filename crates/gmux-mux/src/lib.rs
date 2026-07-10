@@ -136,6 +136,13 @@ impl Window {
         self.root.resize_leaf(self.active, delta);
     }
 
+    /// Drag-resize the divider for `pane` (the top/left pane of the dragged divider) by fractional
+    /// ratio deltas `dx` (vertical divider) / `dy` (horizontal divider). Does NOT change focus — a
+    /// drag on any pane's divider must not steal the active pane. A gone `pane` is a no-op.
+    pub fn resize_pane(&mut self, pane: PaneId, dx: f32, dy: f32) {
+        self.root.resize_leaf_of(pane, dx, dy);
+    }
+
     /// Sidebar metadata for this window: name, active pane's cwd, git branch, and attention.
     pub fn workspace_info(&self) -> WorkspaceInfo {
         let cwd = self.active_pane().cwd();
@@ -481,6 +488,32 @@ mod tests {
         let orphan = Pane::remote(99, 80, 24, Box::new(|_| {}));
         assert!(!s.focus_pane(orphan.id));
         assert_eq!(s.active_index(), 1);
+    }
+
+    /// Drag-resize adjusts the split ratio without changing the active pane (a divider drag on a
+    /// non-focused pane must not steal focus). Two side-by-side panes, active = the right one.
+    #[test]
+    fn resize_pane_changes_ratio_without_changing_focus() {
+        let a = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        let b = Pane::remote(2, 80, 24, Box::new(|_| {}));
+        let (ida, idb) = (a.id, b.id);
+        let root = Node::Split {
+            dir: SplitDir::Horizontal,
+            ratio: 0.5,
+            a: Box::new(Node::Leaf(ida)),
+            b: Box::new(Node::Leaf(idb)),
+        };
+        let mut panes = HashMap::new();
+        panes.insert(ida, a);
+        panes.insert(idb, b);
+        let mut win = Window::from_parts(panes, root, idb); // right pane active
+
+        // Drag the vertical divider right: grow the LEFT pane (the divider's top/left side).
+        win.resize_pane(ida, 0.2, 0.0);
+        assert_eq!(win.active_id(), idb, "a divider drag must not change focus");
+        let rs = win.layout_rects(100, 40);
+        let wa = rs.iter().find(|(id, _)| *id == ida).unwrap().1.w;
+        assert_eq!(wa, 70, "left pane grew to 0.5 + 0.2 of the width");
     }
 
     #[test]

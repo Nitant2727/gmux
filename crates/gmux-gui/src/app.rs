@@ -29,6 +29,11 @@ const DEFAULT_BG: [u8; 3] = [0x08, 0x08, 0x08]; // 0.03 * 255 ≈ 8
 const TOAST_GROUP: &str = "gmux-session";
 const TOAST_MIN_INTERVAL: Duration = Duration::from_millis(1000);
 const FRAME: Duration = Duration::from_millis(33); // ~30 fps poll of remote grids
+const RESIZE_THROTTLE: Duration = Duration::from_millis(33); // ~30 resize sends/s while dragging
+/// Gap (px) the renderer draws between split panes. ponytail: mirrored from renderer.rs's `GAP`
+/// design token (owned by the other task) so the divider hit-test can grab that visible band — if
+/// it changes there, mirror it here.
+const GAP: f32 = 4.0;
 
 // Sidebar row hit-test metrics. ponytail: hardcoded here to mirror the renderer's design tokens
 // (16px top padding, ~20px "WORKSPACES" section label, 48px rows, 4px gaps). The renderer (owned by
@@ -69,6 +74,61 @@ impl Client {
     }
 }
 
+/// An in-progress divider drag: which pane to grow, along which axis, and the throttle/accum state.
+struct Drag {
+    /// Target pane (the top/left side of the dragged divider); grows as the divider moves.
+    pane: u64,
+    /// Vertical divider (drag along x, adjusts a horizontal split) vs horizontal (drag along y).
+    vertical: bool,
+    /// Combined pixel extent of the two adjacent panes along the drag axis, for px→ratio scaling.
+    /// ponytail: approximate (uses the neighbour pair, not the exact split area) — good enough for
+    /// an interactive drag the daemon re-lays-out every frame; exact area math isn't worth it.
+    span: f32,
+    /// Cursor position (physical px) at the last sent delta; the next delta measures from here.
+    origin: (f64, f64),
+    /// Last send time, for the ~30/s throttle.
+    last_send: Instant,
+}
+
+/// A divider grabbed by the drag hit-test.
+struct Divider {
+    pane: u64,
+    vertical: bool,
+    span: f32,
+}
+
+/// Hit-test the gap bands between the (edge-to-edge) cached pane rects. `(cx, cy)` is in
+/// content-area coords (sidebar offset already removed). Returns the divider within `tol` px of a
+/// shared pane boundary — the top/left pane is the resize target — or `None`. Pure, so unit-tested.
+fn divider_at(panes: &[PaneRectWire], cx: f32, cy: f32, tol: f32) -> Option<Divider> {
+    for l in panes {
+        for r in panes {
+            if l.id == r.id {
+                continue;
+            }
+            // Vertical divider: `l` directly left of `r` (shared edge), y-ranges overlap the cursor.
+            if l.x + l.w == r.x {
+                let bx = (l.x + l.w) as f32;
+                let y0 = l.y.max(r.y) as f32;
+                let y1 = (l.y + l.h).min(r.y + r.h) as f32;
+                if (cx - bx).abs() <= tol && cy >= y0 && cy < y1 {
+                    return Some(Divider { pane: l.id, vertical: true, span: (l.w + r.w) as f32 });
+                }
+            }
+            // Horizontal divider: `l` directly above `r`.
+            if l.y + l.h == r.y {
+                let by = (l.y + l.h) as f32;
+                let x0 = l.x.max(r.x) as f32;
+                let x1 = (l.x + l.w).min(r.x + r.w) as f32;
+                if (cy - by).abs() <= tol && cx >= x0 && cx < x1 {
+                    return Some(Divider { pane: l.id, vertical: false, span: (l.h + r.h) as f32 });
+                }
+            }
+        }
+    }
+    None
+}
+
 struct State {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -83,6 +143,8 @@ struct State {
     hwnd: isize,
     /// Last known cursor position (physical px), tracked from `CursorMoved` for click hit-testing.
     cursor: (f64, f64),
+    /// In-progress divider drag (mouse-down on a split gap), or `None`.
+    drag: Option<Drag>,
     /// The active window's pane rectangles from the last rendered layout (content-area coords, i.e.
     /// before the sidebar-width offset), cached each frame for mouse hit-testing.
     last_panes: Vec<PaneRectWire>,
@@ -200,6 +262,7 @@ impl ApplicationHandler for App {
             focused: true,
             hwnd,
             cursor: (0.0, 0.0),
+            drag: None,
             last_panes: Vec::new(),
             tab_count: 0,
             notifier,
@@ -243,14 +306,28 @@ impl ApplicationHandler for App {
                     st.window.request_redraw();
                 }
             }
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(st) = self.state.as_mut() {
+                    // Park the cursor off-window so hover highlights clear, and end any drag —
+                    // stale hover otherwise stays lit until the cursor re-enters.
+                    st.cursor = (-1.0, -1.0);
+                    st.drag = None;
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(st) = self.state.as_mut() {
                     st.cursor = (position.x, position.y);
+                    st.on_cursor_moved();
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 if let Some(st) = self.state.as_mut() {
                     st.on_click();
+                }
+            }
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                if let Some(st) = self.state.as_mut() {
+                    st.drag = None; // end any divider drag
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -466,9 +543,10 @@ impl State {
         }
     }
 
-    /// Handle a left click: a click in the sidebar selects that window (tab); a click in a pane
-    /// focuses that pane. Uses the row metrics mirrored from the renderer for the sidebar and the
-    /// last rendered layout (cached in `render`) for pane hit-testing.
+    /// Handle a left click: in the sidebar, the '+' row opens a new tab and a workspace row selects
+    /// that window; in the content area, a split-gap starts a divider drag and anything else focuses
+    /// the pane. Uses the renderer's row metrics for the sidebar and the last rendered layout
+    /// (cached in `render`) for pane / divider hit-testing.
     fn on_click(&mut self) {
         let (cx, cy) = self.cursor;
         if cx < 0.0 || cy < 0.0 {
@@ -477,25 +555,72 @@ impl State {
         let (sidebar_w, _, _) = self.areas();
         let (px, py) = (cx as u32, cy as u32);
         if px < sidebar_w {
-            if let Some(idx) = self.renderer.sidebar_row_at(cy as f32, self.tab_count) {
+            // The '+' new-tab row sits after the last workspace row, so test it first.
+            if self.renderer.sidebar_new_tab_at(cy as f32, self.tab_count) {
+                self.scroll_offset = 0;
+                self.client.control(Call::NewWindow { command: None });
+                self.sync_size();
+                self.window.request_redraw();
+            } else if let Some(idx) = self.renderer.sidebar_row_at(cy as f32, self.tab_count) {
                 self.scroll_offset = 0;
                 self.client.control(Call::SelectWindow { index: idx });
                 self.window.request_redraw();
             }
             return;
         }
-        // Pane area: cached rects are in content-area coords, so shift the click by the sidebar.
-        let content_x = px - sidebar_w;
+        // Content area: cached rects are in content-area coords, so shift the click by the sidebar.
+        let content_x = cx - sidebar_w as f64;
+        // A split gap starts a drag-resize instead of focusing a pane.
+        if let Some(d) = divider_at(&self.last_panes, content_x as f32, cy as f32, GAP + 2.0) {
+            self.drag = Some(Drag {
+                pane: d.pane,
+                vertical: d.vertical,
+                span: d.span,
+                origin: self.cursor,
+                // Backdate so the first CursorMoved sends immediately.
+                last_send: Instant::now().checked_sub(RESIZE_THROTTLE).unwrap_or_else(Instant::now),
+            });
+            return;
+        }
+        let cxp = content_x as u32;
         let hit = self
             .last_panes
             .iter()
-            .find(|p| content_x >= p.x && content_x < p.x + p.w && py >= p.y && py < p.y + p.h)
+            .find(|p| cxp >= p.x && cxp < p.x + p.w && py >= p.y && py < p.y + p.h)
             .map(|p| p.id);
         if let Some(pane) = hit {
             self.scroll_offset = 0;
             self.client.control(Call::FocusPaneId { pane });
             self.window.request_redraw();
         }
+    }
+
+    /// While a divider drag is active, convert the accumulated pixel motion into a fractional split
+    /// ratio delta and send a throttled `ResizeSplit`. No-op when not dragging.
+    fn on_cursor_moved(&mut self) {
+        let now = Instant::now();
+        let (cx, cy) = self.cursor;
+        let sent = {
+            let Some(drag) = self.drag.as_mut() else { return };
+            if now.duration_since(drag.last_send) < RESIZE_THROTTLE {
+                return;
+            }
+            let ratio = |delta: f64, span: f32| delta as f32 / span.max(1.0);
+            let (dx, dy) = if drag.vertical {
+                (ratio(cx - drag.origin.0, drag.span), 0.0)
+            } else {
+                (0.0, ratio(cy - drag.origin.1, drag.span))
+            };
+            if dx == 0.0 && dy == 0.0 {
+                return;
+            }
+            drag.origin = (cx, cy);
+            drag.last_send = now;
+            (drag.pane, dx, dy)
+        };
+        let (pane, dx, dy) = sent;
+        self.client.control(Call::ResizeSplit { pane, dx, dy });
+        self.window.request_redraw();
     }
 
     fn cell_dims(&self) -> (u32, u32) {
@@ -591,7 +716,7 @@ impl State {
         // acquired SurfaceTexture unpresented exhausts the swapchain and wedges the window white, so
         // every path presents (a cleared frame when there's nothing to draw).
         let mut rows: Vec<SidebarRow> = Vec::new();
-        let mut snaps: Vec<(PaneSnapshot, Attention, bool, Rect)> = Vec::new();
+        let mut snaps: Vec<(PaneSnapshot, Attention, bool, Rect, u32)> = Vec::new();
         if let Ok(ResultBody::Layout(layout)) = self.client.call(Call::GetLayout { w: content_w, h }) {
             if layout.active_pane != self.active_pane {
                 // The active pane changed daemon-side (e.g. the old one exited): the scroll offset
@@ -606,7 +731,7 @@ impl State {
             rows = layout
                 .tabs
                 .iter()
-                .map(|t| SidebarRow { name: t.name.clone(), branch: t.branch.clone(), attention: t.attention, active: t.active, progress: t.progress, progress_error: t.progress_error })
+                .map(|t| SidebarRow { name: t.name.clone(), branch: t.branch.clone(), attention: t.attention, active: t.active, progress: t.progress, progress_error: t.progress_error, hover: false })
                 .collect();
 
             // Update the taskbar attention badge / progress based on overall attention.
@@ -633,20 +758,32 @@ impl State {
                     }
                     let att = if pr.attention { Attention::Pending } else { Attention::Quiet };
                     let rect = Rect { x: pr.x + sidebar_w, y: pr.y, w: pr.w, h: pr.h };
-                    snaps.push((snap, att, pr.active, rect));
+                    snaps.push((snap, att, pr.active, rect, g.offset));
                 }
             }
         }
         let views: Vec<PaneView> = snaps
             .iter()
-            .map(|(s, a, active, rect)| PaneView { snap: s, attention: *a, active: *active, rect: *rect })
+            .map(|(s, a, active, rect, scrolled)| PaneView { snap: s, attention: *a, active: *active, rect: *rect, scrolled: *scrolled })
             .collect();
         let empty_msg = if matches!(self.client, Client::Connecting(_)) {
             "starting daemon..."
         } else {
             "no panes - Ctrl+Shift+T for a new tab"
         };
-        self.renderer.render_frame(&view, &rows, sidebar_w, &views, w, h, empty_msg);
+        // Hover: mark the sidebar row / '+' row under the cursor (only when the cursor is over the
+        // sidebar). The renderer draws the hover fill (and ignores it on the active row).
+        let (cx, cy) = self.cursor;
+        let mut plus_hover = false;
+        if cx >= 0.0 && (cx as u32) < sidebar_w {
+            if let Some(hi) = self.renderer.sidebar_row_at(cy as f32, self.tab_count) {
+                if let Some(row) = rows.get_mut(hi) {
+                    row.hover = true;
+                }
+            }
+            plus_hover = self.renderer.sidebar_new_tab_at(cy as f32, self.tab_count);
+        }
+        self.renderer.render_frame(&view, &rows, sidebar_w, &views, w, h, empty_msg, plus_hover);
         // Present explicitly: dropping a SurfaceTexture does NOT present it — unpresented frames
         // exhaust the swapchain and every later acquire times out (window stays white/stale).
         self.renderer.queue.present(frame);
@@ -769,6 +906,46 @@ fn key_to_bytes(event: &KeyEvent, mods: ModifiersState) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
 
+    fn rect(id: u64, x: u32, y: u32, w: u32, h: u32) -> PaneRectWire {
+        PaneRectWire { id, x, y, w, h, active: false, attention: false }
+    }
+
+    /// Divider hit-test: a vertical split boundary grabs the left pane (drag along x); a horizontal
+    /// one grabs the top pane (drag along y); a click away from any boundary misses.
+    #[test]
+    fn divider_at_grabs_the_right_boundary_and_pane() {
+        // 1 | 2 side by side (edge-to-edge at x=50).
+        let side = [rect(1, 0, 0, 50, 40), rect(2, 50, 0, 50, 40)];
+        let d = divider_at(&side, 51.0, 20.0, GAP + 2.0).expect("on the vertical divider");
+        assert_eq!(d.pane, 1, "left pane is the target");
+        assert!(d.vertical);
+        assert_eq!(d.span, 100.0, "span is both pane widths");
+        // Away from the boundary and inside a pane: no divider (caller falls through to focus).
+        assert!(divider_at(&side, 10.0, 20.0, GAP + 2.0).is_none());
+        // Just outside the tolerance band still misses.
+        assert!(divider_at(&side, 58.0, 20.0, GAP + 2.0).is_none());
+
+        // 1 over 2 stacked (edge-to-edge at y=20).
+        let stack = [rect(1, 0, 0, 80, 20), rect(2, 0, 20, 80, 20)];
+        let d = divider_at(&stack, 40.0, 21.0, GAP + 2.0).expect("on the horizontal divider");
+        assert_eq!(d.pane, 1, "top pane is the target");
+        assert!(!d.vertical);
+        assert_eq!(d.span, 40.0, "span is both pane heights");
+    }
+
+    /// A vertical divider only registers within the panes' shared y-range, not past a pane's end
+    /// (T-junction): dragging outside the overlap misses.
+    #[test]
+    fn divider_at_requires_axis_overlap() {
+        // 1 fills the left; 2 and 3 stack on the right. The 1|2 divider only spans y 0..20.
+        let panes = [rect(1, 0, 0, 50, 40), rect(2, 50, 0, 50, 20), rect(3, 50, 20, 50, 20)];
+        // Within 1|2's overlap: grabs 1, span = 50 + 50.
+        let d = divider_at(&panes, 50.0, 10.0, GAP + 2.0).unwrap();
+        assert_eq!((d.pane, d.vertical, d.span), (1, true, 100.0));
+        // Lower down the same edge falls in 1|3's overlap: still grabs 1.
+        let d = divider_at(&panes, 50.0, 30.0, GAP + 2.0).unwrap();
+        assert_eq!(d.pane, 1);
+    }
 
     #[test]
     fn first_run_reports_once_then_sees_the_marker() {

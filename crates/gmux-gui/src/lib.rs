@@ -41,7 +41,11 @@ pub fn render_offscreen(
     });
     let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
     r.render(&view, snap, attention, px_w, px_h);
+    Some((px_w, px_h, read_rgba(&r, &tex, px_w, px_h)?))
+}
 
+/// Copy a rendered RGBA8 texture back to CPU memory (row-unpadded `w*h*4` bytes).
+fn read_rgba(r: &Renderer, tex: &wgpu::Texture, px_w: u32, px_h: u32) -> Option<Vec<u8>> {
     let unpadded = px_w * 4;
     let padded = align_up(unpadded, 256);
     let buf = r.device.create_buffer(&wgpu::BufferDescriptor {
@@ -54,7 +58,7 @@ pub fn render_offscreen(
         r.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("gmux-copy") });
     enc.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
-            texture: &tex,
+            texture: tex,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
@@ -87,7 +91,7 @@ pub fn render_offscreen(
     }
     drop(data);
     buf.unmap();
-    Some((px_w, px_h, out))
+    Some(out)
 }
 
 #[cfg(test)]
@@ -148,6 +152,47 @@ mod tests {
         let corner = pixel(&px, w, 1, 1);
         // Attention ring is now the pink ATTENTION token (#f38ba8), not blue.
         assert!(corner[0] > 150 && corner[1] > 80 && corner[2] > 100, "expected pink ring, got {corner:?}");
+    }
+
+    #[test]
+    fn rounded_sidebar_row_cuts_corner() {
+        // Verifies the alpha-blended rounded-quad pipeline: an active sidebar row's corner is
+        // masked away (shows the panel bg), while its centre is the solid active fill.
+        use crate::renderer::SidebarRow;
+        let Some(r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
+            return;
+        };
+        let sw = r.sidebar_width();
+        let rows_y0 = 24 + r.cell_h(); // SIDEBAR_PAD_TOP(16) + cell_h + 8
+        let row_h = 48u32;
+        let (w, h) = (sw, rows_y0 + row_h + 20);
+        let tex = r.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gmux-frame-test"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let rows = vec![SidebarRow {
+            name: "ws".into(),
+            branch: None,
+            attention: false,
+            active: true,
+            hover: false,
+            progress: None,
+            progress_error: false,
+        }];
+        r.render_frame(&view, &rows, sw, &[], w, h, "", false);
+        let px = read_rgba(&r, &tex, w, h).expect("readback");
+        // Panel bg is #181825 (r≈24); active fill is #313244 (r≈49). Threshold 40 splits them.
+        let corner = pixel(&px, w, 1, rows_y0 + 1);
+        let center = pixel(&px, w, sw / 2, rows_y0 + row_h / 2);
+        assert!(corner[0] < 40, "active-row corner should round away to panel bg, got {corner:?}");
+        assert!(center[0] > 40, "active-row centre should be the solid fill, got {center:?}");
     }
 
     #[test]

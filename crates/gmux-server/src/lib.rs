@@ -338,6 +338,22 @@ impl Server {
                 }
                 Response::ok(id, ResultBody::Done)
             }
+            Call::ResizeSplit { pane, dx, dy } => {
+                // The GUI only drags panes in the active (rendered) window. A gone pane no-ops.
+                // ponytail: no remote round-trip — remote tmux owns its own layout; a drag on a
+                // mirror is DROPPED (mutating the mirror tree would desync it and fight the next
+                // %layout-change) until that path grows a resize-pane control message.
+                let is_remote = self
+                    .remotes
+                    .iter()
+                    .any(|att| att.remote_id_of(PaneId(*pane)).is_some());
+                if !is_remote {
+                    if let Some(w) = self.session.active_window_mut() {
+                        w.resize_pane(PaneId(*pane), *dx, *dy);
+                    }
+                }
+                Response::ok(id, ResultBody::Done)
+            }
             Call::SwitchWindow { next } => {
                 if *next {
                     self.session.next_window();
