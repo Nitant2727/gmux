@@ -17,6 +17,13 @@ bytemuck = { version = "1", features = ["derive"] }
 ab_glyph = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Clipboard copy/paste (CF_UNICODETEXT via user32/kernel32). Same major as gmux-notify's dep.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+] }
 # M12: only pulled in with `--features browser`; keeps WebView2/COM out of the default graph.
 gmux-browser = { path = "../gmux-browser", optional = true }
 

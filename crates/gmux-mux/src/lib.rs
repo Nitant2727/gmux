@@ -270,6 +270,24 @@ impl Session {
         }
     }
 
+    /// Reorder tabs: move the window at `from` to index `to` (a sidebar drag-drop). Both indices
+    /// are clamped to the window count. The active tab follows the moved window when it *was* the
+    /// moved one; otherwise the active index shifts to track its window's new position.
+    pub fn move_window(&mut self, from: usize, to: usize) {
+        let len = self.windows.len();
+        if len == 0 {
+            return;
+        }
+        let from = from.min(len - 1);
+        let to = to.min(len - 1);
+        if from == to {
+            return;
+        }
+        let win = self.windows.remove(from);
+        self.windows.insert(to, win);
+        self.active = reindex_after_move(self.active, from, to);
+    }
+
     pub fn next_window(&mut self) {
         if !self.windows.is_empty() {
             self.active = (self.active + 1) % self.windows.len();
@@ -413,6 +431,23 @@ fn not_found(session: SessionId) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, format!("no session {session}"))
 }
 
+/// New index of the tracked (active) tab after moving the window at `from` to `to`. Models the
+/// `remove(from)` + `insert(to)` the reorder does: the moved window itself lands at `to`; any other
+/// tracked index shifts if the removal or insertion straddles it. Pure, so unit-tested directly.
+fn reindex_after_move(active: usize, from: usize, to: usize) -> usize {
+    if active == from {
+        return to;
+    }
+    // After remove(from): indices past `from` drop by one.
+    let after_remove = if active > from { active - 1 } else { active };
+    // After insert(to): indices at/after `to` rise by one.
+    if after_remove >= to {
+        after_remove + 1
+    } else {
+        after_remove
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,6 +523,47 @@ mod tests {
         let orphan = Pane::remote(99, 80, 24, Box::new(|_| {}));
         assert!(!s.focus_pane(orphan.id));
         assert_eq!(s.active_index(), 1);
+    }
+
+    #[test]
+    fn move_window_reorders_and_tracks_active() {
+        // Four tabs; capture their ids so we can assert order independent of indices.
+        let mut s = Session::from_windows(
+            "t",
+            vec![remote_window(), remote_window(), remote_window(), remote_window()],
+            2,
+        );
+        let ids: Vec<_> = s.windows().iter().map(|w| w.id).collect();
+
+        // Move the ACTIVE tab (index 2) to the front: it follows to index 0.
+        s.move_window(2, 0);
+        assert_eq!(s.active_index(), 0, "the moved active tab follows to its new index");
+        assert_eq!(s.windows()[0].id, ids[2]);
+        assert_eq!(s.windows().iter().map(|w| w.id).collect::<Vec<_>>(), vec![ids[2], ids[0], ids[1], ids[3]]);
+
+        // Now active is at 0 (ids[2]). Move a tab from after it (index 3, ids[3]) to before it
+        // (index 0): the active tab shifts right by one to make room.
+        s.move_window(3, 0);
+        assert_eq!(s.windows()[0].id, ids[3]);
+        assert_eq!(s.active_index(), 1, "active shifts to track its window after an insert before it");
+        assert_eq!(s.windows()[1].id, ids[2], "active still points at the same window");
+
+        // A clamped / no-op move leaves the active index untouched.
+        let before = s.active_index();
+        s.move_window(99, 99); // both clamp to len-1 -> from == to -> no-op
+        assert_eq!(s.active_index(), before);
+    }
+
+    #[test]
+    fn reindex_after_move_cases() {
+        // Moving the tracked index itself: it follows to `to`.
+        assert_eq!(reindex_after_move(2, 2, 0), 0);
+        // Move right across the tracked index: it shifts left by one.
+        assert_eq!(reindex_after_move(2, 0, 3), 1);
+        // Move left across the tracked index: it shifts right by one.
+        assert_eq!(reindex_after_move(1, 3, 0), 2);
+        // A move entirely on one side of the tracked index leaves it put.
+        assert_eq!(reindex_after_move(0, 2, 3), 0);
     }
 
     /// Drag-resize adjusts the split ratio without changing the active pane (a divider drag on a

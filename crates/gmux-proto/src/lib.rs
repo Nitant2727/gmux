@@ -54,7 +54,19 @@ pub enum Call {
     /// `pane_chrome` is the per-axis pixel overhead the GUI draws around each pane's cell area
     /// (margins/borders/insets, both sides summed); the daemon subtracts it before dividing a
     /// pane's rect into cells so grids match the *visible* area instead of being scissored.
-    ResizeView { w: u32, h: u32, cell_w: u32, cell_h: u32, #[serde(default)] pane_chrome: u32 },
+    /// `pane_chrome` is the horizontal per-axis overhead (subtracted before dividing a pane's
+    /// width into columns); `pane_chrome_y` the vertical overhead (adds the title strip), used for
+    /// rows. A zero `pane_chrome_y` (old client) falls back to `pane_chrome`.
+    ResizeView {
+        w: u32,
+        h: u32,
+        cell_w: u32,
+        cell_h: u32,
+        #[serde(default)]
+        pane_chrome: u32,
+        #[serde(default)]
+        pane_chrome_y: u32,
+    },
     /// Move focus between panes: `dir` is "left" | "right" | "up" | "down".
     FocusPane { dir: String },
     /// Close the active pane.
@@ -86,6 +98,14 @@ pub enum Call {
     FocusPaneId {
         #[serde(default)]
         pane: u64,
+    },
+    /// Reorder tabs: move the window at index `from` to index `to` (a sidebar drag-drop). Both
+    /// indices are clamped to the window count server-side; the active tab follows the moved window.
+    MoveWindow {
+        #[serde(default)]
+        from: usize,
+        #[serde(default)]
+        to: usize,
     },
     /// Drain notifications raised since the last poll (for the GUI to toast).
     PollNotifications,
@@ -197,10 +217,14 @@ pub struct GridWire {
     /// The scroll offset actually rendered (the requested offset clamped to `history`).
     #[serde(default)]
     pub offset: u32,
+    /// The pane's application enabled bracketed paste (DECSET 2004): pasted text should be
+    /// wrapped in `ESC[200~` / `ESC[201~`.
+    #[serde(default)]
+    pub bracketed_paste: bool,
 }
 
 /// One pane's rectangle within the content area.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PaneRectWire {
     pub id: u64,
     pub x: u32,
@@ -209,6 +233,10 @@ pub struct PaneRectWire {
     pub h: u32,
     pub active: bool,
     pub attention: bool,
+    /// Short pane title for the GUI's per-pane title strip (daemon-filled: pane title, else the
+    /// cwd's short name, else the pane id). `#[serde(default)]` so old daemons still parse.
+    #[serde(default)]
+    pub title: String,
 }
 
 /// One sidebar tab (window).
@@ -346,7 +374,7 @@ mod tests {
         for call in [
             Call::GetLayout { w: 800, h: 600 },
             Call::GetGrid { pane: 3, offset: 25 },
-            Call::ResizeView { w: 800, h: 600, cell_w: 9, cell_h: 18, pane_chrome: 34 },
+            Call::ResizeView { w: 800, h: 600, cell_w: 9, cell_h: 18, pane_chrome: 34, pane_chrome_y: 56 },
             Call::FocusPane { dir: "right".into() },
             Call::ClosePane,
             Call::ToggleZoom,
@@ -354,6 +382,7 @@ mod tests {
             Call::SwitchWindow { next: true },
             Call::SelectWindow { index: 2 },
             Call::FocusPaneId { pane: 7 },
+            Call::MoveWindow { from: 3, to: 1 },
             Call::SetPalette {
                 fg: [0xcc, 0xcc, 0xcc],
                 bg: [0x11, 0x11, 0x11],
@@ -378,6 +407,7 @@ mod tests {
             ],
             history: 120,
             offset: 25,
+            bracketed_paste: true,
         });
         let resp = Response::ok(2, grid.clone());
         let mut buf = Vec::new();
@@ -499,6 +529,40 @@ mod tests {
         // Hand-written JSON may omit the (defaulted) deltas / pane.
         let req: Request = serde_json::from_str(r#"{"id":2,"method":"resize-split","params":{"pane":7}}"#).unwrap();
         assert_eq!(req.call, Call::ResizeSplit { pane: 7, dx: 0.0, dy: 0.0 });
+    }
+
+    #[test]
+    fn move_window_is_kebab_case_and_fields_default() {
+        let req = Request { id: 1, call: Call::MoveWindow { from: 3, to: 1 } };
+        let mut buf = Vec::new();
+        write_msg(&mut buf, &req).unwrap();
+        let s = String::from_utf8(buf.clone()).unwrap();
+        assert!(s.contains("\"method\":\"move-window\""), "{s}");
+        let back: Request = read_msg(&mut Cursor::new(buf)).unwrap().unwrap();
+        assert_eq!(back, req);
+        // Hand-written JSON may omit the (defaulted) indices.
+        let req: Request = serde_json::from_str(r#"{"id":2,"method":"move-window","params":{"to":5}}"#).unwrap();
+        assert_eq!(req.call, Call::MoveWindow { from: 0, to: 5 });
+    }
+
+    #[test]
+    fn pane_rect_title_roundtrips_and_defaults() {
+        let layout = LayoutWire {
+            active_pane: 1,
+            tabs: Vec::new(),
+            panes: vec![PaneRectWire {
+                id: 1, x: 0, y: 0, w: 80, h: 24, active: true, attention: false, title: "gmux".into(),
+            }],
+        };
+        let resp = Response::ok(1, ResultBody::Layout(layout.clone()));
+        let mut buf = Vec::new();
+        write_msg(&mut buf, &resp).unwrap();
+        let back: Response = read_msg(&mut Cursor::new(buf)).unwrap().unwrap();
+        assert_eq!(back.result, Some(ResultBody::Layout(layout)));
+        // Old daemons / hand-written JSON omitting `title` still parse (serde default -> "").
+        let line = r#"{"id":9,"x":0,"y":0,"w":80,"h":24,"active":false,"attention":false}"#;
+        let rect: PaneRectWire = serde_json::from_str(line).unwrap();
+        assert_eq!(rect.title, "");
     }
 
     #[test]
