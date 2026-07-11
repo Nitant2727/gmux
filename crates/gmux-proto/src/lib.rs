@@ -51,15 +51,42 @@ pub enum Call {
     /// scrollback history (0 = the live screen); it is clamped server-side to available history.
     GetGrid { pane: u64, #[serde(default)] offset: usize },
     /// Report the GUI's content-area geometry so the daemon resizes the active window's panes.
-    ResizeView { w: u32, h: u32, cell_w: u32, cell_h: u32 },
+    /// `pane_chrome` is the per-axis pixel overhead the GUI draws around each pane's cell area
+    /// (margins/borders/insets, both sides summed); the daemon subtracts it before dividing a
+    /// pane's rect into cells so grids match the *visible* area instead of being scissored.
+    ResizeView { w: u32, h: u32, cell_w: u32, cell_h: u32, #[serde(default)] pane_chrome: u32 },
     /// Move focus between panes: `dir` is "left" | "right" | "up" | "down".
     FocusPane { dir: String },
     /// Close the active pane.
     ClosePane,
     /// Toggle zoom on the active pane.
     ToggleZoom,
+    /// Drag-resize the split at a divider: grow `pane` (the top/left pane of the dragged divider)
+    /// by a fractional split-ratio delta. `dx` moves a vertical divider (adjusts the pane's
+    /// horizontal split), `dy` a horizontal divider; the idle axis is 0. Ignored if the pane is
+    /// gone. Sent throttled while dragging.
+    ResizeSplit {
+        #[serde(default)]
+        pane: u64,
+        #[serde(default)]
+        dx: f32,
+        #[serde(default)]
+        dy: f32,
+    },
     /// Switch tabs: `next` true = next window, false = previous.
     SwitchWindow { next: bool },
+    /// Activate a window (tab) by its index in the sidebar (a sidebar click). Out-of-range
+    /// indices are ignored server-side.
+    SelectWindow {
+        #[serde(default)]
+        index: usize,
+    },
+    /// Focus a specific pane by id, activating its window too (a pane click). Unknown ids are
+    /// ignored server-side.
+    FocusPaneId {
+        #[serde(default)]
+        pane: u64,
+    },
     /// Drain notifications raised since the last poll (for the GUI to toast).
     PollNotifications,
     /// Register this connection as a push subscriber: the daemon replies `ok(Done)`, then streams
@@ -319,11 +346,14 @@ mod tests {
         for call in [
             Call::GetLayout { w: 800, h: 600 },
             Call::GetGrid { pane: 3, offset: 25 },
-            Call::ResizeView { w: 800, h: 600, cell_w: 9, cell_h: 18 },
+            Call::ResizeView { w: 800, h: 600, cell_w: 9, cell_h: 18, pane_chrome: 34 },
             Call::FocusPane { dir: "right".into() },
             Call::ClosePane,
             Call::ToggleZoom,
+            Call::ResizeSplit { pane: 4, dx: 0.5, dy: -0.25 },
             Call::SwitchWindow { next: true },
+            Call::SelectWindow { index: 2 },
+            Call::FocusPaneId { pane: 7 },
             Call::SetPalette {
                 fg: [0xcc, 0xcc, 0xcc],
                 bg: [0x11, 0x11, 0x11],
@@ -446,6 +476,29 @@ mod tests {
             req.call,
             Call::SetPalette { fg: [10, 20, 30], bg: [0, 0, 0], ansi: vec![] }
         );
+    }
+
+    #[test]
+    fn select_window_and_focus_pane_id_kebab_case_and_default() {
+        // Method names are kebab-case like the rest of the protocol.
+        let s = serde_json::to_string(&Request { id: 1, call: Call::SelectWindow { index: 3 } }).unwrap();
+        assert!(s.contains("\"method\":\"select-window\""), "{s}");
+        let s = serde_json::to_string(&Request { id: 1, call: Call::FocusPaneId { pane: 9 } }).unwrap();
+        assert!(s.contains("\"method\":\"focus-pane-id\""), "{s}");
+        // Hand-written JSON omitting the (defaulted) param still parses.
+        let req: Request = serde_json::from_str(r#"{"id":2,"method":"select-window","params":{}}"#).unwrap();
+        assert_eq!(req.call, Call::SelectWindow { index: 0 });
+        let req: Request = serde_json::from_str(r#"{"id":3,"method":"focus-pane-id","params":{}}"#).unwrap();
+        assert_eq!(req.call, Call::FocusPaneId { pane: 0 });
+    }
+
+    #[test]
+    fn resize_split_is_kebab_case_and_fields_default() {
+        let s = serde_json::to_string(&Request { id: 1, call: Call::ResizeSplit { pane: 4, dx: 0.5, dy: 0.0 } }).unwrap();
+        assert!(s.contains("\"method\":\"resize-split\""), "{s}");
+        // Hand-written JSON may omit the (defaulted) deltas / pane.
+        let req: Request = serde_json::from_str(r#"{"id":2,"method":"resize-split","params":{"pane":7}}"#).unwrap();
+        assert_eq!(req.call, Call::ResizeSplit { pane: 7, dx: 0.0, dy: 0.0 });
     }
 
     #[test]

@@ -136,6 +136,13 @@ impl Window {
         self.root.resize_leaf(self.active, delta);
     }
 
+    /// Drag-resize the divider for `pane` (the top/left pane of the dragged divider) by fractional
+    /// ratio deltas `dx` (vertical divider) / `dy` (horizontal divider). Does NOT change focus — a
+    /// drag on any pane's divider must not steal the active pane. A gone `pane` is a no-op.
+    pub fn resize_pane(&mut self, pane: PaneId, dx: f32, dy: f32) {
+        self.root.resize_leaf_of(pane, dx, dy);
+    }
+
     /// Sidebar metadata for this window: name, active pane's cwd, git branch, and attention.
     pub fn workspace_info(&self) -> WorkspaceInfo {
         let cwd = self.active_pane().cwd();
@@ -239,6 +246,28 @@ impl Session {
             self.active = self.windows.len() - 1;
         }
         Some(win)
+    }
+
+    /// Activate the window at `index` (a sidebar click). No-op (returns `false`) if out of range.
+    pub fn select_window(&mut self, index: usize) -> bool {
+        if index < self.windows.len() {
+            self.active = index;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Focus a specific pane by id, activating its window and making it that window's active pane.
+    /// No-op (returns `false`) if no window holds the pane.
+    pub fn focus_pane(&mut self, id: PaneId) -> bool {
+        if let Some(wi) = self.windows.iter().position(|w| w.pane(id).is_some()) {
+            self.active = wi;
+            self.windows[wi].set_active(id);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn next_window(&mut self) {
@@ -432,6 +461,59 @@ mod tests {
         assert_eq!(s.window_count(), 0);
         assert!(s.active_window().is_none());
         assert!(s.remove_window(kept).is_none(), "ids are never reused; a second remove misses");
+    }
+
+    #[test]
+    fn select_window_and_focus_pane_target_by_index_and_id() {
+        let mut s = Session::from_windows("t", vec![remote_window(), remote_window()], 0);
+        let w1_pane = s.windows()[1].active_id();
+
+        // Out-of-range select is a no-op; in-range moves the active index.
+        assert!(!s.select_window(5));
+        assert_eq!(s.active_index(), 0);
+        assert!(s.select_window(1));
+        assert_eq!(s.active_index(), 1);
+
+        // focus_pane jumps to whichever window holds the pane and activates it there.
+        let w0_pane = s.windows()[0].active_id();
+        assert!(s.focus_pane(w0_pane));
+        assert_eq!(s.active_index(), 0);
+        assert_eq!(s.active_window().unwrap().active_id(), w0_pane);
+
+        // A pane in another window pulls focus back to that window.
+        assert!(s.focus_pane(w1_pane));
+        assert_eq!(s.active_index(), 1);
+
+        // An unknown pane id is a no-op.
+        let orphan = Pane::remote(99, 80, 24, Box::new(|_| {}));
+        assert!(!s.focus_pane(orphan.id));
+        assert_eq!(s.active_index(), 1);
+    }
+
+    /// Drag-resize adjusts the split ratio without changing the active pane (a divider drag on a
+    /// non-focused pane must not steal focus). Two side-by-side panes, active = the right one.
+    #[test]
+    fn resize_pane_changes_ratio_without_changing_focus() {
+        let a = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        let b = Pane::remote(2, 80, 24, Box::new(|_| {}));
+        let (ida, idb) = (a.id, b.id);
+        let root = Node::Split {
+            dir: SplitDir::Horizontal,
+            ratio: 0.5,
+            a: Box::new(Node::Leaf(ida)),
+            b: Box::new(Node::Leaf(idb)),
+        };
+        let mut panes = HashMap::new();
+        panes.insert(ida, a);
+        panes.insert(idb, b);
+        let mut win = Window::from_parts(panes, root, idb); // right pane active
+
+        // Drag the vertical divider right: grow the LEFT pane (the divider's top/left side).
+        win.resize_pane(ida, 0.2, 0.0);
+        assert_eq!(win.active_id(), idb, "a divider drag must not change focus");
+        let rs = win.layout_rects(100, 40);
+        let wa = rs.iter().find(|(id, _)| *id == ida).unwrap().1.w;
+        assert_eq!(wa, 70, "left pane grew to 0.5 + 0.2 of the width");
     }
 
     #[test]

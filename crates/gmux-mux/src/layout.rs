@@ -106,6 +106,48 @@ impl Node {
         false
     }
 
+    /// Drag-resize: grow `target` (the top/left pane of a dragged divider) by `dh` along a vertical
+    /// divider (nearest Horizontal ancestor split whose divider sits at `target`'s right edge) and
+    /// `dv` along a horizontal divider. Unlike [`resize_leaf`], this matches the split *direction*
+    /// to the drag axis (target's immediate parent may be the other direction) and never changes
+    /// focus. Positive grows `target`. Adjusts at most one split per nonzero delta.
+    pub fn resize_leaf_of(&mut self, target: PaneId, dh: f32, dv: f32) -> bool {
+        let mut ok = false;
+        if dh != 0.0 {
+            ok |= self.resize_edge(target, SplitDir::Horizontal, dh);
+        }
+        if dv != 0.0 {
+            ok |= self.resize_edge(target, SplitDir::Vertical, dv);
+        }
+        ok
+    }
+
+    /// Adjust the *deepest* ancestor split of `want` direction that has `target` on its top/left
+    /// (`a`) side — the divider touching `target`'s bottom/right edge. Grows `target` by `delta`.
+    fn resize_edge(&mut self, target: PaneId, want: SplitDir, delta: f32) -> bool {
+        if let Node::Split { dir, ratio, a, b } = self {
+            let in_a = a.contains(target);
+            // Descend the subtree holding `target` first so a deeper matching split wins.
+            let deeper = if in_a { a.resize_edge(target, want, delta) } else { b.resize_edge(target, want, delta) };
+            if deeper {
+                return true;
+            }
+            if *dir == want && in_a {
+                *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Whether `target` is a leaf anywhere in this subtree.
+    fn contains(&self, target: PaneId) -> bool {
+        match self {
+            Node::Leaf(id) => *id == target,
+            Node::Split { a, b, .. } => a.contains(target) || b.contains(target),
+        }
+    }
+
     pub fn first_leaf(&self) -> PaneId {
         match self {
             Node::Leaf(id) => *id,
@@ -243,5 +285,38 @@ mod tests {
         let mut rs = Vec::new();
         rects(&root, Rect { x: 0, y: 0, w: 100, h: 40 }, &mut rs);
         assert_eq!(rs[0].1.w, 70); // 0.5 + 0.2
+    }
+
+    /// Drag-resize matches the split to the drag axis: in `V{ a: H{1,2}, b: 3 }`, pane 1's
+    /// immediate parent is the H split, yet dragging the *horizontal* divider under it (dv) must
+    /// grow the outer V split (the top row), and dragging the vertical divider (dh) grows only H.
+    #[test]
+    fn resize_leaf_of_targets_the_matching_direction_split() {
+        // V{ a: H{ a:1, b:2 }, b: 3 }
+        let mut root = Node::Split {
+            dir: SplitDir::Vertical,
+            ratio: 0.5,
+            a: Box::new(Node::Split {
+                dir: SplitDir::Horizontal,
+                ratio: 0.5,
+                a: Box::new(Node::leaf(p(1))),
+                b: Box::new(Node::leaf(p(2))),
+            }),
+            b: Box::new(Node::leaf(p(3))),
+        };
+
+        // dv on pane 1 grows the outer V split: the top row (panes 1 & 2) gets taller.
+        assert!(root.resize_leaf_of(p(1), 0.0, 0.2));
+        let mut rs = Vec::new();
+        rects(&root, Rect { x: 0, y: 0, w: 100, h: 100 }, &mut rs);
+        let h1 = rs.iter().find(|(id, _)| *id == p(1)).unwrap().1.h;
+        assert_eq!(h1, 70, "outer vertical split grew the top row (0.5 + 0.2)");
+
+        // dh on pane 1 grows only the inner H split: pane 1 widens, pane 2 shrinks.
+        assert!(root.resize_leaf_of(p(1), 0.2, 0.0));
+        let mut rs = Vec::new();
+        rects(&root, Rect { x: 0, y: 0, w: 100, h: 100 }, &mut rs);
+        let w1 = rs.iter().find(|(id, _)| *id == p(1)).unwrap().1.w;
+        assert_eq!(w1, 70, "inner horizontal split grew pane 1 (0.5 + 0.2)");
     }
 }

@@ -2,14 +2,16 @@
 //! (fetched over the pipe each frame) and forwards input/control to the daemon. The daemon owns the
 //! panes, so closing this window detaches — the agents keep running — and relaunching reattaches.
 
+use std::io;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gmux_mux::{Attention, Cell, PaneSnapshot, Rect, Rgb};
 use gmux_notify::{flash_window, Notifier, ProgressState as NProgress, Taskbar, ToastRequest, Urgency as NUrgency};
-use gmux_proto::{Call, GridWire, LayoutWire, NotifyWire, ResultBody, CELL_BOLD, CELL_INVERSE, CELL_ITALIC, CELL_UNDERLINE};
+use gmux_proto::{Call, GridWire, NotifyWire, PaneRectWire, ResultBody, CELL_BOLD, CELL_INVERSE, CELL_ITALIC, CELL_UNDERLINE};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
@@ -27,10 +29,104 @@ const DEFAULT_BG: [u8; 3] = [0x08, 0x08, 0x08]; // 0.03 * 255 ≈ 8
 const TOAST_GROUP: &str = "gmux-session";
 const TOAST_MIN_INTERVAL: Duration = Duration::from_millis(1000);
 const FRAME: Duration = Duration::from_millis(33); // ~30 fps poll of remote grids
+const RESIZE_THROTTLE: Duration = Duration::from_millis(33); // ~30 resize sends/s while dragging
+/// Gap (px) the renderer draws between split panes. ponytail: mirrored from renderer.rs's `GAP`
+/// design token (owned by the other task) so the divider hit-test can grab that visible band — if
+/// it changes there, mirror it here.
+const GAP: f32 = 4.0;
+
+// Sidebar row hit-test metrics. ponytail: hardcoded here to mirror the renderer's design tokens
+// (16px top padding, ~20px "WORKSPACES" section label, 48px rows, 4px gaps). The renderer (owned by
+// the other task) is the source of truth for the visuals; this is a deliberate shared-constant
+// divergence — if those tokens change there, mirror them here. The clickable sidebar *width* is
+// still read live from the renderer via `areas()`, so only the vertical row math is duplicated.
 
 pub struct App {
     mods: ModifiersState,
     state: Option<State>,
+}
+
+/// The daemon connection. `Connecting` holds the background connect thread's result channel so
+/// startup never blocks the window paint; `Ready` is the live client. `call`/`control` degrade to
+/// an error / no-op while connecting, so the render and input paths need no special-casing.
+enum Client {
+    Connecting(Receiver<io::Result<DaemonClient>>),
+    Ready(DaemonClient),
+}
+
+impl Client {
+    fn ready(&mut self) -> Option<&mut DaemonClient> {
+        match self {
+            Client::Ready(c) => Some(c),
+            Client::Connecting(_) => None,
+        }
+    }
+    fn call(&mut self, call: Call) -> Result<ResultBody, String> {
+        match self.ready() {
+            Some(c) => c.call(call),
+            None => Err("daemon still connecting".to_string()),
+        }
+    }
+    fn control(&mut self, call: Call) {
+        if let Some(c) = self.ready() {
+            c.control(call);
+        }
+    }
+}
+
+/// An in-progress divider drag: which pane to grow, along which axis, and the throttle/accum state.
+struct Drag {
+    /// Target pane (the top/left side of the dragged divider); grows as the divider moves.
+    pane: u64,
+    /// Vertical divider (drag along x, adjusts a horizontal split) vs horizontal (drag along y).
+    vertical: bool,
+    /// Combined pixel extent of the two adjacent panes along the drag axis, for px→ratio scaling.
+    /// ponytail: approximate (uses the neighbour pair, not the exact split area) — good enough for
+    /// an interactive drag the daemon re-lays-out every frame; exact area math isn't worth it.
+    span: f32,
+    /// Cursor position (physical px) at the last sent delta; the next delta measures from here.
+    origin: (f64, f64),
+    /// Last send time, for the ~30/s throttle.
+    last_send: Instant,
+}
+
+/// A divider grabbed by the drag hit-test.
+struct Divider {
+    pane: u64,
+    vertical: bool,
+    span: f32,
+}
+
+/// Hit-test the gap bands between the (edge-to-edge) cached pane rects. `(cx, cy)` is in
+/// content-area coords (sidebar offset already removed). Returns the divider within `tol` px of a
+/// shared pane boundary — the top/left pane is the resize target — or `None`. Pure, so unit-tested.
+fn divider_at(panes: &[PaneRectWire], cx: f32, cy: f32, tol: f32) -> Option<Divider> {
+    for l in panes {
+        for r in panes {
+            if l.id == r.id {
+                continue;
+            }
+            // Vertical divider: `l` directly left of `r` (shared edge), y-ranges overlap the cursor.
+            if l.x + l.w == r.x {
+                let bx = (l.x + l.w) as f32;
+                let y0 = l.y.max(r.y) as f32;
+                let y1 = (l.y + l.h).min(r.y + r.h) as f32;
+                if (cx - bx).abs() <= tol && cy >= y0 && cy < y1 {
+                    return Some(Divider { pane: l.id, vertical: true, span: (l.w + r.w) as f32 });
+                }
+            }
+            // Horizontal divider: `l` directly above `r`.
+            if l.y + l.h == r.y {
+                let by = (l.y + l.h) as f32;
+                let x0 = l.x.max(r.x) as f32;
+                let x1 = (l.x + l.w).min(r.x + r.w) as f32;
+                if (cy - by).abs() <= tol && cx >= x0 && cx < x1 {
+                    return Some(Divider { pane: l.id, vertical: false, span: (l.h + r.h) as f32 });
+                }
+            }
+        }
+    }
+    None
 }
 
 struct State {
@@ -38,10 +134,22 @@ struct State {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     renderer: Renderer,
-    client: DaemonClient,
+    client: Client,
+    /// The `SetPalette` call to push once the daemon connection is live (computed from the startup
+    /// config, so the daemon's pane colors match the renderer theme). Taken on first connect.
+    init_palette: Option<Call>,
     active_pane: u64,
     focused: bool,
     hwnd: isize,
+    /// Last known cursor position (physical px), tracked from `CursorMoved` for click hit-testing.
+    cursor: (f64, f64),
+    /// In-progress divider drag (mouse-down on a split gap), or `None`.
+    drag: Option<Drag>,
+    /// The active window's pane rectangles from the last rendered layout (content-area coords, i.e.
+    /// before the sidebar-width offset), cached each frame for mouse hit-testing.
+    last_panes: Vec<PaneRectWire>,
+    /// Sidebar row count from the last layout, to bound a sidebar click's row index.
+    tab_count: usize,
     notifier: Option<Notifier>,
     taskbar: Option<Taskbar>,
     last_toast: std::collections::HashMap<u64, Instant>,
@@ -117,15 +225,13 @@ impl ApplicationHandler for App {
         let mut renderer = Renderer::from_device(device, queue, format, font_px);
         apply_theme(&mut renderer, &user_config);
 
-        // Attach to (or start) the daemon.
-        let client = match DaemonClient::connect_or_spawn("gmux") {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("gmux: cannot reach the daemon: {e}");
-                el.exit();
-                return;
-            }
-        };
+        // Attach to (or start) the daemon on a background thread: `connect_or_spawn` can block for
+        // seconds (spawn + poll), which would freeze the window into a white "Not Responding" shell.
+        // The window paints a cleared frame while `about_to_wait` polls this channel for the result.
+        let (tx, connect_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(DaemonClient::connect_or_spawn("gmux"));
+        });
 
         let hwnd = window_hwnd(&window).unwrap_or(0);
         let notifier = Notifier::new("com.gmux.app", "gmux").ok();
@@ -145,15 +251,20 @@ impl ApplicationHandler for App {
             }
         }
 
-        let mut st = State {
+        let st = State {
             window,
             surface,
             config,
             renderer,
-            client,
+            client: Client::Connecting(connect_rx),
+            init_palette: Some(palette_call(&user_config)), // pushed once the connection is live
             active_pane: 0,
             focused: true,
             hwnd,
+            cursor: (0.0, 0.0),
+            drag: None,
+            last_panes: Vec::new(),
+            tab_count: 0,
             notifier,
             taskbar,
             last_toast: std::collections::HashMap::new(),
@@ -167,8 +278,7 @@ impl ApplicationHandler for App {
             #[cfg(feature = "browser")]
             browser: None,
         };
-        st.sync_size();
-        st.send_palette(&user_config); // theme the daemon's panes to match config
+        // sync_size + palette are sent from `poll_connect` once the daemon answers.
         self.state = Some(st);
         el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME));
     }
@@ -194,6 +304,30 @@ impl ApplicationHandler for App {
                     st.surface.configure(&st.renderer.device, &st.config);
                     st.sync_size();
                     st.window.request_redraw();
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                if let Some(st) = self.state.as_mut() {
+                    // Park the cursor off-window so hover highlights clear, and end any drag —
+                    // stale hover otherwise stays lit until the cursor re-enters.
+                    st.cursor = (-1.0, -1.0);
+                    st.drag = None;
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(st) = self.state.as_mut() {
+                    st.cursor = (position.x, position.y);
+                    st.on_cursor_moved();
+                }
+            }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                if let Some(st) = self.state.as_mut() {
+                    st.on_click();
+                }
+            }
+            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
+                if let Some(st) = self.state.as_mut() {
+                    st.drag = None; // end any divider drag
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -228,6 +362,15 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let Some(st) = self.state.as_mut() else { return };
+
+        // Still bringing up the daemon connection: keep painting (a cleared frame) each tick and
+        // poll the connect thread. Skip all the client-dependent polling below until it's live.
+        if matches!(st.client, Client::Connecting(_)) {
+            st.poll_connect(el);
+            st.window.request_redraw();
+            el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME));
+            return;
+        }
 
         // Drain daemon notifications and toast the ones that arrived while unfocused.
         if let Ok(ResultBody::Notifications(notes)) = st.client.call(Call::PollNotifications) {
@@ -371,6 +514,115 @@ impl State {
         self.window.request_redraw();
     }
 
+    /// Poll the background connect thread. Once the daemon answers, promote the connection to
+    /// `Ready` and do the post-connect setup the old blocking startup did (report geometry + push
+    /// the palette). A connect failure (or a dead connect thread) exits the app.
+    fn poll_connect(&mut self, el: &ActiveEventLoop) {
+        let recv = match &self.client {
+            Client::Connecting(rx) => rx.try_recv(),
+            Client::Ready(_) => return,
+        };
+        match recv {
+            Ok(Ok(dc)) => {
+                self.client = Client::Ready(dc);
+                self.sync_size();
+                if let Some(p) = self.init_palette.take() {
+                    self.client.control(p); // theme the daemon's panes to match config
+                }
+                self.window.request_redraw();
+            }
+            Ok(Err(e)) => {
+                eprintln!("gmux: cannot reach the daemon: {e}");
+                el.exit();
+            }
+            Err(TryRecvError::Empty) => {} // still connecting
+            Err(TryRecvError::Disconnected) => {
+                eprintln!("gmux: daemon connect thread ended without a result");
+                el.exit();
+            }
+        }
+    }
+
+    /// Handle a left click: in the sidebar, the '+' row opens a new tab and a workspace row selects
+    /// that window; in the content area, a split-gap starts a divider drag and anything else focuses
+    /// the pane. Uses the renderer's row metrics for the sidebar and the last rendered layout
+    /// (cached in `render`) for pane / divider hit-testing.
+    fn on_click(&mut self) {
+        let (cx, cy) = self.cursor;
+        if cx < 0.0 || cy < 0.0 {
+            return;
+        }
+        let (sidebar_w, _, _) = self.areas();
+        let (px, py) = (cx as u32, cy as u32);
+        if px < sidebar_w {
+            // The '+' new-tab row sits after the last workspace row, so test it first.
+            if self.renderer.sidebar_new_tab_at(cy as f32, self.tab_count) {
+                self.scroll_offset = 0;
+                self.client.control(Call::NewWindow { command: None });
+                self.sync_size();
+                self.window.request_redraw();
+            } else if let Some(idx) = self.renderer.sidebar_row_at(cy as f32, self.tab_count) {
+                self.scroll_offset = 0;
+                self.client.control(Call::SelectWindow { index: idx });
+                self.window.request_redraw();
+            }
+            return;
+        }
+        // Content area: cached rects are in content-area coords, so shift the click by the sidebar.
+        let content_x = cx - sidebar_w as f64;
+        // A split gap starts a drag-resize instead of focusing a pane.
+        if let Some(d) = divider_at(&self.last_panes, content_x as f32, cy as f32, GAP + 2.0) {
+            self.drag = Some(Drag {
+                pane: d.pane,
+                vertical: d.vertical,
+                span: d.span,
+                origin: self.cursor,
+                // Backdate so the first CursorMoved sends immediately.
+                last_send: Instant::now().checked_sub(RESIZE_THROTTLE).unwrap_or_else(Instant::now),
+            });
+            return;
+        }
+        let cxp = content_x as u32;
+        let hit = self
+            .last_panes
+            .iter()
+            .find(|p| cxp >= p.x && cxp < p.x + p.w && py >= p.y && py < p.y + p.h)
+            .map(|p| p.id);
+        if let Some(pane) = hit {
+            self.scroll_offset = 0;
+            self.client.control(Call::FocusPaneId { pane });
+            self.window.request_redraw();
+        }
+    }
+
+    /// While a divider drag is active, convert the accumulated pixel motion into a fractional split
+    /// ratio delta and send a throttled `ResizeSplit`. No-op when not dragging.
+    fn on_cursor_moved(&mut self) {
+        let now = Instant::now();
+        let (cx, cy) = self.cursor;
+        let sent = {
+            let Some(drag) = self.drag.as_mut() else { return };
+            if now.duration_since(drag.last_send) < RESIZE_THROTTLE {
+                return;
+            }
+            let ratio = |delta: f64, span: f32| delta as f32 / span.max(1.0);
+            let (dx, dy) = if drag.vertical {
+                (ratio(cx - drag.origin.0, drag.span), 0.0)
+            } else {
+                (0.0, ratio(cy - drag.origin.1, drag.span))
+            };
+            if dx == 0.0 && dy == 0.0 {
+                return;
+            }
+            drag.origin = (cx, cy);
+            drag.last_send = now;
+            (drag.pane, dx, dy)
+        };
+        let (pane, dx, dy) = sent;
+        self.client.control(Call::ResizeSplit { pane, dx, dy });
+        self.window.request_redraw();
+    }
+
     fn cell_dims(&self) -> (u32, u32) {
         (self.renderer.cell_w().max(1), self.renderer.cell_h().max(1))
     }
@@ -401,7 +653,8 @@ impl State {
     fn sync_size(&mut self) {
         let (_, content_w, h) = self.areas();
         let (cw, ch) = self.cell_dims();
-        self.client.control(Call::ResizeView { w: content_w, h, cell_w: cw, cell_h: ch });
+        let pane_chrome = self.renderer.pane_chrome_px();
+        self.client.control(Call::ResizeView { w: content_w, h, cell_w: cw, cell_h: ch, pane_chrome });
     }
 
     /// Push `config`'s full terminal palette to the daemon (fg/bg + 16 system colors), which
@@ -458,55 +711,82 @@ impl State {
         let (w, h) = (self.config.width, self.config.height);
         let (sidebar_w, content_w, _) = self.areas();
 
-        let layout: LayoutWire = match self.client.call(Call::GetLayout { w: content_w, h }) {
-            Ok(ResultBody::Layout(l)) => l,
-            _ => return,
-        };
-        if layout.active_pane != self.active_pane {
-            // The active pane changed daemon-side (e.g. the old one exited): the scroll offset
-            // belonged to the previous pane, so snap the new one to its live screen.
-            self.scroll_offset = 0;
-        }
-        self.active_pane = layout.active_pane;
-        let rows: Vec<SidebarRow> = layout
-            .tabs
-            .iter()
-            .map(|t| SidebarRow { name: t.name.clone(), branch: t.branch.clone(), attention: t.attention, active: t.active, progress: t.progress, progress_error: t.progress_error })
-            .collect();
+        // Build this frame's draw data. It stays empty while the daemon is still connecting or if a
+        // layout/grid fetch fails — but we ALWAYS fall through to the present below. Dropping an
+        // acquired SurfaceTexture unpresented exhausts the swapchain and wedges the window white, so
+        // every path presents (a cleared frame when there's nothing to draw).
+        let mut rows: Vec<SidebarRow> = Vec::new();
+        let mut snaps: Vec<(PaneSnapshot, Attention, bool, Rect, u32)> = Vec::new();
+        if let Ok(ResultBody::Layout(layout)) = self.client.call(Call::GetLayout { w: content_w, h }) {
+            if layout.active_pane != self.active_pane {
+                // The active pane changed daemon-side (e.g. the old one exited): the scroll offset
+                // belonged to the previous pane, so snap the new one to its live screen.
+                self.scroll_offset = 0;
+            }
+            self.active_pane = layout.active_pane;
+            // Cache for mouse hit-testing (content-area coords; the sidebar offset is applied below).
+            self.last_panes = layout.panes.clone();
+            self.tab_count = layout.tabs.len();
 
-        // Update the taskbar attention badge / progress based on overall attention.
-        if let Some(tb) = &self.taskbar {
-            let any = layout.panes.iter().any(|p| p.attention);
-            tb.set_progress(if any { NProgress::Paused } else { NProgress::None }, None);
-        }
+            rows = layout
+                .tabs
+                .iter()
+                .map(|t| SidebarRow { name: t.name.clone(), branch: t.branch.clone(), attention: t.attention, active: t.active, progress: t.progress, progress_error: t.progress_error, hover: false })
+                .collect();
 
-        let mut snaps: Vec<(PaneSnapshot, Attention, bool, Rect)> = Vec::new();
-        for pr in &layout.panes {
-            // Only the active pane scrolls; the rest always show the live screen.
-            let offset = if pr.active { self.scroll_offset } else { 0 };
-            if let Ok(ResultBody::Grid(g)) = self.client.call(Call::GetGrid { pane: pr.id, offset }) {
-                if pr.active {
-                    // Accept the server's clamp and remember the history depth / rows for
-                    // local wheel clamping and page sizing.
-                    self.scroll_offset = g.offset as usize;
-                    self.scroll_history = g.history as usize;
-                    self.active_rows = g.rows as usize;
+            // Update the taskbar attention badge / progress based on overall attention.
+            if let Some(tb) = &self.taskbar {
+                let any = layout.panes.iter().any(|p| p.attention);
+                tb.set_progress(if any { NProgress::Paused } else { NProgress::None }, None);
+            }
+
+            for pr in &layout.panes {
+                // Only the active pane scrolls; the rest always show the live screen.
+                let offset = if pr.active { self.scroll_offset } else { 0 };
+                if let Ok(ResultBody::Grid(g)) = self.client.call(Call::GetGrid { pane: pr.id, offset }) {
+                    if pr.active {
+                        // Accept the server's clamp and remember the history depth / rows for
+                        // local wheel clamping and page sizing.
+                        self.scroll_offset = g.offset as usize;
+                        self.scroll_history = g.history as usize;
+                        self.active_rows = g.rows as usize;
+                    }
+                    let mut snap = grid_to_snapshot(&g);
+                    if g.offset > 0 {
+                        // Scrolled into history: park the cursor off-grid so no cell draws it.
+                        snap.cursor = (g.cols, g.rows);
+                    }
+                    let att = if pr.attention { Attention::Pending } else { Attention::Quiet };
+                    let rect = Rect { x: pr.x + sidebar_w, y: pr.y, w: pr.w, h: pr.h };
+                    snaps.push((snap, att, pr.active, rect, g.offset));
                 }
-                let mut snap = grid_to_snapshot(&g);
-                if g.offset > 0 {
-                    // Scrolled into history: park the cursor off-grid so no cell draws it.
-                    snap.cursor = (g.cols, g.rows);
-                }
-                let att = if pr.attention { Attention::Pending } else { Attention::Quiet };
-                let rect = Rect { x: pr.x + sidebar_w, y: pr.y, w: pr.w, h: pr.h };
-                snaps.push((snap, att, pr.active, rect));
             }
         }
         let views: Vec<PaneView> = snaps
             .iter()
-            .map(|(s, a, active, rect)| PaneView { snap: s, attention: *a, active: *active, rect: *rect })
+            .map(|(s, a, active, rect, scrolled)| PaneView { snap: s, attention: *a, active: *active, rect: *rect, scrolled: *scrolled })
             .collect();
-        self.renderer.render_frame(&view, &rows, sidebar_w, &views, w, h);
+        let empty_msg = if matches!(self.client, Client::Connecting(_)) {
+            "starting daemon..."
+        } else {
+            "no panes - Ctrl+Shift+T for a new tab"
+        };
+        // Hover: mark the sidebar row / '+' row under the cursor (only when the cursor is over the
+        // sidebar). The renderer draws the hover fill (and ignores it on the active row).
+        let (cx, cy) = self.cursor;
+        let mut plus_hover = false;
+        if cx >= 0.0 && (cx as u32) < sidebar_w {
+            if let Some(hi) = self.renderer.sidebar_row_at(cy as f32, self.tab_count) {
+                if let Some(row) = rows.get_mut(hi) {
+                    row.hover = true;
+                }
+            }
+            plus_hover = self.renderer.sidebar_new_tab_at(cy as f32, self.tab_count);
+        }
+        self.renderer.render_frame(&view, &rows, sidebar_w, &views, w, h, empty_msg, plus_hover);
+        // Present explicitly: dropping a SurfaceTexture does NOT present it — unpresented frames
+        // exhaust the swapchain and every later acquire times out (window stays white/stale).
+        self.renderer.queue.present(frame);
     }
 }
 
@@ -625,6 +905,47 @@ fn key_to_bytes(event: &KeyEvent, mods: ModifiersState) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rect(id: u64, x: u32, y: u32, w: u32, h: u32) -> PaneRectWire {
+        PaneRectWire { id, x, y, w, h, active: false, attention: false }
+    }
+
+    /// Divider hit-test: a vertical split boundary grabs the left pane (drag along x); a horizontal
+    /// one grabs the top pane (drag along y); a click away from any boundary misses.
+    #[test]
+    fn divider_at_grabs_the_right_boundary_and_pane() {
+        // 1 | 2 side by side (edge-to-edge at x=50).
+        let side = [rect(1, 0, 0, 50, 40), rect(2, 50, 0, 50, 40)];
+        let d = divider_at(&side, 51.0, 20.0, GAP + 2.0).expect("on the vertical divider");
+        assert_eq!(d.pane, 1, "left pane is the target");
+        assert!(d.vertical);
+        assert_eq!(d.span, 100.0, "span is both pane widths");
+        // Away from the boundary and inside a pane: no divider (caller falls through to focus).
+        assert!(divider_at(&side, 10.0, 20.0, GAP + 2.0).is_none());
+        // Just outside the tolerance band still misses.
+        assert!(divider_at(&side, 58.0, 20.0, GAP + 2.0).is_none());
+
+        // 1 over 2 stacked (edge-to-edge at y=20).
+        let stack = [rect(1, 0, 0, 80, 20), rect(2, 0, 20, 80, 20)];
+        let d = divider_at(&stack, 40.0, 21.0, GAP + 2.0).expect("on the horizontal divider");
+        assert_eq!(d.pane, 1, "top pane is the target");
+        assert!(!d.vertical);
+        assert_eq!(d.span, 40.0, "span is both pane heights");
+    }
+
+    /// A vertical divider only registers within the panes' shared y-range, not past a pane's end
+    /// (T-junction): dragging outside the overlap misses.
+    #[test]
+    fn divider_at_requires_axis_overlap() {
+        // 1 fills the left; 2 and 3 stack on the right. The 1|2 divider only spans y 0..20.
+        let panes = [rect(1, 0, 0, 50, 40), rect(2, 50, 0, 50, 20), rect(3, 50, 20, 50, 20)];
+        // Within 1|2's overlap: grabs 1, span = 50 + 50.
+        let d = divider_at(&panes, 50.0, 10.0, GAP + 2.0).unwrap();
+        assert_eq!((d.pane, d.vertical, d.span), (1, true, 100.0));
+        // Lower down the same edge falls in 1|3's overlap: still grabs 1.
+        let d = divider_at(&panes, 50.0, 30.0, GAP + 2.0).unwrap();
+        assert_eq!(d.pane, 1);
+    }
 
     #[test]
     fn first_run_reports_once_then_sees_the_marker() {

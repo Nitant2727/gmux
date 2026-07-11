@@ -8,16 +8,58 @@ use wgpu::util::DeviceExt;
 
 use crate::atlas::Atlas;
 
-const RING_COLOR: Rgb = Rgb { r: 0x3b, g: 0x82, b: 0xf6 }; // blue — attention
-const ACTIVE_COLOR: Rgb = Rgb { r: 0x55, g: 0x55, b: 0x55 }; // dim — focused pane border
-const CURSOR_COLOR: Rgb = Rgb { r: 0xcc, g: 0xcc, b: 0xcc };
-const SIDEBAR_BG: Rgb = Rgb { r: 0x16, g: 0x16, b: 0x1a };
-const SIDEBAR_SEP: Rgb = Rgb { r: 0x33, g: 0x33, b: 0x3a };
-const SIDEBAR_ACTIVE: Rgb = Rgb { r: 0x26, g: 0x26, b: 0x30 };
-const TEXT: Rgb = Rgb { r: 0xcc, g: 0xcc, b: 0xcc };
-const DIM: Rgb = Rgb { r: 0x88, g: 0x88, b: 0x88 };
-const RING_PX: f32 = 3.0;
-const DEFAULT_CLEAR: wgpu::Color = wgpu::Color { r: 0.03, g: 0.03, b: 0.03, a: 1.0 };
+// Design tokens (single source of truth). Colors are Catppuccin-Mocha-derived; see the spec.
+const BG_APP: Rgb = Rgb { r: 0x11, g: 0x11, b: 0x1b }; // window / between-pane background
+const BG_SIDEBAR: Rgb = Rgb { r: 0x18, g: 0x18, b: 0x25 };
+const BG_PANE: Rgb = Rgb { r: 0x1e, g: 0x1e, b: 0x2e }; // pane fill + letterbox
+const SIDEBAR_ROW_ACTIVE: Rgb = Rgb { r: 0x31, g: 0x32, b: 0x44 };
+const SIDEBAR_ROW_HOVER: Rgb = Rgb { r: 0x24, g: 0x24, b: 0x3a }; // #24243a — between BG_SIDEBAR and active
+const ACCENT: Rgb = Rgb { r: 0x89, g: 0xb4, b: 0xfa }; // active borders / highlights
+const TEXT: Rgb = Rgb { r: 0xcd, g: 0xd6, b: 0xf4 };
+const TEXT_DIM: Rgb = Rgb { r: 0x7f, g: 0x84, b: 0x9c };
+const ATTENTION: Rgb = Rgb { r: 0xf3, g: 0x8b, b: 0xa8 }; // attention dot / ring
+const PROGRESS: Rgb = Rgb { r: 0xa6, g: 0xe3, b: 0xa1 };
+const ERROR: Rgb = Rgb { r: 0xf3, g: 0x8b, b: 0xa8 };
+const PANE_BORDER_INACTIVE: Rgb = Rgb { r: 0x31, g: 0x32, b: 0x44 };
+const CURSOR: Rgb = Rgb { r: 0xcd, g: 0xd6, b: 0xf4 };
+
+// Spacing (8px grid).
+const MARGIN: f32 = 8.0; // outer margin around the pane area
+const GAP: f32 = 4.0; // gap between split panes
+const INSET: f32 = 8.0; // cell area inset inside the pane border
+const BORDER: f32 = 1.0; // pane border width
+const ATTN_BORDER: f32 = 2.0; // attention ring width (overrides border)
+const SIDEBAR_W: u32 = 220; // fixed sidebar width (app caps it to 1/3 window)
+const SIDEBAR_PAD_TOP: f32 = 16.0;
+const ROW_H: f32 = 48.0;
+const ROW_GAP: f32 = 4.0;
+const ROW_PAD_H: f32 = 12.0; // horizontal padding inside a sidebar row
+const ACCENT_BAR_W: f32 = 3.0; // active-row left-edge bar
+const ATTN_DOT: f32 = 8.0;
+const RADIUS: f32 = 6.0; // rounded corner radius for sidebar rows + pane chrome
+const BADGE_RADIUS: f32 = 4.0; // scroll badge chip
+
+const fn clear_of(c: Rgb) -> wgpu::Color {
+    wgpu::Color { r: c.r as f64 / 255.0, g: c.g as f64 / 255.0, b: c.b as f64 / 255.0, a: 1.0 }
+}
+const DEFAULT_CLEAR: wgpu::Color = clear_of(BG_APP);
+
+/// CPU-side alpha blend `fg` over `bg` (the bg pipeline is opaque, so the cursor is pre-mixed).
+fn blend(fg: Rgb, bg: Rgb, a: f32) -> Rgb {
+    let m = |f: u8, b: u8| ((f as f32 * a) + (b as f32 * (1.0 - a))).round() as u8;
+    Rgb { r: m(fg.r, bg.r), g: m(fg.g, bg.g), b: m(fg.b, bg.b) }
+}
+
+/// Border width + color for a pane: attention ring overrides the active/inactive border.
+fn border_style(active: bool, attention: Attention) -> (f32, Rgb) {
+    if attention.is_pending() {
+        (ATTN_BORDER, ATTENTION)
+    } else if active {
+        (BORDER, ACCENT)
+    } else {
+        (BORDER, PANE_BORDER_INACTIVE)
+    }
+}
 
 /// One pane to draw in a multi-pane frame.
 pub struct PaneView<'a> {
@@ -25,6 +67,8 @@ pub struct PaneView<'a> {
     pub attention: Attention,
     pub active: bool,
     pub rect: Rect,
+    /// Scrollback offset: 0 = live tail; >0 draws a '+{n}' badge top-right of the pane.
+    pub scrolled: u32,
 }
 
 /// One workspace (window/tab) row in the sidebar.
@@ -33,6 +77,8 @@ pub struct SidebarRow {
     pub branch: Option<String>,
     pub attention: bool,
     pub active: bool,
+    /// Cursor is hovering this row: draws a subtle hover fill (ignored when `active`).
+    pub hover: bool,
     /// Aggregate agent progress: `Some(pct)` renders " 42%" after the name.
     pub progress: Option<u8>,
     /// A pane reported a progress error: renders " !" after the name (takes precedence over pct).
@@ -58,11 +104,55 @@ fn rgba(c: Rgb) -> [f32; 4] {
     [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0, 1.0]
 }
 
+/// A rounded-rect quad for the SDF chrome pipeline. `local` is the fragment's pixel offset from
+/// the rect centre (interpolated); `half`/`radius` are constant per quad — the fragment computes
+/// a rounded-box signed distance and alpha-masks the corners.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct RoundedVertex {
+    pos: [f32; 2],
+    local: [f32; 2],
+    half: [f32; 2],
+    radius: f32,
+    color: [f32; 4],
+}
+
+/// Push a rounded rect (`x0,y0`..`x1,y1` in pixels) into a rounded-pipeline vertex buffer.
+fn push_rounded(out: &mut Vec<RoundedVertex>, x0: f32, y0: f32, x1: f32, y1: f32, radius: f32, color: [f32; 4], fw: f32, fh: f32) {
+    let to_ndc = |x: f32, y: f32| [x / fw * 2.0 - 1.0, 1.0 - y / fh * 2.0];
+    let (cx, cy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+    let (hx, hy) = ((x1 - x0) * 0.5, (y1 - y0) * 0.5);
+    let corners = [(-hx, -hy), (hx, -hy), (hx, hy), (-hx, -hy), (hx, hy), (-hx, hy)];
+    for (lx, ly) in corners {
+        out.push(RoundedVertex {
+            pos: to_ndc(cx + lx, cy + ly),
+            local: [lx, ly],
+            half: [hx, hy],
+            radius,
+            color,
+        });
+    }
+}
+
+/// Prefer Cascadia (Mono, then Code) from the Windows fonts dir; fall back to the platform
+/// monospace (Consolas). Same ab_glyph path as the atlas — ASCII-only, unchanged.
+fn load_atlas(px: f32) -> Atlas {
+    for path in [r"C:\Windows\Fonts\CascadiaMono.ttf", r"C:\Windows\Fonts\CascadiaCode.ttf"] {
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Some(a) = Atlas::from_font_bytes(bytes, px) {
+                return a;
+            }
+        }
+    }
+    Atlas::system_monospace(px).expect("a system monospace font")
+}
+
 pub struct Renderer {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     format: wgpu::TextureFormat,
     bg_pipeline: wgpu::RenderPipeline,
+    rounded_pipeline: wgpu::RenderPipeline,
     glyph_pipeline: wgpu::RenderPipeline,
     atlas_bind_group: wgpu::BindGroup,
     atlas: Atlas,
@@ -102,7 +192,7 @@ impl Renderer {
         format: wgpu::TextureFormat,
         font_px: f32,
     ) -> Renderer {
-        let atlas = Atlas::system_monospace(font_px).expect("a system monospace font");
+        let atlas = load_atlas(font_px);
 
         // Upload the R8 coverage atlas.
         let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -209,6 +299,38 @@ impl Renderer {
             cache: None,
         });
 
+        // Rounded-chrome pipeline (alpha-blended SDF quads: sidebar rows, pane fills/borders,
+        // badges). Shares the empty bind layout with bg; only the vertex format + blend differ.
+        let rounded_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("gmux-rounded-pipeline"),
+            layout: Some(&bg_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("rounded_vs"),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<RoundedVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x2, 3 => Float32, 4 => Float32x4],
+                })],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("rounded_fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         // Glyph pipeline (alpha-blended textured quads).
         let glyph_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("gmux-glyph-layout"),
@@ -250,6 +372,7 @@ impl Renderer {
             queue,
             format,
             bg_pipeline,
+            rounded_pipeline,
             glyph_pipeline,
             atlas_bind_group,
             atlas,
@@ -288,6 +411,7 @@ impl Renderer {
         active: bool,
         px_w: u32,
         px_h: u32,
+        draw_border: bool,
     ) -> (Vec<BgVertex>, Vec<GlyphVertex>) {
         let cw = self.atlas.cell_w as f32;
         let ch = self.atlas.cell_h as f32;
@@ -310,7 +434,8 @@ impl Renderer {
                 let x0 = c as f32 * cw;
                 let y0 = r as f32 * ch;
                 let is_cursor = c as u16 == cursor_col && r as u16 == cursor_row;
-                let bg_color = if is_cursor { CURSOR_COLOR } else { cell.bg };
+                // Cursor: pre-blend at ~70% over the cell bg (opaque bg pipeline can't alpha-blend).
+                let bg_color = if is_cursor { blend(CURSOR, cell.bg, 0.7) } else { cell.bg };
                 push_quad(&mut bg, x0, y0, x0 + cw, y0 + ch, rgba(bg_color));
 
                 if let Some(uv) = printable_uv(&self.atlas, cell) {
@@ -320,7 +445,13 @@ impl Renderer {
                         (to_ndc(x0 + cw, y0 + ch), [uv[2], uv[3]]),
                         (to_ndc(x0, y0 + ch), [uv[0], uv[3]]),
                     );
-                    let fg = rgba(cell.fg);
+                    // Inactive panes dim their text so the focused pane pops.
+                    let mut fg = rgba(cell.fg);
+                    if !active {
+                        for ch in fg.iter_mut().take(3) {
+                            *ch *= 0.8;
+                        }
+                    }
                     for (p, t) in [a, b, cc, a, cc, d] {
                         glyphs.push(GlyphVertex { pos: p, uv: t, color: fg });
                     }
@@ -328,19 +459,15 @@ impl Renderer {
             }
         }
 
-        // Border: blue attention ring takes precedence; else a dim border on the focused pane.
-        let border = if attention.is_pending() {
-            Some(rgba(RING_COLOR))
-        } else if active {
-            Some(rgba(ACTIVE_COLOR))
-        } else {
-            None
-        };
-        if let Some(c) = border {
-            push_quad(&mut bg, 0.0, 0.0, fw, RING_PX, c); // top
-            push_quad(&mut bg, 0.0, fh - RING_PX, fw, fh, c); // bottom
-            push_quad(&mut bg, 0.0, 0.0, RING_PX, fh, c); // left
-            push_quad(&mut bg, fw - RING_PX, 0.0, fw, fh, c); // right
+        // Border drawn at the viewport edges (used by the offscreen/test path; the windowed frame
+        // draws its own chrome border around the inset cell rect, so it passes `draw_border=false`).
+        if draw_border {
+            let (bw, bc) = border_style(active, attention);
+            let c = rgba(bc);
+            push_quad(&mut bg, 0.0, 0.0, fw, bw, c); // top
+            push_quad(&mut bg, 0.0, fh - bw, fw, fh, c); // bottom
+            push_quad(&mut bg, 0.0, 0.0, bw, fh, c); // left
+            push_quad(&mut bg, fw - bw, 0.0, fw, fh, c); // right
         }
 
         (bg, glyphs)
@@ -357,7 +484,7 @@ impl Renderer {
     ) {
         self.render_panes(
             view,
-            &[PaneView { snap, attention, active: true, rect: Rect { x: 0, y: 0, w: px_w, h: px_h } }],
+            &[PaneView { snap, attention, active: true, rect: Rect { x: 0, y: 0, w: px_w, h: px_h }, scrolled: 0 }],
             px_w,
             px_h,
         );
@@ -376,8 +503,14 @@ impl Renderer {
         }
         let mut draws = Vec::with_capacity(panes.len());
         for pv in panes {
-            let (bg, glyphs) =
-                self.build_vertices(pv.snap, pv.attention, pv.active, pv.rect.w.max(1), pv.rect.h.max(1));
+            let (bg, glyphs) = self.build_vertices(
+                pv.snap,
+                pv.attention,
+                pv.active,
+                pv.rect.w.max(1),
+                pv.rect.h.max(1),
+                true,
+            );
             draws.push(Draw {
                 rect: pv.rect,
                 bg_n: bg.len() as u32,
@@ -438,13 +571,40 @@ impl Renderer {
         self.queue.submit([enc.finish()]);
     }
 
-    /// The natural width for the sidebar (fits ~22 monospace chars).
-    pub fn sidebar_width(&self) -> u32 {
-        self.atlas.cell_w * 22 + 24
+    /// The sidebar width (fixed; the app caps it to 1/3 of the window).
+    /// Total per-axis chrome around a pane's cell area (margin + border + inset on both sides).
+    /// The GUI reports this to the daemon so grids are sized to the *visible* cell area instead
+    /// of the full rect (cells were silently scissored off otherwise).
+    pub fn pane_chrome_px(&self) -> u32 {
+        (2.0 * (MARGIN + BORDER + INSET)) as u32
     }
 
-    fn row_h(&self) -> f32 {
-        self.atlas.cell_h as f32 * 2.0 + 10.0
+    /// Map a y coordinate (px, window space) to a sidebar row index — the single source of truth
+    /// for click hit-testing, using the same metrics `build_sidebar` draws with.
+    pub fn sidebar_row_at(&self, y: f32, row_count: usize) -> Option<usize> {
+        let rows_y0 = SIDEBAR_PAD_TOP + self.cell_h() as f32 + 8.0;
+        if y < rows_y0 {
+            return None;
+        }
+        let stride = ROW_H + ROW_GAP;
+        let rel = y - rows_y0;
+        let idx = (rel / stride) as usize;
+        if rel - idx as f32 * stride >= ROW_H || idx >= row_count {
+            return None;
+        }
+        Some(idx)
+    }
+
+    /// Hit-test the '+ new tab' row drawn immediately after the last workspace row (same 48px
+    /// metrics as `sidebar_row_at`, so the two never overlap).
+    pub fn sidebar_new_tab_at(&self, y: f32, row_count: usize) -> bool {
+        let rows_y0 = SIDEBAR_PAD_TOP + self.cell_h() as f32 + 8.0;
+        let top = rows_y0 + row_count as f32 * (ROW_H + ROW_GAP);
+        y >= top && y < top + ROW_H
+    }
+
+    pub fn sidebar_width(&self) -> u32 {
+        SIDEBAR_W
     }
 
     /// Append glyph quads for `s` starting at pixel `(x, y)` (monospace advance), full-surface NDC.
@@ -470,8 +630,9 @@ impl Renderer {
         }
     }
 
-    fn build_sidebar(&self, rows: &[SidebarRow], sidebar_w: u32, fw: f32, fh: f32) -> (Vec<BgVertex>, Vec<GlyphVertex>) {
+    fn build_sidebar(&self, rows: &[SidebarRow], sidebar_w: u32, plus_hover: bool, fw: f32, fh: f32) -> (Vec<BgVertex>, Vec<RoundedVertex>, Vec<GlyphVertex>) {
         let mut bg = Vec::new();
+        let mut rd = Vec::new(); // rounded chrome (row fills, accent bar, attention dot)
         let mut gl = Vec::new();
         let sw = sidebar_w as f32;
         let ch = self.atlas.cell_h as f32;
@@ -482,34 +643,62 @@ impl Renderer {
                 bg.push(BgVertex { pos: p, color: c });
             }
         };
-        quad(&mut bg, 0.0, 0.0, sw, fh, rgba(SIDEBAR_BG));
-        quad(&mut bg, sw - 1.0, 0.0, sw, fh, rgba(SIDEBAR_SEP));
+        let cw = self.atlas.cell_w as f32;
+        quad(&mut bg, 0.0, 0.0, sw, fh, rgba(BG_SIDEBAR));
 
-        let rh = self.row_h();
+        // Section label: "WORKSPACES" in dim uppercase.
+        self.text_run("WORKSPACES", ROW_PAD_H, SIDEBAR_PAD_TOP, rgba(TEXT_DIM), fw, fh, &mut gl);
+        let rows_y0 = SIDEBAR_PAD_TOP + ch + 8.0;
+        let text_x = ROW_PAD_H;
+        let pad_v = ((ROW_H - 2.0 * ch) / 2.0).max(2.0); // vertically center the two text lines
+        let right_edge = sw - ROW_PAD_H;
+        let stride = ROW_H + ROW_GAP;
+
         for (i, r) in rows.iter().enumerate() {
-            let y = i as f32 * rh;
+            let top = rows_y0 + i as f32 * stride;
+            let line1 = top + pad_v;
+            let line2 = line1 + ch;
+            // Row fill: active wins over hover. Accent bar sits in the straight span so its sharp
+            // corners never poke past the rounded fill.
             if r.active {
-                quad(&mut bg, 0.0, y, sw, y + rh, rgba(SIDEBAR_ACTIVE));
+                push_rounded(&mut rd, 0.0, top, sw, top + ROW_H, RADIUS, rgba(SIDEBAR_ROW_ACTIVE), fw, fh);
+                push_rounded(&mut rd, 0.0, top + RADIUS, ACCENT_BAR_W, top + ROW_H - RADIUS, 0.0, rgba(ACCENT), fw, fh);
+            } else if r.hover {
+                push_rounded(&mut rd, 0.0, top, sw, top + ROW_H, RADIUS, rgba(SIDEBAR_ROW_HOVER), fw, fh);
+            }
+            self.text_run(&r.name, text_x, line1, rgba(self.text), fw, fh, &mut gl);
+            if let Some(b) = &r.branch {
+                self.text_run(&format!("git:{b}"), text_x, line2, rgba(TEXT_DIM), fw, fh, &mut gl);
+            }
+
+            // Right-aligned indicators on line 1: progress text (PROGRESS / ERROR), then the
+            // attention dot (a round SDF chip) to its left.
+            let mut cursor_right = right_edge;
+            if r.progress_error || r.progress.is_some() {
+                let (txt, col) = if r.progress_error {
+                    ("!".to_string(), ERROR)
+                } else {
+                    (format!("{}%", r.progress.unwrap()), PROGRESS)
+                };
+                let w = txt.chars().count() as f32 * cw;
+                self.text_run(&txt, cursor_right - w, line1, rgba(col), fw, fh, &mut gl);
+                cursor_right -= w + 4.0;
             }
             if r.attention {
-                quad(&mut bg, 8.0, y + 9.0, 16.0, y + 17.0, rgba(RING_COLOR));
-            }
-            self.text_run(&r.name, 24.0, y + 6.0, rgba(self.text), fw, fh, &mut gl);
-            // Progress suffix in the dim branch color: " !" on error, else " 42%".
-            let suffix = if r.progress_error {
-                Some(" !".to_string())
-            } else {
-                r.progress.map(|p| format!(" {p}%"))
-            };
-            if let Some(s) = suffix {
-                let x = 24.0 + r.name.chars().count() as f32 * self.atlas.cell_w as f32;
-                self.text_run(&s, x, y + 6.0, rgba(DIM), fw, fh, &mut gl);
-            }
-            if let Some(b) = &r.branch {
-                self.text_run(&format!("git:{b}"), 24.0, y + 6.0 + ch, rgba(DIM), fw, fh, &mut gl);
+                let x1 = cursor_right;
+                let y0 = line1 + (ch - ATTN_DOT) / 2.0;
+                push_rounded(&mut rd, x1 - ATTN_DOT, y0, x1, y0 + ATTN_DOT, ATTN_DOT / 2.0, rgba(ATTENTION), fw, fh);
             }
         }
-        (bg, gl)
+
+        // '+ new tab' row, immediately after the last workspace row (matches sidebar_new_tab_at).
+        let plus_top = rows_y0 + rows.len() as f32 * stride;
+        if plus_hover {
+            push_rounded(&mut rd, 0.0, plus_top, sw, plus_top + ROW_H, RADIUS, rgba(SIDEBAR_ROW_HOVER), fw, fh);
+        }
+        self.text_run("+ new tab", text_x, plus_top + (ROW_H - ch) / 2.0, rgba(TEXT_DIM), fw, fh, &mut gl);
+
+        (bg, rd, gl)
     }
 
     /// Render a full frame: the sidebar (left column) plus the panes.
@@ -521,9 +710,17 @@ impl Renderer {
         panes: &[PaneView],
         surf_w: u32,
         surf_h: u32,
+        empty_msg: &str,
+        plus_hover: bool,
     ) {
         let (fw, fh) = (surf_w.max(1) as f32, surf_h.max(1) as f32);
-        let (sbg, sgl) = self.build_sidebar(sidebar, sidebar_w, fw, fh);
+        // `sbg` is the opaque sidebar panel; `srd` is the rounded chrome (sidebar rows + pane
+        // fills/borders); `sgl` is the sidebar text plus any empty-state message. `obg`/`ogl` are
+        // the scroll-badge overlay, drawn last so they sit above the pane cells.
+        let (sbg, mut srd, mut sgl) = self.build_sidebar(sidebar, sidebar_w, plus_hover, fw, fh);
+        let mut obg: Vec<RoundedVertex> = Vec::new();
+        let mut ogl: Vec<GlyphVertex> = Vec::new();
+        let (cw_cell, ch_cell) = (self.atlas.cell_w as f32, self.atlas.cell_h as f32);
         let vb = |data: &[u8]| {
             self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("gmux-vb"),
@@ -531,8 +728,6 @@ impl Renderer {
                 usage: wgpu::BufferUsages::VERTEX,
             })
         };
-        let sbg_buf = vb(bytemuck::cast_slice(&sbg));
-        let sgl_buf = vb(bytemuck::cast_slice(&sgl));
 
         struct Draw {
             rect: Rect,
@@ -543,16 +738,65 @@ impl Renderer {
         }
         let mut draws = Vec::with_capacity(panes.len());
         for pv in panes {
+            // Daemon rects tile the content area edge-to-edge. Shrink each edge: MARGIN at the
+            // content boundary, GAP/2 at an interior split edge (so neighbours share a GAP gap).
+            let (ox, oy, ow, oh) = (pv.rect.x as f32, pv.rect.y as f32, pv.rect.w as f32, pv.rect.h as f32);
+            let l = if pv.rect.x <= sidebar_w { MARGIN } else { GAP / 2.0 };
+            let t = if pv.rect.y == 0 { MARGIN } else { GAP / 2.0 };
+            let rgt = if pv.rect.x + pv.rect.w >= surf_w { MARGIN } else { GAP / 2.0 };
+            let bot = if pv.rect.y + pv.rect.h >= surf_h { MARGIN } else { GAP / 2.0 };
+            let (cx, cy) = (ox + l, oy + t);
+            let (cw_, ch_) = ((ow - l - rgt).max(1.0), (oh - t - bot).max(1.0));
+
+            // Pane chrome: a rounded border ring (outer) with the BG_PANE fill (inner, inset by the
+            // border width) drawn on top. The fill also letterboxes the cell-grid remainder.
+            let (bw, bc) = border_style(pv.active, pv.attention);
+            push_rounded(&mut srd, cx, cy, cx + cw_, cy + ch_, RADIUS, rgba(bc), fw, fh);
+            push_rounded(&mut srd, cx + bw, cy + bw, cx + cw_ - bw, cy + ch_ - bw, (RADIUS - bw).max(0.0), rgba(BG_PANE), fw, fh);
+
+            // Scroll badge: '+{n}' chip top-right inside the pane (drawn later, above the cells).
+            if pv.scrolled > 0 {
+                let label = format!("+{}", pv.scrolled);
+                let (bpx, bpy) = (4.0, 2.0);
+                let bw_chip = label.chars().count() as f32 * cw_cell + 2.0 * bpx;
+                let bh_chip = ch_cell + 2.0 * bpy;
+                let br = cx + cw_ - bw - 4.0;
+                let bt = cy + bw + 4.0;
+                push_rounded(&mut obg, br - bw_chip, bt, br, bt + bh_chip, BADGE_RADIUS, rgba(BG_SIDEBAR), fw, fh);
+                self.text_run(&label, br - bw_chip + bpx, bt + bpy, rgba(ACCENT), fw, fh, &mut ogl);
+            }
+
+            // Cell area: inset INSET inside the border. Cells draw at fixed size from its top-left;
+            // the viewport clips overflow, the BG_PANE fill shows through any remainder.
+            let pad = bw + INSET;
+            let (ix, iy) = (cx + pad, cy + pad);
+            let (iw, ih) = ((cw_ - 2.0 * pad).max(1.0), (ch_ - 2.0 * pad).max(1.0));
             let (bg, glyphs) =
-                self.build_vertices(pv.snap, pv.attention, pv.active, pv.rect.w.max(1), pv.rect.h.max(1));
+                self.build_vertices(pv.snap, pv.attention, pv.active, iw as u32, ih as u32, false);
             draws.push(Draw {
-                rect: pv.rect,
+                rect: Rect { x: ix as u32, y: iy as u32, w: iw as u32, h: ih as u32 },
                 bg_n: bg.len() as u32,
                 glyph_n: glyphs.len() as u32,
                 bg: vb(bytemuck::cast_slice(&bg)),
                 glyph: vb(bytemuck::cast_slice(&glyphs)),
             });
         }
+
+        // Empty state: no panes to draw.
+        if panes.is_empty() {
+            let msg = empty_msg;
+            let tw = msg.chars().count() as f32 * self.atlas.cell_w as f32;
+            let content_w = fw - sidebar_w as f32;
+            let x = sidebar_w as f32 + ((content_w - tw) / 2.0).max(0.0);
+            let y = (fh - self.atlas.cell_h as f32) / 2.0;
+            self.text_run(msg, x, y, rgba(TEXT_DIM), fw, fh, &mut sgl);
+        }
+
+        let sbg_buf = vb(bytemuck::cast_slice(&sbg));
+        let srd_buf = vb(bytemuck::cast_slice(&srd));
+        let sgl_buf = vb(bytemuck::cast_slice(&sgl));
+        let obg_buf = vb(bytemuck::cast_slice(&obg));
+        let ogl_buf = vb(bytemuck::cast_slice(&ogl));
 
         let mut enc = self
             .device
@@ -582,6 +826,11 @@ impl Renderer {
                 pass.set_vertex_buffer(0, sbg_buf.slice(..));
                 pass.draw(0..sbg.len() as u32, 0..1);
             }
+            if !srd.is_empty() {
+                pass.set_pipeline(&self.rounded_pipeline);
+                pass.set_vertex_buffer(0, srd_buf.slice(..));
+                pass.draw(0..srd.len() as u32, 0..1);
+            }
             if !sgl.is_empty() {
                 pass.set_pipeline(&self.glyph_pipeline);
                 pass.set_bind_group(0, &self.atlas_bind_group, &[]);
@@ -591,6 +840,9 @@ impl Renderer {
             // Panes (viewport per pane).
             for d in &draws {
                 let (x, y) = (d.rect.x, d.rect.y);
+                if x >= surf_w || y >= surf_h {
+                    continue; // inset origin off-surface (absurdly small window): nothing to draw
+                }
                 let w = d.rect.w.max(1).min(surf_w.saturating_sub(x)).max(1);
                 let h = d.rect.h.max(1).min(surf_h.saturating_sub(y)).max(1);
                 pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
@@ -605,6 +857,22 @@ impl Renderer {
                     pass.set_bind_group(0, &self.atlas_bind_group, &[]);
                     pass.set_vertex_buffer(0, d.glyph.slice(..));
                     pass.draw(0..d.glyph_n, 0..1);
+                }
+            }
+            // Scroll-badge overlay (full-surface viewport, above the pane cells).
+            if !obg.is_empty() || !ogl.is_empty() {
+                pass.set_viewport(0.0, 0.0, fw, fh, 0.0, 1.0);
+                pass.set_scissor_rect(0, 0, surf_w, surf_h);
+                if !obg.is_empty() {
+                    pass.set_pipeline(&self.rounded_pipeline);
+                    pass.set_vertex_buffer(0, obg_buf.slice(..));
+                    pass.draw(0..obg.len() as u32, 0..1);
+                }
+                if !ogl.is_empty() {
+                    pass.set_pipeline(&self.glyph_pipeline);
+                    pass.set_bind_group(0, &self.atlas_bind_group, &[]);
+                    pass.set_vertex_buffer(0, ogl_buf.slice(..));
+                    pass.draw(0..ogl.len() as u32, 0..1);
                 }
             }
         }
@@ -625,6 +893,27 @@ struct BgOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32> 
     var o: BgOut; o.pos = vec4<f32>(pos, 0.0, 1.0); o.color = color; return o;
 }
 @fragment fn bg_fs(i: BgOut) -> @location(0) vec4<f32> { return i.color; }
+
+struct RoundedOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) local: vec2<f32>,
+    @location(1) half: vec2<f32>,
+    @location(2) radius: f32,
+    @location(3) color: vec4<f32>,
+};
+@vertex fn rounded_vs(@location(0) pos: vec2<f32>, @location(1) local: vec2<f32>, @location(2) half: vec2<f32>, @location(3) radius: f32, @location(4) color: vec4<f32>) -> RoundedOut {
+    var o: RoundedOut;
+    o.pos = vec4<f32>(pos, 0.0, 1.0);
+    o.local = local; o.half = half; o.radius = radius; o.color = color;
+    return o;
+}
+@fragment fn rounded_fs(i: RoundedOut) -> @location(0) vec4<f32> {
+    // Signed distance to a rounded box; 1px anti-aliased alpha mask at the edge.
+    let q = abs(i.local) - (i.half - vec2<f32>(i.radius));
+    let d = min(max(q.x, q.y), 0.0) + length(max(q, vec2<f32>(0.0))) - i.radius;
+    let aa = clamp(0.5 - d, 0.0, 1.0);
+    return vec4<f32>(i.color.rgb, i.color.a * aa);
+}
 
 struct GlyphOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>, @location(1) color: vec4<f32> };
 @group(0) @binding(0) var atlas_tex: texture_2d<f32>;
