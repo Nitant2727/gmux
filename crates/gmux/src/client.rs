@@ -121,11 +121,12 @@ fn parse_ssh_tmux(args: &[String]) -> Option<(String, Option<String>)> {
     }
 }
 
-/// `gmux subscribe` — register as a push subscriber and print one JSON line per event batch the
-/// daemon streams, until the connection closes or Ctrl+C. Reuses the raw `Response` JSON as the
-/// output line (each is `{"id":0,"result":{"notifications":[...]}}`), so scripts can parse it with
-/// the same reader they use for any other reply.
-fn subscribe() -> i32 {
+/// `gmux subscribe [--output]` — register as a push subscriber and print one JSON line per event
+/// batch the daemon streams, until the connection closes or Ctrl+C. Reuses the raw `Response` JSON
+/// as the output line (each is `{"id":0,"result":{"notifications":[...]}}`), so scripts can parse
+/// it with the same reader they use for any other reply. `--output` also streams per-pane
+/// `pane-output` damage wires (noisy — for rendering clients, not toast scripts).
+fn subscribe(output: bool) -> i32 {
     let name = gmux_pipe::pipe_name_for_user("gmux");
     let stream = match gmux_pipe::client_connect(&name) {
         Ok(s) => s,
@@ -142,7 +143,7 @@ fn subscribe() -> i32 {
         }
     };
     let mut reader = BufReader::new(stream);
-    if let Err(e) = write_msg(&mut writer, &Request { id: 1, call: Call::Subscribe }) {
+    if let Err(e) = write_msg(&mut writer, &Request { id: 1, call: Call::Subscribe { output } }) {
         eprintln!("gmux: {e}");
         return 1;
     }
@@ -170,7 +171,7 @@ fn subscribe() -> i32 {
 pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
     match cmd {
         "list-panes" => Some(run(Call::ListPanes)),
-        "subscribe" => Some(subscribe()),
+        "subscribe" => Some(subscribe(args.iter().any(|a| a == "--output"))),
         "hello" => Some(run(Call::Hello { client_version: env!("CARGO_PKG_VERSION").into() })),
         "send-keys" => {
             let (mut pane, mut enter, mut text_parts) = (None, false, Vec::new());

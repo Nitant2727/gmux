@@ -89,6 +89,9 @@ pub struct Cell {
     pub italic: bool,
     pub underline: bool,
     pub inverse: bool,
+    /// A double-width (CJK/emoji) char: it occupies this cell plus the next spacer cell (which
+    /// carries `ch == ' '`). From alacritty's `Flags::WIDE_CHAR`.
+    pub wide: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +328,7 @@ impl Terminal {
                 italic: flags.contains(Flags::ITALIC),
                 underline: flags.intersects(Flags::ALL_UNDERLINES),
                 inverse,
+                wide: flags.contains(Flags::WIDE_CHAR),
             });
         }
         cells

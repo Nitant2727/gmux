@@ -30,8 +30,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Console::{
-    AllocConsole, ClosePseudoConsole, CreatePseudoConsole, GetConsoleWindow, ResizePseudoConsole,
-    SetStdHandle, COORD, HPCON, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    AllocConsole, ClosePseudoConsole, CreatePseudoConsole, GetConsoleMode, GetConsoleWindow,
+    GetStdHandle, ResizePseudoConsole, SetStdHandle, COORD, HPCON, STD_ERROR_HANDLE,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject,
@@ -115,7 +116,17 @@ static CONSOLE_INIT: Once = Once::new();
 pub fn ensure_console() {
     CONSOLE_INIT.call_once(|| unsafe {
         if !GetConsoleWindow().is_null() {
-            return; // already have a console
+            // A console exists, but the std handles may not point at it — a parent that spawned
+            // us with redirected/null stdio (CREATE_NO_WINDOW still creates a console) leaves
+            // stdout as a pipe/NUL, and ConPTY children only bind their stdio when the host's
+            // stdout IS a console (the M0 finding). Repair the handles instead of trusting them.
+            let mut mode = 0u32;
+            let stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+            if stdout != INVALID_HANDLE_VALUE && GetConsoleMode(stdout, &mut mode) != 0 {
+                return; // stdout really is a console: nothing to do
+            }
+            repoint_std_handles();
+            return;
         }
         if AllocConsole() == 0 {
             return; // best effort; spawn may still work if a console appears elsewhere
@@ -124,6 +135,13 @@ pub fn ensure_console() {
         if !hwnd.is_null() {
             ShowWindow(hwnd as _, SW_HIDE);
         }
+        repoint_std_handles();
+    });
+}
+
+/// Point the std handles at the process's console (`CONOUT$`/`CONIN$`).
+unsafe fn repoint_std_handles() {
+    unsafe {
         let share = FILE_SHARE_READ | FILE_SHARE_WRITE;
         let conout = CreateFileW(
             wide("CONOUT$").as_ptr(),
@@ -150,7 +168,7 @@ pub fn ensure_console() {
         if conin != INVALID_HANDLE_VALUE {
             SetStdHandle(STD_INPUT_HANDLE, conin);
         }
-    });
+    }
 }
 
 impl Pty {

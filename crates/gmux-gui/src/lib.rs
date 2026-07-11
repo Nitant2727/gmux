@@ -100,7 +100,7 @@ mod tests {
     use gmux_mux::{Cell, Rgb};
 
     fn cell(ch: char, fg: Rgb, bg: Rgb) -> Cell {
-        Cell { ch, fg, bg, bold: false, italic: false, underline: false, inverse: false }
+        Cell { ch, fg, bg, bold: false, italic: false, underline: false, inverse: false, wide: false }
     }
 
     fn pixel(px: &[u8], w: u32, x: u32, y: u32) -> [u8; 4] {
@@ -253,5 +253,65 @@ mod tests {
             selected[0] as i32 - unselected[0] as i32 > 60,
             "selected cell should be visibly highlighted, got sel={selected:?} unsel={unselected:?}"
         );
+    }
+
+    /// The cell width the dynamic atlas assigns to `ch` when asked for a wide tile: 2 if a font in
+    /// the fallback chain can rasterize it, else 1 (box fallback). Mirrors the renderer's font
+    /// preference so the wide-cell render test can honestly skip on a CJK-font-less runner.
+    fn probe_wide_cells(ch: char) -> u8 {
+        use crate::atlas::{Atlas, GlyphLookup};
+        let atlas = [r"C:\Windows\Fonts\CascadiaMono.ttf", r"C:\Windows\Fonts\CascadiaCode.ttf"]
+            .iter()
+            .find_map(|p| std::fs::read(p).ok().and_then(|b| Atlas::from_font_bytes(b, 18.0)))
+            .or_else(|| Atlas::system_monospace(18.0))
+            .expect("a monospace font");
+        match atlas.glyph(ch, true) {
+            GlyphLookup::Ready { cells, .. } | GlyphLookup::Upload { cells, .. } => cells,
+            GlyphLookup::Blank => 0,
+        }
+    }
+
+    #[test]
+    fn wide_cell_draws_across_two_cells() {
+        // A wide CJK glyph must render into BOTH its own cell and the spacer cell to its right.
+        if probe_wide_cells('中') != 2 {
+            eprintln!("no CJK/wide glyph on this runner; skipping cross-cell assertion");
+            return;
+        }
+        let bg = Rgb { r: 0, g: 0, b: 0 };
+        let fg = Rgb { r: 255, g: 255, b: 255 };
+        // '中' is wide; the daemon sends a ' ' spacer in the next cell.
+        let mut wide = cell('中', fg, bg);
+        wide.wide = true;
+        let snap = PaneSnapshot {
+            cells: vec![vec![wide, cell(' ', fg, bg)]],
+            cursor: (99, 99),
+            cols: 2,
+            rows: 1,
+        };
+        let Some(r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
+            return;
+        };
+        let (cw, ch) = (r.cell_w(), r.cell_h());
+        drop(r);
+        let (w, h, px) = render_offscreen(&snap, Attention::Quiet, cw * 2, ch).expect("render");
+
+        // Count bright (white glyph) pixels in each cell's interior x-range (avoid the edge border).
+        let bright_in = |x0: u32, x1: u32| {
+            let mut n = 0;
+            for y in 2..h.saturating_sub(2) {
+                for x in x0..x1 {
+                    let p = pixel(&px, w, x, y);
+                    if p[0] > 150 && p[1] > 150 && p[2] > 150 {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let first = bright_in(1, cw);
+        let second = bright_in(cw, (cw * 2).saturating_sub(1));
+        assert!(first > 0, "wide glyph produced no coverage in its own cell ({first})");
+        assert!(second > 0, "wide glyph did not extend into the spacer cell ({second})");
     }
 }

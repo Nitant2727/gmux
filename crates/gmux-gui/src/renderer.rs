@@ -3,10 +3,10 @@
 //! glyphs). Vertex buffers are rebuilt per frame (damage tracking is a later optimization).
 
 use bytemuck::{Pod, Zeroable};
-use gmux_mux::{Attention, Cell, PaneSnapshot, Rect, Rgb};
+use gmux_mux::{Attention, PaneSnapshot, Rect, Rgb};
 use wgpu::util::DeviceExt;
 
-use crate::atlas::Atlas;
+use crate::atlas::{Atlas, GlyphLookup};
 
 // Design tokens (single source of truth). Colors are Catppuccin-Mocha-derived; see the spec.
 const BG_APP: Rgb = Rgb { r: 0x11, g: 0x11, b: 0x1b }; // window / between-pane background
@@ -161,6 +161,7 @@ pub struct Renderer {
     rounded_pipeline: wgpu::RenderPipeline,
     glyph_pipeline: wgpu::RenderPipeline,
     atlas_bind_group: wgpu::BindGroup,
+    atlas_tex: wgpu::Texture, // dynamic glyph tiles are written here incrementally
     atlas: Atlas,
     // Theme knobs (see `set_theme`). Cell fg/bg still come from the daemon's grid; these only drive
     // the window clear color and the sidebar text color.
@@ -200,7 +201,9 @@ impl Renderer {
     ) -> Renderer {
         let atlas = load_atlas(font_px);
 
-        // Upload the R8 coverage atlas.
+        // Full-size R8 coverage texture. Only the initial region (ASCII grid + box tile) is uploaded
+        // now; dynamic glyph tiles are written incrementally into the shelves below via
+        // `queue.write_texture` (see `glyph_uv`). The rest zero-inits on first sample.
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("gmux-atlas"),
             size: wgpu::Extent3d { width: atlas.width, height: atlas.height, depth_or_array_layers: 1 },
@@ -222,9 +225,9 @@ impl Renderer {
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(atlas.width),
-                rows_per_image: Some(atlas.height),
+                rows_per_image: Some(atlas.init_h),
             },
-            wgpu::Extent3d { width: atlas.width, height: atlas.height, depth_or_array_layers: 1 },
+            wgpu::Extent3d { width: atlas.width, height: atlas.init_h, depth_or_array_layers: 1 },
         );
         let tex_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -381,6 +384,7 @@ impl Renderer {
             rounded_pipeline,
             glyph_pipeline,
             atlas_bind_group,
+            atlas_tex: tex,
             atlas,
             clear: DEFAULT_CLEAR,
             text: TEXT,
@@ -407,6 +411,34 @@ impl Renderer {
     }
     pub fn format(&self) -> wgpu::TextureFormat {
         self.format
+    }
+
+    /// Resolve a character to its atlas UV + cell width (1 or 2), rasterizing + uploading a new tile
+    /// on a miss. Returns `None` for blanks (space/null). Called during vertex building (before the
+    /// render pass), so any `write_texture` here is queued ahead of the draw that samples it.
+    fn glyph_uv(&self, ch: char, wide: bool) -> Option<([f32; 4], u8)> {
+        match self.atlas.glyph(ch, wide) {
+            GlyphLookup::Blank => None,
+            GlyphLookup::Ready { uv, cells } => Some((uv, cells)),
+            GlyphLookup::Upload { uv, cells, x, y, w, tile } => {
+                self.queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.atlas_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d { x, y, z: 0 },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &tile,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(w),
+                        rows_per_image: Some(self.atlas.cell_h),
+                    },
+                    wgpu::Extent3d { width: w, height: self.atlas.cell_h, depth_or_array_layers: 1 },
+                );
+                Some((uv, cells))
+            }
+        }
     }
 
     /// Build the per-frame vertex data for a snapshot at the given pixel size.
@@ -440,11 +472,23 @@ impl Renderer {
             for (c, cell) in row.iter().enumerate() {
                 let x0 = c as f32 * cw;
                 let y0 = r as f32 * ch;
-                let is_cursor = c as u16 == cursor_col && r as u16 == cursor_row;
+                // A wide glyph spans this cell + the next spacer: cursor/selection on EITHER cell
+                // must style BOTH, or half the glyph highlights (the spacer inherits the lead's
+                // state, and a lead is styled when its spacer is hit).
+                let lead_wide = c > 0 && row.get(c - 1).is_some_and(|p| p.wide);
+                let hits = |col: usize| -> bool {
+                    col as u16 == cursor_col && r as u16 == cursor_row
+                };
+                let is_cursor = hits(c)
+                    || (lead_wide && hits(c - 1))
+                    || (cell.wide && hits(c + 1));
+                let selected = in_selection(selection, r, c)
+                    || (lead_wide && in_selection(selection, r, c - 1))
+                    || (cell.wide && in_selection(selection, r, c + 1));
                 // Selection: swap fg/bg and tint the (swapped) bg 30% toward ACCENT so the
                 // highlight reads over any content (blank cells, dark-on-dark, etc.).
                 let (mut cell_bg, mut cell_fg) = (cell.bg, cell.fg);
-                if in_selection(selection, r, c) {
+                if selected {
                     std::mem::swap(&mut cell_bg, &mut cell_fg);
                     cell_bg = blend(ACCENT, cell_bg, 0.3);
                 }
@@ -452,11 +496,14 @@ impl Renderer {
                 let bg_color = if is_cursor { blend(CURSOR, cell_bg, 0.7) } else { cell_bg };
                 push_quad(&mut bg, x0, y0, x0 + cw, y0 + ch, rgba(bg_color));
 
-                if let Some(uv) = printable_uv(&self.atlas, cell) {
+                // Wide (CJK) glyphs span two cells; the daemon sends a ' ' spacer in the next cell
+                // (which draws no glyph of its own). The bg quad above is still drawn for both cells.
+                if let Some((uv, cells)) = self.glyph_uv(cell.ch, cell.wide) {
+                    let gw = cw * cells as f32;
                     let (a, b, cc, d) = (
                         (to_ndc(x0, y0), [uv[0], uv[1]]),
-                        (to_ndc(x0 + cw, y0), [uv[2], uv[1]]),
-                        (to_ndc(x0 + cw, y0 + ch), [uv[2], uv[3]]),
+                        (to_ndc(x0 + gw, y0), [uv[2], uv[1]]),
+                        (to_ndc(x0 + gw, y0 + ch), [uv[2], uv[3]]),
                         (to_ndc(x0, y0 + ch), [uv[0], uv[3]]),
                     );
                     // Inactive panes dim their text so the focused pane pops.
@@ -642,7 +689,8 @@ impl Renderer {
         let ch = self.atlas.cell_h as f32;
         let to_ndc = |x: f32, y: f32| [x / fw * 2.0 - 1.0, 1.0 - y / fh * 2.0];
         for (i, c) in s.chars().enumerate() {
-            if let Some(uv) = self.atlas.tile_uv(c) {
+            // Chrome text is monospace (one cell advance) even for wide glyphs, so pass wide=false.
+            if let Some((uv, _cells)) = self.glyph_uv(c, false) {
                 let x0 = x + i as f32 * cw;
                 let corners = [
                     (to_ndc(x0, y), [uv[0], uv[1]]),
@@ -956,13 +1004,6 @@ fn truncate_ellipsis(s: &str, max: usize) -> String {
     let mut t: String = s.chars().take(max - 3).collect();
     t.push_str("...");
     t
-}
-
-fn printable_uv(atlas: &Atlas, cell: &Cell) -> Option<[f32; 4]> {
-    if cell.ch == ' ' || cell.ch == '\0' {
-        return None;
-    }
-    atlas.tile_uv(cell.ch)
 }
 
 const SHADERS: &str = r#"

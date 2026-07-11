@@ -114,7 +114,15 @@ pub enum Call {
     /// [`ResultBody::Notifications`] — one line per tick that produced events. Pane exits arrive in
     /// the same stream as a [`NotifyWire`] with `title == "pane-exited"` and the pane id in `pane`.
     /// The connection stays usable for further requests. Replaces the poll-in-a-loop pattern.
-    Subscribe,
+    ///
+    /// With `output: true` the push stream ALSO carries per-pane damage wires — a [`NotifyWire`]
+    /// with `title == "pane-output"` and the damaged pane's id in `pane`, coalesced to at most one
+    /// per pane per tick — so a rendering client redraws only what changed instead of polling. The
+    /// default (`false`) keeps `gmux subscribe` CLI streams clean.
+    Subscribe {
+        #[serde(default)]
+        output: bool,
+    },
     /// Set the color palette the daemon's terminals resolve grid cells against (fg/bg + the 16
     /// system colors). The GUI sends this once after connecting and on config hot-reload; the
     /// daemon applies it to every existing and future pane. `ansi` shorter than 16 leaves the
@@ -189,7 +197,8 @@ pub struct NotifyWire {
     pub urgency: u8,
 }
 
-/// A cell on the wire (compact; `flags` bit0 bold, bit1 italic, bit2 underline, bit3 inverse).
+/// A cell on the wire (compact; `flags` bit0 bold, bit1 italic, bit2 underline, bit3 inverse,
+/// bit4 wide).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CellWire {
     pub ch: char,
@@ -202,6 +211,9 @@ pub const CELL_BOLD: u8 = 1;
 pub const CELL_ITALIC: u8 = 2;
 pub const CELL_UNDERLINE: u8 = 4;
 pub const CELL_INVERSE: u8 = 8;
+/// A double-width (CJK/emoji) char: it occupies this cell plus the next, which arrives as a blank
+/// spacer (`ch == ' '`, no `CELL_WIDE`).
+pub const CELL_WIDE: u8 = 16;
 
 /// A pane's visible grid for rendering (row-major `cells`, length `cols * rows`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -397,13 +409,14 @@ mod tests {
         }
 
         let grid = ResultBody::Grid(GridWire {
-            cols: 2,
+            cols: 3,
             rows: 1,
             cursor_col: 0,
             cursor_row: 0,
             cells: vec![
                 CellWire { ch: 'h', fg: [255, 255, 255], bg: [0, 0, 0], flags: CELL_BOLD },
-                CellWire { ch: 'i', fg: [10, 20, 30], bg: [1, 2, 3], flags: 0 },
+                CellWire { ch: '中', fg: [10, 20, 30], bg: [1, 2, 3], flags: CELL_WIDE },
+                CellWire { ch: ' ', fg: [10, 20, 30], bg: [1, 2, 3], flags: 0 }, // wide spacer
             ],
             history: 120,
             offset: 25,
@@ -473,13 +486,18 @@ mod tests {
 
     #[test]
     fn subscribe_roundtrips_and_is_kebab_case() {
-        let req = Request { id: 1, call: Call::Subscribe };
-        let mut buf = Vec::new();
-        write_msg(&mut buf, &req).unwrap();
-        let s = String::from_utf8(buf.clone()).unwrap();
-        assert!(s.contains("\"method\":\"subscribe\""), "{s}");
-        let back: Request = read_msg(&mut Cursor::new(buf)).unwrap().unwrap();
-        assert_eq!(back, req);
+        for output in [false, true] {
+            let req = Request { id: 1, call: Call::Subscribe { output } };
+            let mut buf = Vec::new();
+            write_msg(&mut buf, &req).unwrap();
+            let s = String::from_utf8(buf.clone()).unwrap();
+            assert!(s.contains("\"method\":\"subscribe\""), "{s}");
+            let back: Request = read_msg(&mut Cursor::new(buf)).unwrap().unwrap();
+            assert_eq!(back, req);
+        }
+        // Hand-written / old-client JSON: an absent `output` (empty or missing params) defaults false.
+        let req: Request = serde_json::from_str(r#"{"id":2,"method":"subscribe","params":{}}"#).unwrap();
+        assert_eq!(req.call, Call::Subscribe { output: false });
 
         // A pushed event batch is an id:0 Response carrying Notifications.
         let push = Response::ok(0, ResultBody::Notifications(vec![NotifyWire {

@@ -1,20 +1,30 @@
 //! Blocking client to the gmux daemon over the named pipe. The thin-client GUI uses this to fetch
 //! layout/grids for rendering and to send input/control. If no daemon is answering, it spawns one
-//! (`gmux --daemon`) with `CREATE_NO_WINDOW` so the daemon gets a hidden console — required for its
-//! ConPTY panes to bind their stdio (the M0 console-binding finding).
+//! (`gmux --daemon`) as a `DETACHED_PROCESS` with null stdio, so `ensure_console` allocates it a
+//! hidden console — required for its ConPTY panes to bind their stdio (the M0 console-binding
+//! finding; see `spawn_daemon` for why other spawn modes are fatal).
 //!
 //! If the daemon dies mid-session (crash, upgrade, killed), [`DaemonClient::call`] reconnects
 //! transparently — plain reconnect first (the daemon may have restarted on its own), respawn if
 //! nothing is listening — and retries the request once before surfacing the error.
 
+use std::collections::HashSet;
 use std::io::{self, BufReader};
 use std::os::windows::process::CommandExt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gmux_pipe::PipeStream;
-use gmux_proto::{read_msg, write_msg, Call, Request, Response, ResultBody};
+use gmux_proto::{read_msg, write_msg, Call, NotifyWire, Request, Response, ResultBody};
+use winit::event_loop::EventLoopProxy;
 
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// `DETACHED_PROCESS`: the daemon starts with NO console, so `gmux_pty::ensure_console` takes
+/// its AllocConsole path (hidden console + std handles repointed) — the configuration ConPTY
+/// binding was designed around. `CREATE_NO_WINDOW` combined with null/redirected stdio was
+/// empirically fatal: the daemon's ConPTY children died instantly (spawn-mode matrix, round 4).
+const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 pub struct DaemonClient {
     reader: BufReader<PipeStream>,
@@ -88,6 +98,63 @@ impl DaemonClient {
     }
 }
 
+/// Spawn a background thread that opens its OWN pipe connection, registers as an output-carrying
+/// push subscriber (`Subscribe { output: true }`), and streams event batches forever. Per batch it:
+/// forwards real notifications to `toasts` (for the main thread to render), records the ids of
+/// panes that emitted output (`title == "pane-output"`) into `damaged`, and wakes the winit loop
+/// via `proxy`. The returned flag flips to `false` when the thread exits (pipe EOF / error), so the
+/// caller can respawn it after a daemon reconnect. ponytail: no join handle — a dead thread is
+/// detected by the flag and replaced; the OS reaps it.
+pub fn spawn_output_subscriber(
+    proxy: EventLoopProxy<()>,
+    damaged: Arc<Mutex<HashSet<u64>>>,
+    toasts: Sender<NotifyWire>,
+) -> Arc<AtomicBool> {
+    let alive = Arc::new(AtomicBool::new(true));
+    let flag = alive.clone();
+    std::thread::spawn(move || {
+        run_subscriber(&proxy, &damaged, &toasts);
+        flag.store(false, Ordering::Relaxed); // EOF/error: signal the main loop to respawn us
+    });
+    alive
+}
+
+/// The subscriber read loop; returns on pipe EOF or any protocol/I/O error.
+fn run_subscriber(proxy: &EventLoopProxy<()>, damaged: &Mutex<HashSet<u64>>, toasts: &Sender<NotifyWire>) {
+    let name = gmux_pipe::pipe_name_for_user("gmux");
+    let Ok(stream) = gmux_pipe::client_connect(&name) else { return };
+    let Ok(mut writer) = stream.try_clone() else { return };
+    let mut reader = BufReader::new(stream);
+    if write_msg(&mut writer, &Request { id: 1, call: Call::Subscribe { output: true } }).is_err() {
+        return;
+    }
+    loop {
+        let resp = match read_msg::<Response>(&mut reader) {
+            Ok(Some(r)) => r,
+            _ => return, // clean EOF or error: die; the caller respawns us
+        };
+        if let Some(ResultBody::Notifications(notes)) = resp.result {
+            let mut hits: Vec<u64> = Vec::new();
+            for n in notes {
+                if n.title == "pane-output" {
+                    hits.push(n.pane); // a damage wire: this pane produced output
+                } else {
+                    let _ = toasts.send(n); // a real notification: toast it on the main thread
+                }
+            }
+            if !hits.is_empty() {
+                if let Ok(mut d) = damaged.lock() {
+                    d.extend(hits);
+                }
+            }
+        }
+        // Wake the main loop for every batch (damage or notification) so it re-renders / toasts.
+        if proxy.send_event(()).is_err() {
+            return; // the event loop is gone
+        }
+    }
+}
+
 /// Whether re-sending `call` after an ambiguous failure is safe. Read-only queries and
 /// absolute-geometry reports are; anything that types, creates, closes, toggles, or moves focus
 /// is not — the daemon may have applied the first send before the connection broke.
@@ -124,7 +191,13 @@ fn spawn_daemon() {
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::process::Command::new(exe)
             .arg("--daemon")
-            .creation_flags(CREATE_NO_WINDOW)
+            .creation_flags(DETACHED_PROCESS)
+            // Null stdio, never inherit: a GUI launched with redirected/broken handles would
+            // pass them to the daemon, whose ConPTY panes then die instantly (daemon exits
+            // "all panes exited" -> GUI reconnect churn -> fatal exit).
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn();
     }
 }
