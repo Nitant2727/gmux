@@ -297,6 +297,11 @@ impl Pane {
         self.terminal.lock().unwrap().history_len()
     }
 
+    /// Whether the pane's application enabled bracketed paste (DECSET 2004).
+    pub fn bracketed_paste(&self) -> bool {
+        self.terminal.lock().unwrap().bracketed_paste()
+    }
+
     /// Re-theme this pane's terminal (fg/bg + the 16 system colors). Takes `&self` — the terminal
     /// is behind an `Arc<Mutex>`, so a shared pane ref suffices; the next snapshot reflects it.
     pub fn set_palette(&self, palette: Palette) {

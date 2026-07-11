@@ -270,6 +270,12 @@ impl Terminal {
         self.cells_at_offset(0)
     }
 
+    /// Whether the application enabled bracketed paste (DECSET 2004) — pasted text should then
+    /// be wrapped in `ESC[200~` / `ESC[201~` so the shell treats it as literal input.
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
+    }
+
     /// Number of scrollback (history) lines currently retained above the viewport.
     pub fn history_len(&self) -> usize {
         self.term.grid().history_size()

@@ -281,16 +281,19 @@ impl Server {
                 Some(p) => Response::ok(id, ResultBody::Grid(grid_wire(p, *offset))),
                 None => Response::err(id, format!("no pane %{pane}")),
             },
-            Call::ResizeView { w, h, cell_w, cell_h, pane_chrome } => {
+            Call::ResizeView { w, h, cell_w, cell_h, pane_chrome, pane_chrome_y } => {
                 self.last_view = (*w, *h);
                 let (cw, ch) = ((*cell_w).max(1), (*cell_h).max(1));
+                // Vertical chrome includes the title strip; a zero (old client) falls back to the
+                // horizontal chrome so rows aren't left oversized.
+                let chrome_y = if *pane_chrome_y != 0 { *pane_chrome_y } else { *pane_chrome };
                 if let Some(win) = self.session.active_window() {
                     for (pid, rect) in win.layout_rects(*w, *h) {
                         if let Some(p) = win.pane(pid) {
                             // Grids fit the VISIBLE cell area: the GUI draws margins/borders/
-                            // insets inside each rect, so those pixels can't hold cells.
+                            // insets/title-strip inside each rect, so those pixels can't hold cells.
                             let cols = (rect.w.saturating_sub(*pane_chrome) / cw).max(1) as u16;
-                            let rows = (rect.h.saturating_sub(*pane_chrome) / ch).max(1) as u16;
+                            let rows = (rect.h.saturating_sub(chrome_y) / ch).max(1) as u16;
                             let _ = p.resize(PtySize { cols, rows });
                         }
                     }
@@ -368,6 +371,10 @@ impl Server {
             }
             Call::FocusPaneId { pane } => {
                 self.session.focus_pane(PaneId(*pane));
+                Response::ok(id, ResultBody::Done)
+            }
+            Call::MoveWindow { from, to } => {
+                self.session.move_window(*from, *to);
                 Response::ok(id, ResultBody::Done)
             }
             Call::PollNotifications => {
@@ -453,6 +460,7 @@ impl Server {
                             h: r.h,
                             active: pid == active,
                             attention: p.attention().is_pending(),
+                            title: pane_title(p, pid.0),
                         })
                     })
                     .collect();
@@ -493,6 +501,19 @@ impl Server {
     }
 }
 
+/// The short title for a pane's title strip: its terminal title (OSC 0/2) if set, else the short
+/// name of its cwd, else the `%id` fallback so the strip is never blank.
+fn pane_title(p: &Pane, id: u64) -> String {
+    let title = p.title();
+    if !title.is_empty() {
+        return title;
+    }
+    if let Some(name) = p.cwd().as_deref().map(gmux_mux::workspace::cwd_name).filter(|s| !s.is_empty()) {
+        return name;
+    }
+    format!("%{id}")
+}
+
 /// Aggregate a window's per-pane progress into the sidebar's `(progress, error)` pair: an Error in
 /// any pane wins (returns `error = true`); otherwise `progress` is the lowest pct among Set panes
 /// (the least-done agent). Indeterminate/Paused panes count as active but report no pct, so a window
@@ -524,6 +545,7 @@ fn window_progress(
 /// snapshot, history depth, and clamped offset are read under one terminal lock so they can't
 /// skew against each other while the pump thread appends output.
 fn grid_wire(p: &Pane, offset: usize) -> GridWire {
+    let bracketed_paste = p.bracketed_paste();
     let (snap, history, offset) = p.snapshot_scrolled(offset);
     let mut cells = Vec::with_capacity(snap.cols as usize * snap.rows as usize);
     for row in &snap.cells {
@@ -557,6 +579,7 @@ fn grid_wire(p: &Pane, offset: usize) -> GridWire {
         cells,
         history: history as u32,
         offset: offset as u32,
+        bracketed_paste,
     }
 }
 
@@ -874,7 +897,7 @@ mod tests {
         session.pane(ida).unwrap().push_output(b"\x1b]9;4;1;42\x07");
         session.pane(idb).unwrap().push_output(b"\x1b]9;4;1;80\x07");
         let mut progress: HashMap<PaneId, (ProgressState, Option<u8>)> = HashMap::new();
-        let mut drain = |progress: &mut HashMap<PaneId, (ProgressState, Option<u8>)>| {
+        let drain = |progress: &mut HashMap<PaneId, (ProgressState, Option<u8>)>| {
             for w in session.windows() {
                 for p in w.panes() {
                     for ev in p.drain_events() {
@@ -940,6 +963,19 @@ mod tests {
         assert!(!persist_screen_from_json("\u{feff}{\"persist_screen\": false}"), "BOM is stripped");
         // A non-bool value is ignored (defaults true), not coerced.
         assert!(persist_screen_from_json(r#"{"persist_screen": "no"}"#));
+    }
+
+    /// `pane_title` never returns blank: it falls back to `%id` with no title/cwd, and an OSC 2
+    /// title wins once set. (cwd fallback needs OSC 7 plumbing; the never-blank guarantee is the
+    /// point.) Uses a console-free remote pane, so it runs under the default headless `cargo test`.
+    #[test]
+    fn pane_title_falls_back_then_prefers_osc_title() {
+        use gmux_mux::Pane;
+        let p = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        let id = p.id.0;
+        assert_eq!(pane_title(&p, id), format!("%{id}"), "blank title/cwd -> %id fallback");
+        p.push_output(b"\x1b]2;my-title\x07"); // OSC 2 sets the terminal title synchronously
+        assert_eq!(pane_title(&p, id), "my-title");
     }
 
     /// A pane exit is encoded on the subscribe stream as a `NotifyWire` with the reserved

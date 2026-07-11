@@ -54,7 +54,7 @@ fn server_owns_pane_and_serves_protocol() {
     assert_eq!(grid.cells.len(), grid.cols as usize * grid.rows as usize, "grid cell count");
 
     // ResizeView + FocusPane are accepted.
-    assert!(s.handle(&Request { id: 12, call: Call::ResizeView { w: 800, h: 400, cell_w: 9, cell_h: 18, pane_chrome: 34 } }).error.is_none());
+    assert!(s.handle(&Request { id: 12, call: Call::ResizeView { w: 800, h: 400, cell_w: 9, cell_h: 18, pane_chrome: 34, pane_chrome_y: 56 } }).error.is_none());
     assert!(s.handle(&Request { id: 13, call: Call::FocusPane { dir: "right".into() } }).error.is_none());
 
     // send-keys into the original pane, then capture its screen.

@@ -38,6 +38,7 @@ const ACCENT_BAR_W: f32 = 3.0; // active-row left-edge bar
 const ATTN_DOT: f32 = 8.0;
 const RADIUS: f32 = 6.0; // rounded corner radius for sidebar rows + pane chrome
 const BADGE_RADIUS: f32 = 4.0; // scroll badge chip
+const TITLE_STRIP: f32 = 22.0; // pane title band inside the border, above the cells
 
 const fn clear_of(c: Rgb) -> wgpu::Color {
     wgpu::Color { r: c.r as f64 / 255.0, g: c.g as f64 / 255.0, b: c.b as f64 / 255.0, a: 1.0 }
@@ -69,6 +70,11 @@ pub struct PaneView<'a> {
     pub rect: Rect,
     /// Scrollback offset: 0 = live tail; >0 draws a '+{n}' badge top-right of the pane.
     pub scrolled: u32,
+    /// Title shown in the pane's title strip (daemon-provided; short cwd / pane name).
+    pub title: String,
+    /// Selected cell range `((start_col,start_row),(end_col,end_row))`, normalized start<=end in
+    /// reading order, in viewport cell coords. Those cells get fg/bg swapped + an ACCENT tint.
+    pub selection: Option<((u16, u16), (u16, u16))>,
 }
 
 /// One workspace (window/tab) row in the sidebar.
@@ -412,6 +418,7 @@ impl Renderer {
         px_w: u32,
         px_h: u32,
         draw_border: bool,
+        selection: Option<((u16, u16), (u16, u16))>,
     ) -> (Vec<BgVertex>, Vec<GlyphVertex>) {
         let cw = self.atlas.cell_w as f32;
         let ch = self.atlas.cell_h as f32;
@@ -434,8 +441,15 @@ impl Renderer {
                 let x0 = c as f32 * cw;
                 let y0 = r as f32 * ch;
                 let is_cursor = c as u16 == cursor_col && r as u16 == cursor_row;
+                // Selection: swap fg/bg and tint the (swapped) bg 30% toward ACCENT so the
+                // highlight reads over any content (blank cells, dark-on-dark, etc.).
+                let (mut cell_bg, mut cell_fg) = (cell.bg, cell.fg);
+                if in_selection(selection, r, c) {
+                    std::mem::swap(&mut cell_bg, &mut cell_fg);
+                    cell_bg = blend(ACCENT, cell_bg, 0.3);
+                }
                 // Cursor: pre-blend at ~70% over the cell bg (opaque bg pipeline can't alpha-blend).
-                let bg_color = if is_cursor { blend(CURSOR, cell.bg, 0.7) } else { cell.bg };
+                let bg_color = if is_cursor { blend(CURSOR, cell_bg, 0.7) } else { cell_bg };
                 push_quad(&mut bg, x0, y0, x0 + cw, y0 + ch, rgba(bg_color));
 
                 if let Some(uv) = printable_uv(&self.atlas, cell) {
@@ -446,7 +460,7 @@ impl Renderer {
                         (to_ndc(x0, y0 + ch), [uv[0], uv[3]]),
                     );
                     // Inactive panes dim their text so the focused pane pops.
-                    let mut fg = rgba(cell.fg);
+                    let mut fg = rgba(cell_fg);
                     if !active {
                         for ch in fg.iter_mut().take(3) {
                             *ch *= 0.8;
@@ -484,7 +498,15 @@ impl Renderer {
     ) {
         self.render_panes(
             view,
-            &[PaneView { snap, attention, active: true, rect: Rect { x: 0, y: 0, w: px_w, h: px_h }, scrolled: 0 }],
+            &[PaneView {
+                snap,
+                attention,
+                active: true,
+                rect: Rect { x: 0, y: 0, w: px_w, h: px_h },
+                scrolled: 0,
+                title: String::new(),
+                selection: None,
+            }],
             px_w,
             px_h,
         );
@@ -510,6 +532,7 @@ impl Renderer {
                 pv.rect.w.max(1),
                 pv.rect.h.max(1),
                 true,
+                pv.selection,
             );
             draws.push(Draw {
                 rect: pv.rect,
@@ -577,6 +600,12 @@ impl Renderer {
     /// of the full rect (cells were silently scissored off otherwise).
     pub fn pane_chrome_px(&self) -> u32 {
         (2.0 * (MARGIN + BORDER + INSET)) as u32
+    }
+
+    /// Vertical chrome around a pane's cell area: [`pane_chrome_px`] plus the 22px title strip.
+    /// The GUI reports this to the daemon so rows are sized to the cell area *below* the strip.
+    pub fn pane_chrome_y_px(&self) -> u32 {
+        (2.0 * (MARGIN + BORDER) + INSET * 2.0 + TITLE_STRIP) as u32
     }
 
     /// Map a y coordinate (px, window space) to a sidebar row index — the single source of truth
@@ -754,25 +783,49 @@ impl Renderer {
             push_rounded(&mut srd, cx, cy, cx + cw_, cy + ch_, RADIUS, rgba(bc), fw, fh);
             push_rounded(&mut srd, cx + bw, cy + bw, cx + cw_ - bw, cy + ch_ - bw, (RADIUS - bw).max(0.0), rgba(BG_PANE), fw, fh);
 
-            // Scroll badge: '+{n}' chip top-right inside the pane (drawn later, above the cells).
+            // Title strip: a TITLE_STRIP-tall BG_SIDEBAR band inside the border. First quad rounds
+            // the top corners (radius RADIUS-bw); the second (radius 0) squares off the bottom edge
+            // where it meets the cell area. Active pane gets an ACCENT dot before the title text.
+            let (sx0, sx1) = (cx + bw, cx + cw_ - bw);
+            let (sy0, sy1) = (cy + bw, cy + bw + TITLE_STRIP);
+            let sr = (RADIUS - bw).max(0.0);
+            push_rounded(&mut srd, sx0, sy0, sx1, sy1, sr, rgba(BG_SIDEBAR), fw, fh);
+            push_rounded(&mut srd, sx0, sy0 + sr, sx1, sy1, 0.0, rgba(BG_SIDEBAR), fw, fh);
+            let ty = (sy0 + (TITLE_STRIP - ch_cell) / 2.0).max(sy0);
+            let mut tx = sx0 + 12.0;
+            if pv.active {
+                let dot = 6.0;
+                let dy = sy0 + (TITLE_STRIP - dot) / 2.0;
+                push_rounded(&mut srd, tx, dy, tx + dot, dy + dot, dot / 2.0, rgba(ACCENT), fw, fh);
+                tx += dot + 5.0;
+            }
+            let max_chars = ((sx1 - 8.0 - tx).max(0.0) / cw_cell) as usize;
+            let title = truncate_ellipsis(&pv.title, max_chars);
+            if !title.is_empty() {
+                self.text_run(&title, tx, ty, rgba(TEXT_DIM), fw, fh, &mut sgl);
+            }
+
+            // Scroll badge: '+{n}' chip top-right inside the pane, below the title strip (drawn
+            // later, above the cells).
             if pv.scrolled > 0 {
                 let label = format!("+{}", pv.scrolled);
                 let (bpx, bpy) = (4.0, 2.0);
                 let bw_chip = label.chars().count() as f32 * cw_cell + 2.0 * bpx;
                 let bh_chip = ch_cell + 2.0 * bpy;
                 let br = cx + cw_ - bw - 4.0;
-                let bt = cy + bw + 4.0;
+                let bt = cy + bw + TITLE_STRIP + 4.0;
                 push_rounded(&mut obg, br - bw_chip, bt, br, bt + bh_chip, BADGE_RADIUS, rgba(BG_SIDEBAR), fw, fh);
                 self.text_run(&label, br - bw_chip + bpx, bt + bpy, rgba(ACCENT), fw, fh, &mut ogl);
             }
 
-            // Cell area: inset INSET inside the border. Cells draw at fixed size from its top-left;
-            // the viewport clips overflow, the BG_PANE fill shows through any remainder.
+            // Cell area: inset INSET on the sides and bottom, and below the title strip on top.
+            // Cells draw at fixed size from its top-left; the viewport clips overflow, the BG_PANE
+            // fill shows through any remainder.
             let pad = bw + INSET;
-            let (ix, iy) = (cx + pad, cy + pad);
-            let (iw, ih) = ((cw_ - 2.0 * pad).max(1.0), (ch_ - 2.0 * pad).max(1.0));
+            let (ix, iy) = (cx + pad, cy + bw + TITLE_STRIP + INSET);
+            let (iw, ih) = ((cw_ - 2.0 * pad).max(1.0), (ch_ - bw - TITLE_STRIP - INSET - pad).max(1.0));
             let (bg, glyphs) =
-                self.build_vertices(pv.snap, pv.attention, pv.active, iw as u32, ih as u32, false);
+                self.build_vertices(pv.snap, pv.attention, pv.active, iw as u32, ih as u32, false, pv.selection);
             draws.push(Draw {
                 rect: Rect { x: ix as u32, y: iy as u32, w: iw as u32, h: ih as u32 },
                 bg_n: bg.len() as u32,
@@ -878,6 +931,31 @@ impl Renderer {
         }
         self.queue.submit([enc.finish()]);
     }
+}
+
+/// Reading-order (row-major) hit-test: is cell (row `r`, col `c`) inside the selection range?
+/// `sel` is `((start_col,start_row),(end_col,end_row))`, normalized start<=end in reading order.
+fn in_selection(sel: Option<((u16, u16), (u16, u16))>, r: usize, c: usize) -> bool {
+    match sel {
+        Some(((sc, sr), (ec, er))) => {
+            let pos = (r as u16, c as u16);
+            pos >= (sr, sc) && pos <= (er, ec)
+        }
+        None => false,
+    }
+}
+
+/// Truncate `s` to at most `max` display cells, appending "..." when it would overflow.
+fn truncate_ellipsis(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    if max <= 3 {
+        return s.chars().take(max).collect();
+    }
+    let mut t: String = s.chars().take(max - 3).collect();
+    t.push_str("...");
+    t
 }
 
 fn printable_uv(atlas: &Atlas, cell: &Cell) -> Option<[f32; 4]> {

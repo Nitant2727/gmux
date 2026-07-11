@@ -21,6 +21,12 @@ use crate::daemon_client::DaemonClient;
 use crate::renderer::{PaneView, SidebarRow};
 use crate::Renderer;
 
+// The Windows clipboard helper lives in its own file but is declared here (a child of `app`) so the
+// crate root (`lib.rs`, owned by the renderer task) needs no edit. ponytail: `#[path]` over a
+// `lib.rs` mod line, to avoid touching a file another task is editing.
+#[path = "clipboard.rs"]
+mod clipboard;
+
 /// Fallback font size when `config.font_px` is unset.
 const DEFAULT_FONT_PX: f32 = 18.0;
 /// Theme defaults (match the renderer's baked-in look): sidebar text and window background.
@@ -34,6 +40,14 @@ const RESIZE_THROTTLE: Duration = Duration::from_millis(33); // ~30 resize sends
 /// design token (owned by the other task) so the divider hit-test can grab that visible band — if
 /// it changes there, mirror it here.
 const GAP: f32 = 4.0;
+// Pane-chrome design tokens, mirrored from renderer.rs (owned by the other task) so mouse
+// selection maps pixels to the SAME cell grid the renderer draws. ponytail: duplicated constants,
+// not a shared module — a handful of numbers; if they change in the renderer, mirror them here.
+// The cell area origin is `rect + margin + BORDER + (INSET, TITLE_STRIP+INSET)`; see `pixel_to_cell`.
+const MARGIN: f32 = 8.0; // outer margin at a content boundary (GAP/2 at an interior split edge)
+const BORDER: f32 = 1.0; // pane border (the 2px attention ring is ignored — 1px error at most)
+const INSET: f32 = 8.0; // cell-area inset inside the border
+const TITLE_STRIP: f32 = 22.0; // title band inside the border, above the cells
 
 // Sidebar row hit-test metrics. ponytail: hardcoded here to mirror the renderer's design tokens
 // (16px top padding, ~20px "WORKSPACES" section label, 48px rows, 4px gaps). The renderer (owned by
@@ -129,6 +143,90 @@ fn divider_at(panes: &[PaneRectWire], cx: f32, cy: f32, tol: f32) -> Option<Divi
     None
 }
 
+/// A text selection in one pane: an anchor cell and the dragged-to cell, both in viewport cell
+/// coords. Kept un-normalized (start = the press cell); `normalize_selection` orders them for
+/// rendering and copy.
+struct Selection {
+    pane: u64,
+    start: (u16, u16),
+    end: (u16, u16),
+}
+
+/// A sidebar row press that may become a tab reorder once the cursor moves past the threshold.
+struct SidebarDrag {
+    from_row: usize,
+    start_y: f64,
+    reordering: bool,
+}
+
+/// Map a physical pixel `(px, py)` (window coords) to a `(col, row)` cell in a pane whose `rect` is
+/// in WINDOW coords (sidebar offset already applied). Mirrors the renderer's per-pane chrome layout
+/// exactly (margin/gap edges + border + title strip + inset), then clamps to the visible cell grid.
+/// Pure, so unit-tested. ponytail: assumes the 1px border, not the 2px attention ring — a 1px error
+/// at most, and selection lives on the focused pane, which has attention cleared.
+fn pixel_to_cell(
+    px: f32,
+    py: f32,
+    rect: Rect,
+    sidebar_w: u32,
+    surf_w: u32,
+    surf_h: u32,
+    cell_w: u32,
+    cell_h: u32,
+) -> (u16, u16) {
+    let (ox, oy, ow, oh) = (rect.x as f32, rect.y as f32, rect.w as f32, rect.h as f32);
+    let l = if rect.x <= sidebar_w { MARGIN } else { GAP / 2.0 };
+    let t = if rect.y == 0 { MARGIN } else { GAP / 2.0 };
+    let rgt = if rect.x + rect.w >= surf_w { MARGIN } else { GAP / 2.0 };
+    let bot = if rect.y + rect.h >= surf_h { MARGIN } else { GAP / 2.0 };
+    let ix = ox + l + BORDER + INSET;
+    let iy = oy + t + BORDER + TITLE_STRIP + INSET;
+    let iw = (ow - l - rgt - 2.0 * BORDER - 2.0 * INSET).max(cell_w as f32);
+    let ih = (oh - t - bot - 2.0 * BORDER - TITLE_STRIP - 2.0 * INSET).max(cell_h as f32);
+    let cols = (iw / cell_w as f32).floor().max(1.0);
+    let rows = (ih / cell_h as f32).floor().max(1.0);
+    let col = ((px - ix) / cell_w as f32).floor().clamp(0.0, cols - 1.0);
+    let row = ((py - iy) / cell_h as f32).floor().clamp(0.0, rows - 1.0);
+    (col as u16, row as u16)
+}
+
+/// Order a selection's two endpoints into reading order (row-major), so `start <= end`. Matches the
+/// renderer's `PaneView.selection` contract.
+fn normalize_selection(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+    // Compare by (row, col): a cell earlier in reading order sorts first.
+    if (a.1, a.0) <= (b.1, b.0) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Rebuild the selected text from a grid. `start`/`end` are normalized (reading order) inclusive
+/// viewport cells. Rows join with CRLF (the Windows clipboard convention); each row is trimmed of
+/// trailing spaces. Indices are clamped to the grid so a stale selection can't panic. Pure/tested.
+fn grid_selection_text(grid: &GridWire, start: (u16, u16), end: (u16, u16)) -> String {
+    let cols = grid.cols as usize;
+    let rows = grid.rows as usize;
+    if cols == 0 || rows == 0 {
+        return String::new();
+    }
+    let (r0, r1) = (start.1 as usize, (end.1 as usize).min(rows.saturating_sub(1)));
+    let mut out: Vec<String> = Vec::new();
+    for r in r0..=r1.min(rows - 1) {
+        // First row starts at start.col; last row ends at end.col; middle rows span the full width.
+        let c_start = if r == start.1 as usize { start.0 as usize } else { 0 };
+        let c_end = if r == end.1 as usize { end.0 as usize } else { cols - 1 };
+        let (c_start, c_end) = (c_start.min(cols - 1), c_end.min(cols - 1));
+        let mut line = String::new();
+        for c in c_start..=c_end {
+            line.push(grid.cells.get(r * cols + c).map(|cell| cell.ch).unwrap_or(' '));
+        }
+        line.truncate(line.trim_end_matches(' ').len());
+        out.push(line);
+    }
+    out.join("\r\n")
+}
+
 struct State {
     window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -145,6 +243,12 @@ struct State {
     cursor: (f64, f64),
     /// In-progress divider drag (mouse-down on a split gap), or `None`.
     drag: Option<Drag>,
+    /// Current pane text selection (rendered highlighted; copied on release / Ctrl+Shift+C).
+    selection: Option<Selection>,
+    /// True while a left-drag is actively building `selection` (press inside a pane's cell area).
+    sel_dragging: bool,
+    /// A sidebar row press that may turn into a tab reorder, or `None`.
+    sidebar_drag: Option<SidebarDrag>,
     /// The active window's pane rectangles from the last rendered layout (content-area coords, i.e.
     /// before the sidebar-width offset), cached each frame for mouse hit-testing.
     last_panes: Vec<PaneRectWire>,
@@ -158,6 +262,8 @@ struct State {
     scroll_offset: usize,
     scroll_history: usize,
     active_rows: usize,
+    /// Whether the active pane's app enabled bracketed paste (from the last GetGrid).
+    active_bracketed: bool,
     heartbeat_ticks: u32,
     // Config-driven keybindings + the last config mtime we loaded, for hot-reload.
     keymap: Keymap,
@@ -263,6 +369,9 @@ impl ApplicationHandler for App {
             hwnd,
             cursor: (0.0, 0.0),
             drag: None,
+            selection: None,
+            sel_dragging: false,
+            sidebar_drag: None,
             last_panes: Vec::new(),
             tab_count: 0,
             notifier,
@@ -271,6 +380,7 @@ impl ApplicationHandler for App {
             scroll_offset: 0,
             scroll_history: 0,
             active_rows: 0,
+            active_bracketed: false,
             heartbeat_ticks: 0,
             keymap,
             font_px,
@@ -309,9 +419,12 @@ impl ApplicationHandler for App {
             WindowEvent::CursorLeft { .. } => {
                 if let Some(st) = self.state.as_mut() {
                     // Park the cursor off-window so hover highlights clear, and end any drag —
-                    // stale hover otherwise stays lit until the cursor re-enters.
+                    // stale hover otherwise stays lit until the cursor re-enters. The selection
+                    // highlight itself is kept (still copyable via Ctrl+Shift+C).
                     st.cursor = (-1.0, -1.0);
                     st.drag = None;
+                    st.sel_dragging = false;
+                    st.sidebar_drag = None;
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -327,7 +440,7 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
                 if let Some(st) = self.state.as_mut() {
-                    st.drag = None; // end any divider drag
+                    st.on_release();
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -428,17 +541,35 @@ impl App {
         let mods = self.mods;
         let Some(st) = self.state.as_mut() else { return false };
 
+        // Ctrl+Shift+C copies the active selection (hardcoded — not a rebindable action, and it
+        // must run before the "any key clears the selection" step below).
+        if mods == (ModifiersState::CONTROL | ModifiersState::SHIFT)
+            && matches!(&event.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("c"))
+        {
+            st.copy_selection();
+            st.clear_selection();
+            return true;
+        }
+
+        // Any other key press dismisses a pending selection before the key is handled.
+        let had_selection = st.selection.is_some();
+        st.clear_selection();
+
         if let Some(action) = st.keymap.action(mods, &event.logical_key) {
             st.dispatch(action);
             return true;
         }
 
         // Escape while scrolled snaps back to live (not a rebindable action; consumed here so the
-        // pane never sees it).
+        // pane never sees it). Escape that only dismissed a selection is likewise consumed, so it
+        // isn't also forwarded to the pane.
         if let Key::Named(NamedKey::Escape) = &event.logical_key {
             if st.scroll_offset > 0 {
                 st.scroll_offset = 0;
                 st.window.request_redraw();
+                return true;
+            }
+            if had_selection {
                 return true;
             }
         }
@@ -489,6 +620,37 @@ impl State {
             }
             Action::ScrollPageUp => self.scroll_page(1),
             Action::ScrollPageDown => self.scroll_page(-1),
+            Action::Paste => {
+                if let Some(text) = clipboard::get_text(self.hwnd) {
+                    // Terminals expect a bare CR for Enter; normalize CRLF (Windows) then any
+                    // remaining lone LF (Unix clipboards).
+                    let text = text.replace("\r\n", "\r").replace('\n', "\r");
+                    // When the app enabled bracketed paste (DECSET 2004), wrap the text so the
+                    // shell treats it as one literal paste instead of executing each line.
+                    let text = if self.paste_is_bracketed() {
+                        format!("\x1b[200~{text}\x1b[201~")
+                    } else {
+                        text
+                    };
+                    // The pipe rejects lines over MAX_LINE (1 MiB) and JSON escaping inflates
+                    // further -- chunk huge pastes into multiple SendKeys instead of losing them.
+                    const CHUNK: usize = 64 * 1024;
+                    let mut rest = text.as_str();
+                    while !rest.is_empty() {
+                        let mut cut = rest.len().min(CHUNK);
+                        while !rest.is_char_boundary(cut) {
+                            cut -= 1;
+                        }
+                        let (piece, tail) = rest.split_at(cut);
+                        self.client.control(Call::SendKeys {
+                            pane: self.active_pane,
+                            text: piece.to_string(),
+                            enter: false,
+                        });
+                        rest = tail;
+                    }
+                }
+            }
         }
         self.window.request_redraw();
     }
@@ -543,10 +705,11 @@ impl State {
         }
     }
 
-    /// Handle a left click: in the sidebar, the '+' row opens a new tab and a workspace row selects
-    /// that window; in the content area, a split-gap starts a divider drag and anything else focuses
-    /// the pane. Uses the renderer's row metrics for the sidebar and the last rendered layout
-    /// (cached in `render`) for pane / divider hit-testing.
+    /// Handle a left press: in the sidebar, the '+' row opens a new tab and a workspace row selects
+    /// that window (and arms a possible tab reorder); in the content area, a split-gap starts a
+    /// divider drag and a press inside a pane's cell area starts a text selection (a release without
+    /// movement becomes a plain focus, see [`State::on_release`]). Uses the renderer's row metrics
+    /// for the sidebar and the last rendered layout (cached in `render`) for pane / divider tests.
     fn on_click(&mut self) {
         let (cx, cy) = self.cursor;
         if cx < 0.0 || cy < 0.0 {
@@ -555,6 +718,7 @@ impl State {
         let (sidebar_w, _, _) = self.areas();
         let (px, py) = (cx as u32, cy as u32);
         if px < sidebar_w {
+            self.clear_selection();
             // The '+' new-tab row sits after the last workspace row, so test it first.
             if self.renderer.sidebar_new_tab_at(cy as f32, self.tab_count) {
                 self.scroll_offset = 0;
@@ -564,14 +728,17 @@ impl State {
             } else if let Some(idx) = self.renderer.sidebar_row_at(cy as f32, self.tab_count) {
                 self.scroll_offset = 0;
                 self.client.control(Call::SelectWindow { index: idx });
+                // Arm a tab reorder: a >8px vertical drag before release turns into a MoveWindow.
+                self.sidebar_drag = Some(SidebarDrag { from_row: idx, start_y: cy, reordering: false });
                 self.window.request_redraw();
             }
             return;
         }
         // Content area: cached rects are in content-area coords, so shift the click by the sidebar.
         let content_x = cx - sidebar_w as f64;
-        // A split gap starts a drag-resize instead of focusing a pane.
+        // A split gap starts a drag-resize instead of a selection/focus.
         if let Some(d) = divider_at(&self.last_panes, content_x as f32, cy as f32, GAP + 2.0) {
+            self.clear_selection();
             self.drag = Some(Drag {
                 pane: d.pane,
                 vertical: d.vertical,
@@ -582,22 +749,37 @@ impl State {
             });
             return;
         }
+        // Inside a pane: anchor a selection at the pressed cell. Focus is deferred to release.
         let cxp = content_x as u32;
         let hit = self
             .last_panes
             .iter()
             .find(|p| cxp >= p.x && cxp < p.x + p.w && py >= p.y && py < p.y + p.h)
-            .map(|p| p.id);
-        if let Some(pane) = hit {
-            self.scroll_offset = 0;
-            self.client.control(Call::FocusPaneId { pane });
+            .cloned();
+        if let Some(pr) = hit {
+            let (cw, ch) = self.cell_dims();
+            let rect = Rect { x: pr.x + sidebar_w, y: pr.y, w: pr.w, h: pr.h };
+            let cell = pixel_to_cell(cx as f32, cy as f32, rect, sidebar_w, self.config.width, self.config.height, cw, ch);
+            self.selection = Some(Selection { pane: pr.id, start: cell, end: cell });
+            self.sel_dragging = true;
             self.window.request_redraw();
         }
     }
 
-    /// While a divider drag is active, convert the accumulated pixel motion into a fractional split
-    /// ratio delta and send a throttled `ResizeSplit`. No-op when not dragging.
+    /// Route cursor motion to the active interaction: extend a text selection, promote a sidebar
+    /// press to a tab reorder past the drag threshold, or (a divider drag) throttle a `ResizeSplit`.
     fn on_cursor_moved(&mut self) {
+        if self.sel_dragging {
+            self.extend_selection_to_cursor();
+            return;
+        }
+        let cy = self.cursor.1;
+        if let Some(sd) = self.sidebar_drag.as_mut() {
+            if !sd.reordering && (cy - sd.start_y).abs() > 8.0 {
+                sd.reordering = true; // no visual feedback required; MoveWindow fires on release
+            }
+            return;
+        }
         let now = Instant::now();
         let (cx, cy) = self.cursor;
         let sent = {
@@ -623,6 +805,83 @@ impl State {
         self.window.request_redraw();
     }
 
+    /// Extend the in-progress selection to the cursor's cell within the selection's pane, clamped
+    /// to that pane's grid. Requests a redraw when the end cell changed.
+    fn extend_selection_to_cursor(&mut self) {
+        let (cx, cy) = self.cursor;
+        let (sidebar_w, _, _) = self.areas();
+        let (cw, ch) = self.cell_dims();
+        let (surf_w, surf_h) = (self.config.width, self.config.height);
+        let Some(pane) = self.selection.as_ref().map(|s| s.pane) else { return };
+        // Copy the pane rect out before mutating `selection` (both borrow `self`).
+        let Some(pr) = self.last_panes.iter().find(|p| p.id == pane).cloned() else { return };
+        let rect = Rect { x: pr.x + sidebar_w, y: pr.y, w: pr.w, h: pr.h };
+        let cell = pixel_to_cell(cx as f32, cy as f32, rect, sidebar_w, surf_w, surf_h, cw, ch);
+        if let Some(sel) = self.selection.as_mut() {
+            if sel.end != cell {
+                sel.end = cell;
+                self.window.request_redraw();
+            }
+        }
+    }
+
+    /// Finish whatever left-drag was in progress: commit a tab reorder, finalize a selection (copy
+    /// it, or treat a zero-movement press as a plain focus click), and clear any divider drag.
+    fn on_release(&mut self) {
+        self.drag = None;
+        if let Some(sd) = self.sidebar_drag.take() {
+            if sd.reordering {
+                let target = self.renderer.sidebar_row_at(self.cursor.1 as f32, self.tab_count);
+                if let Some(to) = target {
+                    if to != sd.from_row {
+                        self.client.control(Call::MoveWindow { from: sd.from_row, to });
+                        self.sync_size();
+                        self.window.request_redraw();
+                    }
+                }
+            }
+        }
+        if self.sel_dragging {
+            self.sel_dragging = false;
+            let is_click = self.selection.as_ref().map_or(true, |s| s.start == s.end);
+            if is_click {
+                // No movement: a plain focus click (the old press-to-focus behavior).
+                if let Some(pane) = self.selection.take().map(|s| s.pane) {
+                    self.scroll_offset = 0;
+                    self.client.control(Call::FocusPaneId { pane });
+                }
+                self.window.request_redraw();
+            } else {
+                self.copy_selection();
+            }
+        }
+    }
+
+    /// Copy the current selection's text to the clipboard, rebuilt from the pane's freshly fetched
+    /// grid at the same offset it was rendered. ponytail: refetch rather than cache every pane's
+    /// grid each frame — copy is rare; this reflects what's currently on screen at those cells.
+    fn copy_selection(&mut self) {
+        let Some((pane, start, end)) = self.selection.as_ref().map(|s| (s.pane, s.start, s.end)) else {
+            return;
+        };
+        let (start, end) = normalize_selection(start, end);
+        let offset = if pane == self.active_pane { self.scroll_offset } else { 0 };
+        if let Ok(ResultBody::Grid(g)) = self.client.call(Call::GetGrid { pane, offset }) {
+            let text = grid_selection_text(&g, start, end);
+            if !text.is_empty() {
+                clipboard::set_text(self.hwnd, &text);
+            }
+        }
+    }
+
+    /// Drop any selection (and its highlight), requesting a redraw if one was showing.
+    fn clear_selection(&mut self) {
+        self.sel_dragging = false;
+        if self.selection.take().is_some() {
+            self.window.request_redraw();
+        }
+    }
+
     fn cell_dims(&self) -> (u32, u32) {
         (self.renderer.cell_w().max(1), self.renderer.cell_h().max(1))
     }
@@ -635,10 +894,19 @@ impl State {
 
     /// Scroll the active pane's viewport by `lines` (positive = deeper into history), clamped
     /// locally to the last-seen history depth; the daemon clamps again server-side.
+    /// Whether pasted text should be wrapped in bracketed-paste markers (the active pane's
+    /// application turned on DECSET 2004).
+    fn paste_is_bracketed(&self) -> bool {
+        self.active_bracketed
+    }
+
     fn scroll_by(&mut self, lines: i64) {
         let next = (self.scroll_offset as i64 + lines).clamp(0, self.scroll_history as i64) as usize;
         if next != self.scroll_offset {
             self.scroll_offset = next;
+            // Scrolling moves content under a viewport-anchored selection; clear it rather than
+            // let the highlight drift onto unintended text.
+            self.selection = None;
             self.window.request_redraw();
         }
     }
@@ -654,7 +922,15 @@ impl State {
         let (_, content_w, h) = self.areas();
         let (cw, ch) = self.cell_dims();
         let pane_chrome = self.renderer.pane_chrome_px();
-        self.client.control(Call::ResizeView { w: content_w, h, cell_w: cw, cell_h: ch, pane_chrome });
+        let pane_chrome_y = self.renderer.pane_chrome_y_px();
+        self.client.control(Call::ResizeView {
+            w: content_w,
+            h,
+            cell_w: cw,
+            cell_h: ch,
+            pane_chrome,
+            pane_chrome_y,
+        });
     }
 
     /// Push `config`'s full terminal palette to the daemon (fg/bg + 16 system colors), which
@@ -716,7 +992,8 @@ impl State {
         // acquired SurfaceTexture unpresented exhausts the swapchain and wedges the window white, so
         // every path presents (a cleared frame when there's nothing to draw).
         let mut rows: Vec<SidebarRow> = Vec::new();
-        let mut snaps: Vec<(PaneSnapshot, Attention, bool, Rect, u32)> = Vec::new();
+        // Per pane: snapshot, attention, active, rect (window coords), scroll offset, id, title.
+        let mut snaps: Vec<(PaneSnapshot, Attention, bool, Rect, u32, u64, String)> = Vec::new();
         if let Ok(ResultBody::Layout(layout)) = self.client.call(Call::GetLayout { w: content_w, h }) {
             if layout.active_pane != self.active_pane {
                 // The active pane changed daemon-side (e.g. the old one exited): the scroll offset
@@ -750,6 +1027,7 @@ impl State {
                         self.scroll_offset = g.offset as usize;
                         self.scroll_history = g.history as usize;
                         self.active_rows = g.rows as usize;
+                        self.active_bracketed = g.bracketed_paste;
                     }
                     let mut snap = grid_to_snapshot(&g);
                     if g.offset > 0 {
@@ -758,13 +1036,29 @@ impl State {
                     }
                     let att = if pr.attention { Attention::Pending } else { Attention::Quiet };
                     let rect = Rect { x: pr.x + sidebar_w, y: pr.y, w: pr.w, h: pr.h };
-                    snaps.push((snap, att, pr.active, rect, g.offset));
+                    snaps.push((snap, att, pr.active, rect, g.offset, pr.id, pr.title.clone()));
                 }
             }
         }
         let views: Vec<PaneView> = snaps
             .iter()
-            .map(|(s, a, active, rect, scrolled)| PaneView { snap: s, attention: *a, active: *active, rect: *rect, scrolled: *scrolled })
+            .map(|(s, a, active, rect, scrolled, id, title)| {
+                // Highlight the selection only on the pane that owns it, normalized to reading order.
+                let selection = self
+                    .selection
+                    .as_ref()
+                    .filter(|sel| sel.pane == *id)
+                    .map(|sel| normalize_selection(sel.start, sel.end));
+                PaneView {
+                    snap: s,
+                    attention: *a,
+                    active: *active,
+                    rect: *rect,
+                    scrolled: *scrolled,
+                    title: title.clone(),
+                    selection,
+                }
+            })
             .collect();
         let empty_msg = if matches!(self.client, Client::Connecting(_)) {
             "starting daemon..."
@@ -907,7 +1201,7 @@ mod tests {
     use super::*;
 
     fn rect(id: u64, x: u32, y: u32, w: u32, h: u32) -> PaneRectWire {
-        PaneRectWire { id, x, y, w, h, active: false, attention: false }
+        PaneRectWire { id, x, y, w, h, active: false, attention: false, title: String::new() }
     }
 
     /// Divider hit-test: a vertical split boundary grabs the left pane (drag along x); a horizontal
@@ -945,6 +1239,65 @@ mod tests {
         // Lower down the same edge falls in 1|3's overlap: still grabs 1.
         let d = divider_at(&panes, 50.0, 30.0, GAP + 2.0).unwrap();
         assert_eq!(d.pane, 1);
+    }
+
+    fn cw(ch: char) -> gmux_proto::CellWire {
+        gmux_proto::CellWire { ch, fg: [0; 3], bg: [0; 3], flags: 0 }
+    }
+
+    fn grid(cols: u16, rows: u16, chars: &[char]) -> GridWire {
+        GridWire {
+            cols,
+            rows,
+            cursor_col: 0,
+            cursor_row: 0,
+            cells: chars.iter().map(|c| cw(*c)).collect(),
+            history: 0,
+            offset: 0,
+            bracketed_paste: false,
+        }
+    }
+
+    /// Pixel→cell mirrors the renderer chrome: cells start at margin+border+inset (x) and
+    /// margin+border+title-strip+inset (y), and out-of-area pixels clamp to the grid.
+    #[test]
+    fn pixel_to_cell_maps_and_clamps() {
+        // One pane filling the content area right of a 200px sidebar in a 1000x600 window.
+        let rect = Rect { x: 200, y: 0, w: 800, h: 600 };
+        let (sw, surf_w, surf_h, cwid, chgt) = (200, 1000, 600, 10, 20);
+        // Cell-area origin: ix = 200+8+1+8 = 217, iy = 0+8+1+22+8 = 39.
+        assert_eq!(pixel_to_cell(217.0, 39.0, rect, sw, surf_w, surf_h, cwid, chgt), (0, 0));
+        // 3 cells right, 2 down from the origin (plus a few px into the cell).
+        assert_eq!(pixel_to_cell(252.0, 84.0, rect, sw, surf_w, surf_h, cwid, chgt), (3, 2));
+        // Above/left of the cell area clamps to (0,0).
+        assert_eq!(pixel_to_cell(0.0, 0.0, rect, sw, surf_w, surf_h, cwid, chgt), (0, 0));
+        // Far bottom-right clamps to the last visible cell (cols=76 -> 75, rows=27 -> 26).
+        assert_eq!(pixel_to_cell(1e6, 1e6, rect, sw, surf_w, surf_h, cwid, chgt), (75, 26));
+    }
+
+    /// Selection endpoints normalize into reading order (row-major), regardless of drag direction.
+    #[test]
+    fn normalize_selection_orders_reading_order() {
+        // Backwards across rows: swapped so start precedes end.
+        assert_eq!(normalize_selection((5, 2), (1, 0)), ((1, 0), (5, 2)));
+        // Already ordered on one row: untouched.
+        assert_eq!(normalize_selection((0, 0), (3, 0)), ((0, 0), (3, 0)));
+        // Backwards on the same row: swapped by column.
+        assert_eq!(normalize_selection((4, 1), (2, 1)), ((2, 1), (4, 1)));
+    }
+
+    /// Text assembly: first/last rows are partial, middle rows full width, trailing spaces trimmed,
+    /// rows joined with CRLF, and out-of-range endpoints clamp instead of panicking.
+    #[test]
+    fn grid_selection_text_assembles_rows() {
+        // 4x3: "ab  " / "cdef" / "gh  ".
+        let g = grid(4, 3, &['a', 'b', ' ', ' ', 'c', 'd', 'e', 'f', 'g', 'h', ' ', ' ']);
+        // Single row, trailing spaces trimmed.
+        assert_eq!(grid_selection_text(&g, (0, 0), (3, 0)), "ab");
+        // Multi-row: first row from col 1, middle full, last row to col 1.
+        assert_eq!(grid_selection_text(&g, (1, 0), (1, 2)), "b\r\ncdef\r\ngh");
+        // A stale selection past the grid clamps (no panic) to the last row/col.
+        assert_eq!(grid_selection_text(&g, (0, 0), (10, 10)), "ab\r\ncdef\r\ngh");
     }
 
     #[test]

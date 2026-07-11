@@ -29,6 +29,7 @@ pub enum Action {
     FocusDown,
     ScrollPageUp,
     ScrollPageDown,
+    Paste,
 }
 
 impl Action {
@@ -47,6 +48,7 @@ impl Action {
             "focus_down" => Action::FocusDown,
             "scroll_page_up" => Action::ScrollPageUp,
             "scroll_page_down" => Action::ScrollPageDown,
+            "paste" => Action::Paste,
             _ => return None,
         })
     }
@@ -67,6 +69,7 @@ const DEFAULTS: &[(&str, &str, Action)] = &[
     ("focus_down", "alt+down", Action::FocusDown),
     ("scroll_page_up", "shift+pageup", Action::ScrollPageUp),
     ("scroll_page_down", "shift+pagedown", Action::ScrollPageDown),
+    ("paste", "ctrl+shift+v", Action::Paste),
 ];
 
 #[derive(Debug, Default, Deserialize)]
@@ -390,6 +393,16 @@ mod tests {
             assert_eq!(km.action(mods, &key), Some(*action), "missing default for {chord:?}");
         }
         assert_eq!(km.map.len(), DEFAULTS.len());
+    }
+
+    #[test]
+    fn paste_action_default_chord_and_name() {
+        // Ctrl+Shift+V resolves to Paste out of the box.
+        let km = Keymap::default();
+        let (m, k) = parse_chord("ctrl+shift+v").unwrap();
+        assert_eq!(km.action(m, &k), Some(Action::Paste));
+        // The action name maps both ways (config `keys` uses these names).
+        assert_eq!(Action::from_name("paste"), Some(Action::Paste));
     }
 
     #[test]

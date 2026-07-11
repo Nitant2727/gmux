@@ -209,4 +209,49 @@ mod tests {
         let bright = px.chunks(4).filter(|p| p[0] > 150 && p[1] > 150 && p[2] > 150).count();
         assert!(bright > 5, "'M' glyph produced no bright pixels ({bright})");
     }
+
+    #[test]
+    fn selection_highlights_cells() {
+        // 3 blank cells in a row; select only the middle one. Its bg is fg/bg-swapped then tinted
+        // toward ACCENT, so it must differ from the untouched dark bg of the unselected cells.
+        use crate::renderer::PaneView;
+        use gmux_mux::Rect;
+        let bg = Rgb { r: 20, g: 20, b: 20 };
+        let fg = Rgb { r: 210, g: 210, b: 210 };
+        let snap = PaneSnapshot { cells: vec![vec![cell(' ', fg, bg); 3]], cursor: (99, 99), cols: 3, rows: 1 };
+        let Some(r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
+            return;
+        };
+        let (cw, ch) = (r.cell_w(), r.cell_h());
+        let (w, h) = (cw * 3, ch);
+        let tex = r.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gmux-sel-test"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let pv = PaneView {
+            snap: &snap,
+            attention: Attention::Quiet,
+            active: true,
+            rect: Rect { x: 0, y: 0, w, h },
+            scrolled: 0,
+            title: String::new(),
+            selection: Some(((1, 0), (1, 0))),
+        };
+        r.render_panes(&view, &[pv], w, h);
+        let px = read_rgba(&r, &tex, w, h).expect("readback");
+        let unselected = pixel(&px, w, cw / 2, ch / 2);
+        let selected = pixel(&px, w, cw + cw / 2, ch / 2);
+        assert_ne!(selected, unselected, "selected cell bg should differ from unselected");
+        assert!(
+            selected[0] as i32 - unselected[0] as i32 > 60,
+            "selected cell should be visibly highlighted, got sel={selected:?} unsel={unselected:?}"
+        );
+    }
 }
