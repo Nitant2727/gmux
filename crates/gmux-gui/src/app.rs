@@ -11,14 +11,14 @@ use std::time::{Duration, Instant};
 
 use gmux_mux::{Attention, Cell, PaneSnapshot, Rect, Rgb};
 use gmux_notify::{flash_window, Notifier, ProgressState as NProgress, Taskbar, ToastRequest, Urgency as NUrgency};
-use gmux_proto::{Call, GridWire, LayoutWire, NotifyWire, PaneRectWire, ResultBody, CELL_BOLD, CELL_INVERSE, CELL_ITALIC, CELL_UNDERLINE, CELL_WIDE};
+use gmux_proto::{Call, GridWire, LayoutWire, NotifyWire, PaneRectWire, ResultBody, CELL_BOLD, CELL_INVERSE, CELL_ITALIC, CELL_UNDERLINE, CELL_WIDE, MOUSE_DRAG, MOUSE_MOTION, MOUSE_SGR};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
-use crate::config::{config_path, Action, Config, Keymap};
+use crate::config::{config_path, default_template, Action, Config, Keymap};
 use crate::daemon_client::{spawn_output_subscriber, DaemonClient};
 use crate::renderer::{PaneView, SidebarRow};
 use crate::Renderer;
@@ -283,6 +283,16 @@ struct State {
     active_rows: usize,
     /// Whether the active pane's app enabled bracketed paste (from the last GetGrid).
     active_bracketed: bool,
+    /// The active pane's mouse-reporting mode (bitfield from the last GetGrid; 0 = no reporting,
+    /// so the GUI keeps its own selection/drag). See `report_button`/`report_motion`/`report_wheel`.
+    active_mouse_mode: u8,
+    /// The button code (0/1/2) currently held for mouse reporting, so a drag reports it and a
+    /// release matches its press even if the cursor left the pane. `None` when no reported press
+    /// is outstanding.
+    mouse_down: Option<u8>,
+    /// Last cell a motion report was sent for, to suppress duplicate reports while the pointer
+    /// stays in one cell (winit fires `CursorMoved` per pixel). Reset on press/release.
+    mouse_last_cell: Option<(u16, u16)>,
     /// Wakes the loop from the subscriber thread (`send_event(())`).
     proxy: EventLoopProxy<()>,
     /// Pane ids that produced output since the last render (filled by the subscriber thread,
@@ -337,6 +347,9 @@ impl ApplicationHandler for App {
         let window = Arc::new(
             el.create_window(Window::default_attributes().with_title("gmux")).expect("create window"),
         );
+        // Let the OS route IME composition to this window: CJK/emoji-picker input then arrives as
+        // `WindowEvent::Ime` (see the handler in `window_event`) instead of raw keystrokes.
+        window.set_ime_allowed(true);
         let size = window.inner_size();
 
         let instance = wgpu::Instance::default();
@@ -428,6 +441,9 @@ impl ApplicationHandler for App {
             scroll_history: 0,
             active_rows: 0,
             active_bracketed: false,
+            active_mouse_mode: 0,
+            mouse_down: None,
+            mouse_last_cell: None,
             proxy: self.proxy.clone(),
             damaged: Arc::new(Mutex::new(HashSet::new())),
             toast_rx,
@@ -476,6 +492,25 @@ impl ApplicationHandler for App {
                     st.window.request_redraw();
                 }
             }
+            WindowEvent::Ime(ime) => {
+                if let Some(st) = self.state.as_mut() {
+                    match ime {
+                        // Committed composition (a finished CJK/emoji sequence): send it as text to
+                        // the active pane, like typing — snap back to live and drop any selection.
+                        Ime::Commit(text) => {
+                            st.mark_activity();
+                            st.clear_selection();
+                            st.scroll_offset = 0;
+                            st.client.control(Call::SendKeys { pane: st.active_pane, text, enter: false });
+                        }
+                        // ponytail: inline preedit display (the composition string drawn in-grid) is
+                        // future work; composition still works via the OS's floating IME window,
+                        // which shows the candidate list until Commit.
+                        Ime::Preedit(..) => {}
+                        Ime::Enabled | Ime::Disabled => {}
+                    }
+                }
+            }
             WindowEvent::CursorLeft { .. } => {
                 if let Some(st) = self.state.as_mut() {
                     // Park the cursor off-window so hover highlights clear, and end any drag —
@@ -490,27 +525,60 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                let shift = self.mods.shift_key();
                 if let Some(st) = self.state.as_mut() {
                     st.cursor = (position.x, position.y);
                     st.mark_activity(); // keep polling so hover/selection tracks the cursor
-                    st.on_cursor_moved();
+                    // In-progress local drags (divider/selection/reorder) always keep the motion;
+                    // otherwise forward it to a mouse-reporting pane (drag / any-motion), and only
+                    // when the app doesn't take it run the local hover/selection logic.
+                    let local_drag_live =
+                        st.drag.is_some() || st.sel_dragging || st.sidebar_drag.is_some();
+                    if local_drag_live || !st.report_motion(shift) {
+                        st.on_cursor_moved();
+                    }
                 }
             }
-            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+            WindowEvent::MouseInput { state, button, .. } => {
+                let shift = self.mods.shift_key();
                 if let Some(st) = self.state.as_mut() {
                     st.mark_activity();
-                    st.on_click();
-                }
-            }
-            WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
-                if let Some(st) = self.state.as_mut() {
-                    st.mark_activity();
-                    st.on_release();
+                    let pressed = state == ElementState::Pressed;
+                    // Local surfaces win first: an in-progress divider/selection/reorder drag,
+                    // or a fresh press on a divider band, must not be swallowed by app reporting.
+                    let local_drag_live =
+                        st.drag.is_some() || st.sel_dragging || st.sidebar_drag.is_some();
+                    let grabs_divider = pressed
+                        && button == MouseButton::Left
+                        && st.divider_under_cursor();
+                    // App mouse reporting: if the active pane wants mouse events and this one is
+                    // inside its cell area without Shift, forward it and suppress local behavior.
+                    if !local_drag_live && !grabs_divider {
+                        if let Some(b) = mouse_button_code(button) {
+                            if st.report_button(b, pressed, shift) {
+                                return;
+                            }
+                        }
+                    }
+                    // Only the left button drives local selection / focus / divider-resize.
+                    if button == MouseButton::Left {
+                        if pressed {
+                            st.on_click();
+                        } else {
+                            st.on_release();
+                        }
+                    }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                let shift = self.mods.shift_key();
                 if let Some(st) = self.state.as_mut() {
                     st.mark_activity();
+                    // Shift+wheel always drives gmux scrollback; an unmodified wheel over a
+                    // mouse-reporting pane is forwarded to its app instead.
+                    if !shift && st.report_wheel(delta) {
+                        return;
+                    }
                     // Wheel up (positive y) scrolls deeper into history.
                     let lines = match delta {
                         MouseScrollDelta::LineDelta(_, y) => (y * 3.0).round() as i64,
@@ -723,6 +791,27 @@ impl State {
                     }
                 }
             }
+            Action::OpenSettings => {
+                // First open writes a fully-populated, self-documenting gmux.json; thereafter we
+                // open whatever's there. Then hand it to the OS's default editor for .json.
+                let path = config_path();
+                if !path.exists() {
+                    if let Some(dir) = path.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    if let Err(e) = std::fs::write(&path, default_template()) {
+                        eprintln!("gmux: could not write config template {}: {e}", path.display());
+                    }
+                }
+                // `cmd /c start "" <path>` launches the file's associated editor and returns at once.
+                // The empty "" is start's window-title arg (else it would swallow the path as title).
+                if let Err(e) = std::process::Command::new("cmd")
+                    .args(["/c", "start", "", &path.to_string_lossy()])
+                    .spawn()
+                {
+                    eprintln!("gmux: could not open settings {}: {e}", path.display());
+                }
+            }
         }
         self.window.request_redraw();
     }
@@ -840,6 +929,21 @@ impl State {
     /// divider drag and a press inside a pane's cell area starts a text selection (a release without
     /// movement becomes a plain focus, see [`State::on_release`]). Uses the renderer's row metrics
     /// for the sidebar and the last rendered layout (cached in `render`) for pane / divider tests.
+    /// Whether the cursor currently sits on a split-divider band (content-area coords) — used to
+    /// give local drag-resize precedence over app mouse reporting on a fresh press.
+    fn divider_under_cursor(&self) -> bool {
+        let (cx, cy) = self.cursor;
+        if cx < 0.0 || cy < 0.0 {
+            return false;
+        }
+        let (sidebar_w, _, _) = self.areas();
+        if (cx as u32) < sidebar_w {
+            return false;
+        }
+        let content_x = cx - sidebar_w as f64;
+        divider_at(&self.last_panes, content_x as f32, cy as f32, GAP + 2.0).is_some()
+    }
+
     fn on_click(&mut self) {
         let (cx, cy) = self.cursor;
         if cx < 0.0 || cy < 0.0 {
@@ -1016,6 +1120,148 @@ impl State {
         (self.renderer.cell_w().max(1), self.renderer.cell_h().max(1))
     }
 
+    /// Whether the active pane's app asked for SGR (1006) mouse encoding.
+    fn sgr_mouse(&self) -> bool {
+        self.active_mouse_mode & MOUSE_SGR != 0
+    }
+
+    /// The active pane's rectangle in window coords (sidebar offset applied), plus whether the
+    /// cursor currently sits inside it. `None` if the active pane isn't in the last layout yet.
+    fn active_pane_rect(&self) -> Option<(Rect, bool)> {
+        let (sidebar_w, _, _) = self.areas();
+        let pr = self.last_panes.iter().find(|p| p.id == self.active_pane)?;
+        let rect = Rect { x: pr.x + sidebar_w, y: pr.y, w: pr.w, h: pr.h };
+        let (cx, cy) = self.cursor;
+        let inside = cx >= rect.x as f64
+            && cx < (rect.x + rect.w) as f64
+            && cy >= rect.y as f64
+            && cy < (rect.y + rect.h) as f64;
+        Some((rect, inside))
+    }
+
+    /// The cursor's 1-based cell within `rect` (mouse reports are 1-based; `pixel_to_cell` clamps
+    /// pixels in the chrome/outside to the pane's visible grid).
+    fn active_cell(&self, rect: Rect) -> (u16, u16) {
+        let (sidebar_w, _, _) = self.areas();
+        let (cw, ch) = self.cell_dims();
+        let (col, row) = pixel_to_cell(
+            self.cursor.0 as f32,
+            self.cursor.1 as f32,
+            rect,
+            sidebar_w,
+            self.config.width,
+            self.config.height,
+            cw,
+            ch,
+        );
+        (col + 1, row + 1)
+    }
+
+    /// Send an encoded mouse sequence to the active pane. ponytail: `SendKeys` carries a `String`,
+    /// and SGR reports are pure ASCII so they round-trip exactly; the legacy X10 fallback packs
+    /// bytes >127 for cols/rows past 95, which a UTF-8 string can't carry — `from_utf8_lossy` is
+    /// exact for the ASCII/SGR case and best-effort otherwise. Upgrade path if pure-X10 apps in
+    /// wide panes ever matter: a bytes-carrying wire call. Modern apps enable SGR, sidestepping it.
+    fn send_mouse(&mut self, seq: Vec<u8>) {
+        let text = String::from_utf8_lossy(&seq).into_owned();
+        self.client.control(Call::SendKeys { pane: self.active_pane, text, enter: false });
+    }
+
+    /// Forward a mouse button press/release to the active pane's app when it wants mouse events,
+    /// Shift isn't held, and (press) the cursor is in its cell area or (release) the matching press
+    /// was reported. Returns true when reported, so the caller suppresses the local selection/focus.
+    fn report_button(&mut self, b: u8, pressed: bool, shift: bool) -> bool {
+        if self.active_mouse_mode == 0 {
+            // The app turned reporting off while a reported button was held: clear the tracked
+            // press so a later re-enable can't hallucinate a drag from the stale state.
+            if !pressed && self.mouse_down == Some(b) {
+                self.mouse_down = None;
+                self.mouse_last_cell = None;
+            }
+            return false;
+        }
+        if pressed {
+            // Shift bypasses reporting so gmux's own selection/focus still works over a mouse app.
+            if shift {
+                return false;
+            }
+            let Some((rect, true)) = self.active_pane_rect() else { return false };
+            let (col, row) = self.active_cell(rect);
+            self.mouse_down = Some(b);
+            self.mouse_last_cell = Some((col, row));
+            let seq = encode_mouse(self.sgr_mouse(), b, true, col, row);
+            self.send_mouse(seq);
+            true
+        } else {
+            // Release only if we reported this button's press (keeps press/release matched even if
+            // the cursor left the pane or Shift changed mid-drag).
+            if self.mouse_down != Some(b) {
+                return false;
+            }
+            self.mouse_down = None;
+            self.mouse_last_cell = None;
+            let (rect, _) = match self.active_pane_rect() {
+                Some(r) => r,
+                None => return true, // pane gone; still consume it (its press was reported)
+            };
+            let (col, row) = self.active_cell(rect);
+            let seq = encode_mouse(self.sgr_mouse(), b, false, col, row);
+            self.send_mouse(seq);
+            true
+        }
+    }
+
+    /// Forward pointer motion to the active pane's app: a held-button drag (mode has `MOUSE_DRAG`
+    /// or `MOUSE_MOTION`) reports the held button + 32; buttonless motion (mode has `MOUSE_MOTION`)
+    /// reports button 35. Deduped per cell. Returns true when the motion was consumed by reporting.
+    fn report_motion(&mut self, shift: bool) -> bool {
+        if self.active_mouse_mode == 0 || shift {
+            return false;
+        }
+        let drag = self.active_mouse_mode & MOUSE_DRAG != 0;
+        let any = self.active_mouse_mode & MOUSE_MOTION != 0;
+        let button = match self.mouse_down {
+            Some(b) if drag || any => b + 32,
+            None if any => 35,
+            _ => return false, // no motion reporting for this mode/button state
+        };
+        let Some((rect, true)) = self.active_pane_rect() else { return false };
+        let (col, row) = self.active_cell(rect);
+        if self.mouse_last_cell == Some((col, row)) {
+            return true; // same cell: consume the motion but don't spam a duplicate report
+        }
+        self.mouse_last_cell = Some((col, row));
+        let seq = encode_mouse(self.sgr_mouse(), button, true, col, row);
+        self.send_mouse(seq);
+        true
+    }
+
+    /// Forward a wheel notch to the active pane's app (button 64 up / 65 down) when it wants mouse
+    /// events and the cursor is over its cell area. Returns true when reported (caller skips
+    /// gmux scrollback).
+    fn report_wheel(&mut self, delta: MouseScrollDelta) -> bool {
+        if self.active_mouse_mode == 0 {
+            return false;
+        }
+        let ch = self.cell_dims().1 as f64;
+        let (y, notches) = match delta {
+            MouseScrollDelta::LineDelta(_, y) => (y as f64, (y.abs().round() as u32).max(1)),
+            MouseScrollDelta::PixelDelta(p) => (p.y, ((p.y.abs() / ch).round() as u32).max(1)),
+        };
+        if y == 0.0 {
+            return false; // a purely horizontal wheel event: leave it to the fallthrough (no-op)
+        }
+        let Some((rect, true)) = self.active_pane_rect() else { return false };
+        let button = if y > 0.0 { 64 } else { 65 };
+        let (col, row) = self.active_cell(rect);
+        let sgr = self.sgr_mouse();
+        for _ in 0..notches.min(10) {
+            let seq = encode_mouse(sgr, button, true, col, row);
+            self.send_mouse(seq);
+        }
+        true
+    }
+
     fn areas(&self) -> (u32, u32, u32) {
         let sidebar_w = self.renderer.sidebar_width().min(self.config.width / 3);
         let content_w = self.config.width.saturating_sub(sidebar_w).max(1);
@@ -1176,6 +1422,7 @@ impl State {
                                 self.scroll_history = g.history as usize;
                                 self.active_rows = g.rows as usize;
                                 self.active_bracketed = g.bracketed_paste;
+                                self.active_mouse_mode = g.mouse_mode;
                             }
                             let mut s = grid_to_snapshot(&g);
                             if g.offset > 0 {
@@ -1360,6 +1607,40 @@ fn window_hwnd(window: &Window) -> Option<isize> {
     }
 }
 
+/// Terminal button code for a physical mouse button (left 0, middle 1, right 2). Back/forward and
+/// other buttons aren't reported.
+fn mouse_button_code(b: MouseButton) -> Option<u8> {
+    Some(match b {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+        _ => return None,
+    })
+}
+
+/// Encode a mouse event as a terminal report. `button` is the full button code the caller already
+/// computed: 0/1/2 for left/middle/right, `base + 32` for a held-button drag, 35 for buttonless
+/// motion, 64/65 for wheel up/down. `col`/`row` are 1-based cells. SGR (1006) uses the textual
+/// `ESC[<b;col;row` form with a trailing `M` (press) / `m` (release), keeping the button number on
+/// release. The legacy X10 fallback packs `ESC[M` + three bytes `32+b`, `32+col`, `32+row`, with a
+/// release always reported as button 3 and each coord clamped to 223 so `32+coord` fits a byte.
+/// Pure, so unit-tested.
+fn encode_mouse(sgr: bool, button: u8, pressed: bool, col: u16, row: u16) -> Vec<u8> {
+    if sgr {
+        let f = if pressed { 'M' } else { 'm' };
+        format!("\x1b[<{button};{col};{row}{f}").into_bytes()
+    } else {
+        // X10 has no per-button release: a release reports button 3 (all buttons up).
+        let b = if pressed { button } else { 3 };
+        // Clamp to 94 (not the spec's 223): the report travels as a JSON String over the pipe,
+        // and coordinate bytes above 127 are not standalone UTF-8 — they'd be mangled to U+FFFD
+        // in transit. 32+94 = 126 keeps every byte ASCII; panes wider than 94 cells need SGR
+        // (DECSET 1006), which every modern mouse app requests anyway.
+        let coord = |v: u16| 32u8.saturating_add(v.min(94) as u8);
+        vec![0x1b, b'[', b'M', 32u8.saturating_add(b), coord(col), coord(row)]
+    }
+}
+
 /// Translate a key press into bytes for the PTY (full win32-input-mode fidelity comes later).
 fn key_to_bytes(event: &KeyEvent, mods: ModifiersState) -> Option<Vec<u8>> {
     use NamedKey::*;
@@ -1451,6 +1732,7 @@ mod tests {
             history: 0,
             offset: 0,
             bracketed_paste: false,
+            mouse_mode: 0,
         }
     }
 
@@ -1575,9 +1857,47 @@ mod tests {
             history: 0,
             offset: 0,
             bracketed_paste: false,
+            mouse_mode: 0,
         };
         let snap = grid_to_snapshot(&g);
         assert!(snap.cells[0][0].wide, "wide char maps to Cell.wide");
         assert!(!snap.cells[0][1].wide, "the spacer cell is not wide");
+    }
+
+    /// SGR (1006) mouse reports: press uses `M`, release `m` (keeping the button number), wheel and
+    /// drag carry their pre-computed button codes, all with 1-based coords.
+    #[test]
+    fn encode_mouse_sgr_forms() {
+        assert_eq!(encode_mouse(true, 0, true, 1, 1), b"\x1b[<0;1;1M");
+        assert_eq!(encode_mouse(true, 0, false, 1, 1), b"\x1b[<0;1;1m"); // release keeps the button
+        assert_eq!(encode_mouse(true, 2, true, 10, 5), b"\x1b[<2;10;5M"); // right press
+        assert_eq!(encode_mouse(true, 64, true, 3, 4), b"\x1b[<64;3;4M"); // wheel up
+        assert_eq!(encode_mouse(true, 65, true, 3, 4), b"\x1b[<65;3;4M"); // wheel down
+        assert_eq!(encode_mouse(true, 32, true, 7, 8), b"\x1b[<32;7;8M"); // left drag (0 + 32)
+        assert_eq!(encode_mouse(true, 35, true, 2, 2), b"\x1b[<35;2;2M"); // buttonless any-motion
+    }
+
+    /// X10 fallback: `ESC[M` + three offset bytes; a release is always button 3; coords clamp to
+    /// 94 so every byte stays ASCII (the report rides a JSON String — bytes > 127 would be
+    /// mangled to U+FFFD in transit; wider panes need SGR).
+    #[test]
+    fn encode_mouse_x10_fallback_and_clamp() {
+        // Left press at (1,1): 32+0, 32+1, 32+1.
+        assert_eq!(encode_mouse(false, 0, true, 1, 1), vec![0x1b, b'[', b'M', 32, 33, 33]);
+        // Release reports button 3 regardless of which button (32+3 = 35).
+        assert_eq!(encode_mouse(false, 2, false, 1, 1), vec![0x1b, b'[', b'M', 35, 33, 33]);
+        // Wheel up code 64 -> 32+64 = 96.
+        assert_eq!(encode_mouse(false, 64, true, 1, 1), vec![0x1b, b'[', b'M', 96, 33, 33]);
+        // Coords past 94 clamp so the byte tops out at ASCII 126 (32 + 94).
+        assert_eq!(encode_mouse(false, 0, true, 300, 300), vec![0x1b, b'[', b'M', 32, 126, 126]);
+    }
+
+    /// Only left/middle/right map to report codes; other buttons don't report.
+    #[test]
+    fn mouse_button_code_maps_the_three_buttons() {
+        assert_eq!(mouse_button_code(MouseButton::Left), Some(0));
+        assert_eq!(mouse_button_code(MouseButton::Middle), Some(1));
+        assert_eq!(mouse_button_code(MouseButton::Right), Some(2));
+        assert_eq!(mouse_button_code(MouseButton::Back), None);
     }
 }

@@ -279,6 +279,19 @@ impl Terminal {
         self.term.mode().contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
     }
 
+    /// The application's mouse-reporting mode as a bitfield (0 = wants no mouse):
+    /// 1 = clicks (DECSET 1000), 2 = button-drag (1002), 4 = any-motion (1003), 8 = SGR encoding
+    /// (1006). Mirrors alacritty's `TermMode` mouse flags onto the gmux-proto contract so the GUI
+    /// knows whether to forward mouse events (and how to encode them) instead of doing selection.
+    pub fn mouse_mode(&self) -> u8 {
+        use alacritty_terminal::term::TermMode as M;
+        let m = self.term.mode();
+        (m.contains(M::MOUSE_REPORT_CLICK) as u8)
+            | (m.contains(M::MOUSE_DRAG) as u8) << 1
+            | (m.contains(M::MOUSE_MOTION) as u8) << 2
+            | (m.contains(M::SGR_MOUSE) as u8) << 3
+    }
+
     /// Number of scrollback (history) lines currently retained above the viewport.
     pub fn history_len(&self) -> usize {
         self.term.grid().history_size()

@@ -559,6 +559,7 @@ fn window_progress(
 /// skew against each other while the pump thread appends output.
 fn grid_wire(p: &Pane, offset: usize) -> GridWire {
     let bracketed_paste = p.bracketed_paste();
+    let mouse_mode = p.mouse_mode();
     let (snap, history, offset) = p.snapshot_scrolled(offset);
     let mut cells = Vec::with_capacity(snap.cols as usize * snap.rows as usize);
     for row in &snap.cells {
@@ -596,6 +597,7 @@ fn grid_wire(p: &Pane, offset: usize) -> GridWire {
         history: history as u32,
         offset: offset as u32,
         bracketed_paste,
+        mouse_mode,
     }
 }
 
@@ -1188,5 +1190,16 @@ mod tests {
         assert_eq!(wire.cells[0].flags & CELL_WIDE, CELL_WIDE, "wide char sets CELL_WIDE");
         assert_eq!(wire.cells[1].ch, ' ', "the cell after a wide char is a blank spacer");
         assert_eq!(wire.cells[1].flags & CELL_WIDE, 0, "spacer is not itself wide");
+    }
+
+    /// End-to-end: DECSET mouse bytes over the remote push path surface as `GridWire::mouse_mode`.
+    #[test]
+    fn grid_wire_maps_mouse_mode() {
+        use gmux_mux::Pane;
+        use gmux_proto::{MOUSE_MOTION, MOUSE_SGR};
+        let p = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        assert_eq!(grid_wire(&p, 0).mouse_mode, 0, "no mouse reporting by default");
+        p.push_output(b"\x1b[?1003h\x1b[?1006h"); // any-motion + SGR encoding
+        assert_eq!(grid_wire(&p, 0).mouse_mode, MOUSE_MOTION | MOUSE_SGR);
     }
 }

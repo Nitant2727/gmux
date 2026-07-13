@@ -30,6 +30,7 @@ pub enum Action {
     ScrollPageUp,
     ScrollPageDown,
     Paste,
+    OpenSettings,
 }
 
 impl Action {
@@ -49,6 +50,7 @@ impl Action {
             "scroll_page_up" => Action::ScrollPageUp,
             "scroll_page_down" => Action::ScrollPageDown,
             "paste" => Action::Paste,
+            "open_settings" => Action::OpenSettings,
             _ => return None,
         })
     }
@@ -70,6 +72,7 @@ const DEFAULTS: &[(&str, &str, Action)] = &[
     ("scroll_page_up", "shift+pageup", Action::ScrollPageUp),
     ("scroll_page_down", "shift+pagedown", Action::ScrollPageDown),
     ("paste", "ctrl+shift+v", Action::Paste),
+    ("open_settings", "ctrl+,", Action::OpenSettings),
 ];
 
 #[derive(Debug, Default, Deserialize)]
@@ -227,6 +230,39 @@ fn load_scheme(path: &std::path::Path) -> Option<HashMap<String, String>> {
 pub fn config_path() -> PathBuf {
     let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(base).join("gmux").join("gmux.json")
+}
+
+/// A fully-populated `gmux.json`, written on the first "open settings" so the file itself documents
+/// the schema — JSON has no comments, so every setting appears with its default value. The `keys`
+/// block is generated from [`DEFAULTS`], so it always lists every action + its default chord and
+/// can't drift. `persist_screen` is read by the daemon (not this struct); the rest map to [`Config`].
+/// Parses back cleanly via [`Config::load`] (extra keys like `persist_screen` are ignored here).
+pub fn default_template() -> String {
+    let keys = DEFAULTS
+        .iter()
+        .map(|(name, chord, _)| format!("    \"{name}\": \"{chord}\""))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!(
+        "{{
+  \"font_px\": {font},
+  \"persist_screen\": true,
+  \"theme\": {{
+    \"fg\": \"#{fg:02x}{fg1:02x}{fg2:02x}\",
+    \"bg\": \"#{bg:02x}{bg1:02x}{bg2:02x}\",
+    \"scheme\": null,
+    \"ansi\": null
+  }},
+  \"keys\": {{
+{keys}
+  }}
+}}
+"
+        ,
+        font = 18.0f32, // ponytail: mirror of app::DEFAULT_FONT_PX (config cannot import app)
+        fg = DEFAULT_PALETTE.fg[0], fg1 = DEFAULT_PALETTE.fg[1], fg2 = DEFAULT_PALETTE.fg[2],
+        bg = DEFAULT_PALETTE.bg[0], bg1 = DEFAULT_PALETTE.bg[1], bg2 = DEFAULT_PALETTE.bg[2],
+    )
 }
 
 /// `"#rrggbb"` (or `"rrggbb"`) -> `[r, g, b]`; anything else -> `None`.
@@ -393,6 +429,40 @@ mod tests {
             assert_eq!(km.action(mods, &key), Some(*action), "missing default for {chord:?}");
         }
         assert_eq!(km.map.len(), DEFAULTS.len());
+    }
+
+    #[test]
+    fn open_settings_chord_and_name() {
+        // `ctrl+,` parses (the ',' single-char token becomes a Key::Character) and binds OpenSettings.
+        assert_eq!(
+            parse_chord("ctrl+,"),
+            Some((ModifiersState::CONTROL, Key::Character(",".into())))
+        );
+        let km = Keymap::default();
+        let (m, k) = parse_chord("ctrl+,").unwrap();
+        assert_eq!(km.action(m, &k), Some(Action::OpenSettings));
+        assert_eq!(Action::from_name("open_settings"), Some(Action::OpenSettings));
+    }
+
+    #[test]
+    fn template_parses_and_covers_every_action() {
+        let t = default_template();
+        // Round-trips through serde as a Config (the on-disk load path).
+        let cfg: Config = serde_json::from_str(&t).expect("template is valid config JSON");
+        assert_eq!(cfg.font_px, Some(18.0));
+        assert!(cfg.theme.is_some(), "template carries a theme block");
+        let keys = cfg.keys.as_ref().expect("template has a keys block");
+        // Every action name appears with its default chord.
+        for (name, chord, _) in DEFAULTS {
+            assert_eq!(keys.get(*name).map(String::as_str), Some(*chord), "template missing {name}");
+        }
+        assert_eq!(keys.len(), DEFAULTS.len(), "template lists exactly the default actions");
+        // The generated keys parse back into the same Keymap the defaults build.
+        let km = Keymap::build(&cfg);
+        for (_, chord, action) in DEFAULTS {
+            let (m, k) = parse_chord(chord).unwrap();
+            assert_eq!(km.action(m, &k), Some(*action));
+        }
     }
 
     #[test]
