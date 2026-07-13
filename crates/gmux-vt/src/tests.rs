@@ -416,3 +416,33 @@ fn wide_char_flags_cell_and_leaves_spacer() {
     // The cursor advances two columns past a wide glyph.
     assert_eq!(t.cursor(), (2, 0));
 }
+
+// ---------------------------------------------------------------------------
+// Mouse-reporting mode (DECSET/DECRST 1000/1002/1003/1006).
+// ---------------------------------------------------------------------------
+
+/// DECSET turns on each mouse-reporting mode (mapped to its contract bit) and DECRST clears it.
+/// Note: alacritty treats clicks/drag/motion (1000/1002/1003) as mutually exclusive — the latest
+/// wins — while SGR (1006) is an orthogonal encoding flag that composes with any of them.
+#[test]
+fn mouse_mode_tracks_decset_and_decrst() {
+    let mut t = Terminal::new(80, 24);
+    assert_eq!(t.mouse_mode(), 0, "no mouse reporting by default");
+
+    t.advance(b"\x1b[?1000h"); // clicks
+    assert_eq!(t.mouse_mode(), 1);
+    t.advance(b"\x1b[?1002h"); // button-drag (replaces clicks)
+    assert_eq!(t.mouse_mode(), 2);
+    t.advance(b"\x1b[?1003h"); // any-motion (replaces drag)
+    assert_eq!(t.mouse_mode(), 4);
+
+    // SGR encoding composes with the active motion mode: 4 | 8 = 12.
+    t.advance(b"\x1b[?1006h");
+    assert_eq!(t.mouse_mode(), 12);
+
+    // DECRST the motion mode, leaving only the SGR encoding bit.
+    t.advance(b"\x1b[?1003l");
+    assert_eq!(t.mouse_mode(), 8);
+    t.advance(b"\x1b[?1006l");
+    assert_eq!(t.mouse_mode(), 0);
+}

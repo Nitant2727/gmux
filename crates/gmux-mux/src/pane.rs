@@ -302,6 +302,11 @@ impl Pane {
         self.terminal.lock().unwrap().bracketed_paste()
     }
 
+    /// The pane's mouse-reporting mode bitfield (see [`gmux_vt::Terminal::mouse_mode`]).
+    pub fn mouse_mode(&self) -> u8 {
+        self.terminal.lock().unwrap().mouse_mode()
+    }
+
     /// Re-theme this pane's terminal (fg/bg + the 16 system colors). Takes `&self` — the terminal
     /// is behind an `Arc<Mutex>`, so a shared pane ref suffices; the next snapshot reflects it.
     pub fn set_palette(&self, palette: Palette) {

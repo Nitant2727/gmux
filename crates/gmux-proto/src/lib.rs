@@ -215,6 +215,16 @@ pub const CELL_INVERSE: u8 = 8;
 /// spacer (`ch == ' '`, no `CELL_WIDE`).
 pub const CELL_WIDE: u8 = 16;
 
+// [`GridWire::mouse_mode`] bits — the application's mouse-reporting mode (0 = wants no mouse).
+/// Report button clicks (DECSET 1000).
+pub const MOUSE_CLICKS: u8 = 1;
+/// Report motion while a button is held (DECSET 1002).
+pub const MOUSE_DRAG: u8 = 2;
+/// Report any pointer motion (DECSET 1003).
+pub const MOUSE_MOTION: u8 = 4;
+/// Encode reports in SGR form (DECSET 1006) rather than the legacy byte encoding.
+pub const MOUSE_SGR: u8 = 8;
+
 /// A pane's visible grid for rendering (row-major `cells`, length `cols * rows`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GridWire {
@@ -233,6 +243,11 @@ pub struct GridWire {
     /// wrapped in `ESC[200~` / `ESC[201~`.
     #[serde(default)]
     pub bracketed_paste: bool,
+    /// The pane's mouse-reporting mode (bitfield: [`MOUSE_CLICKS`] | [`MOUSE_DRAG`] |
+    /// [`MOUSE_MOTION`] | [`MOUSE_SGR`]). 0 = the app wants no mouse, so the GUI keeps its own
+    /// selection/drag behavior; nonzero = forward mouse events to the pane.
+    #[serde(default)]
+    pub mouse_mode: u8,
 }
 
 /// One pane's rectangle within the content area.
@@ -421,6 +436,7 @@ mod tests {
             history: 120,
             offset: 25,
             bracketed_paste: true,
+            mouse_mode: MOUSE_CLICKS | MOUSE_SGR,
         });
         let resp = Response::ok(2, grid.clone());
         let mut buf = Vec::new();
