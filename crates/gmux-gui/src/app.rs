@@ -2,22 +2,24 @@
 //! (fetched over the pipe each frame) and forwards input/control to the daemon. The daemon owns the
 //! panes, so closing this window detaches — the agents keep running — and relaunching reattaches.
 
+use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::mpsc::{Receiver, TryRecvError};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gmux_mux::{Attention, Cell, PaneSnapshot, Rect, Rgb};
 use gmux_notify::{flash_window, Notifier, ProgressState as NProgress, Taskbar, ToastRequest, Urgency as NUrgency};
-use gmux_proto::{Call, GridWire, NotifyWire, PaneRectWire, ResultBody, CELL_BOLD, CELL_INVERSE, CELL_ITALIC, CELL_UNDERLINE};
+use gmux_proto::{Call, GridWire, LayoutWire, NotifyWire, PaneRectWire, ResultBody, CELL_BOLD, CELL_INVERSE, CELL_ITALIC, CELL_UNDERLINE, CELL_WIDE};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::config::{config_path, Action, Config, Keymap};
-use crate::daemon_client::DaemonClient;
+use crate::daemon_client::{spawn_output_subscriber, DaemonClient};
 use crate::renderer::{PaneView, SidebarRow};
 use crate::Renderer;
 
@@ -34,7 +36,13 @@ const DEFAULT_FG: [u8; 3] = [0xcc, 0xcc, 0xcc];
 const DEFAULT_BG: [u8; 3] = [0x08, 0x08, 0x08]; // 0.03 * 255 ≈ 8
 const TOAST_GROUP: &str = "gmux-session";
 const TOAST_MIN_INTERVAL: Duration = Duration::from_millis(1000);
-const FRAME: Duration = Duration::from_millis(33); // ~30 fps poll of remote grids
+const FRAME: Duration = Duration::from_millis(33); // ~30 fps poll of remote grids while active
+/// How long after the last activity (input or a damage/notification wake) the loop keeps polling
+/// at `FRAME` before dropping to the idle heartbeat.
+const ACTIVE_WINDOW: Duration = Duration::from_millis(500);
+/// Idle cadence: resend geometry, hot-reload config, and check the subscriber thread this often —
+/// with no per-tick redraw, so an idle GUI stops fetching grids entirely.
+const HEARTBEAT: Duration = Duration::from_secs(1);
 const RESIZE_THROTTLE: Duration = Duration::from_millis(33); // ~30 resize sends/s while dragging
 /// Gap (px) the renderer draws between split panes. ponytail: mirrored from renderer.rs's `GAP`
 /// design token (owned by the other task) so the divider hit-test can grab that visible band — if
@@ -58,6 +66,9 @@ const TITLE_STRIP: f32 = 22.0; // title band inside the border, above the cells
 pub struct App {
     mods: ModifiersState,
     state: Option<State>,
+    /// Cloned into each subscriber thread to wake the loop (`send_event(())`); stashed here so
+    /// `resumed` can hand a clone to the `State` it builds.
+    proxy: EventLoopProxy<()>,
 }
 
 /// The daemon connection. `Connecting` holds the background connect thread's result channel so
@@ -218,8 +229,16 @@ fn grid_selection_text(grid: &GridWire, start: (u16, u16), end: (u16, u16)) -> S
         let c_end = if r == end.1 as usize { end.0 as usize } else { cols - 1 };
         let (c_start, c_end) = (c_start.min(cols - 1), c_end.min(cols - 1));
         let mut line = String::new();
+        let mut skip_spacer = false;
         for c in c_start..=c_end {
-            line.push(grid.cells.get(r * cols + c).map(|cell| cell.ch).unwrap_or(' '));
+            let cell = grid.cells.get(r * cols + c);
+            if skip_spacer {
+                // The blank cell after a wide (CJK) glyph is layout filler, not content.
+                skip_spacer = false;
+                continue;
+            }
+            skip_spacer = cell.map(|cell| cell.flags & gmux_proto::CELL_WIDE != 0).unwrap_or(false);
+            line.push(cell.map(|cell| cell.ch).unwrap_or(' '));
         }
         line.truncate(line.trim_end_matches(' ').len());
         out.push(line);
@@ -264,7 +283,31 @@ struct State {
     active_rows: usize,
     /// Whether the active pane's app enabled bracketed paste (from the last GetGrid).
     active_bracketed: bool,
-    heartbeat_ticks: u32,
+    /// Wakes the loop from the subscriber thread (`send_event(())`).
+    proxy: EventLoopProxy<()>,
+    /// Pane ids that produced output since the last render (filled by the subscriber thread,
+    /// taken/cleared each render to gate GetGrid fetches).
+    damaged: Arc<Mutex<HashSet<u64>>>,
+    /// Real (non-`pane-output`) notifications forwarded by the subscriber thread, drained to toasts.
+    toast_rx: Receiver<NotifyWire>,
+    /// Sender half, kept to clone into a respawned subscriber thread.
+    toast_tx: Sender<NotifyWire>,
+    /// Liveness flag of the current subscriber thread (`false` once it dies); `None` before the
+    /// first spawn. Respawned from the heartbeat when dead.
+    sub_alive: Option<Arc<AtomicBool>>,
+    /// Cached last snapshot per pane id, reused for undamaged panes so a damage-gated render still
+    /// hands the renderer a full views list. Evicted for panes gone from the layout.
+    snap_cache: HashMap<u64, PaneSnapshot>,
+    /// Last activity (input or a wake): within `ACTIVE_WINDOW` the loop keeps polling at `FRAME`.
+    last_activity: Instant,
+    /// Last idle-heartbeat time.
+    last_heartbeat: Instant,
+    /// Hash of the last layout's geometry; a change forces a full grid refetch (tab switch/split/resize).
+    last_layout_hash: u64,
+    /// Force a full refetch of every pane next render (first frame, resize, reconnect).
+    force_full: bool,
+    /// A Ready client that can no longer reach the daemon: the loop exits.
+    fatal: bool,
     // Config-driven keybindings + the last config mtime we loaded, for hot-reload.
     keymap: Keymap,
     font_px: f32,
@@ -278,9 +321,10 @@ struct State {
 /// Run the gmux GUI. `_shell` is currently unused (the daemon picks its shell); kept for the CLI
 /// signature and a future `--daemon <shell>` hand-off.
 pub fn run(_shell: String) -> Result<(), Box<dyn std::error::Error>> {
-    let event_loop = EventLoop::new()?;
+    let event_loop = EventLoop::<()>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = App { mods: ModifiersState::empty(), state: None };
+    let proxy = event_loop.create_proxy();
+    let mut app = App { mods: ModifiersState::empty(), state: None, proxy };
     event_loop.run_app(&mut app)?;
     Ok(())
 }
@@ -357,6 +401,9 @@ impl ApplicationHandler for App {
             }
         }
 
+        // Real notifications flow from the subscriber thread to the main loop over this channel.
+        let (toast_tx, toast_rx) = std::sync::mpsc::channel();
+        let now = Instant::now();
         let st = State {
             window,
             surface,
@@ -381,7 +428,17 @@ impl ApplicationHandler for App {
             scroll_history: 0,
             active_rows: 0,
             active_bracketed: false,
-            heartbeat_ticks: 0,
+            proxy: self.proxy.clone(),
+            damaged: Arc::new(Mutex::new(HashSet::new())),
+            toast_rx,
+            toast_tx,
+            sub_alive: None,
+            snap_cache: HashMap::new(),
+            last_activity: now,
+            last_heartbeat: now,
+            last_layout_hash: 0,
+            force_full: true,
+            fatal: false,
             keymap,
             font_px,
             config_mtime,
@@ -401,6 +458,7 @@ impl ApplicationHandler for App {
                 if let Some(st) = self.state.as_mut() {
                     st.focused = f;
                     if f {
+                        st.mark_activity();
                         st.clear_active_toast();
                         flash_window(st.hwnd, false);
                         st.window.request_redraw();
@@ -413,6 +471,8 @@ impl ApplicationHandler for App {
                     st.config.height = sz.height.max(1);
                     st.surface.configure(&st.renderer.device, &st.config);
                     st.sync_size();
+                    st.force_full = true; // panes reflow at the new size: refetch every grid
+                    st.mark_activity();
                     st.window.request_redraw();
                 }
             }
@@ -425,26 +485,32 @@ impl ApplicationHandler for App {
                     st.drag = None;
                     st.sel_dragging = false;
                     st.sidebar_drag = None;
+                    st.mark_activity(); // one more frame to clear the parked hover highlight
+                    st.window.request_redraw();
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if let Some(st) = self.state.as_mut() {
                     st.cursor = (position.x, position.y);
+                    st.mark_activity(); // keep polling so hover/selection tracks the cursor
                     st.on_cursor_moved();
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
                 if let Some(st) = self.state.as_mut() {
+                    st.mark_activity();
                     st.on_click();
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Released, button: MouseButton::Left, .. } => {
                 if let Some(st) = self.state.as_mut() {
+                    st.mark_activity();
                     st.on_release();
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 if let Some(st) = self.state.as_mut() {
+                    st.mark_activity();
                     // Wheel up (positive y) scrolls deeper into history.
                     let lines = match delta {
                         MouseScrollDelta::LineDelta(_, y) => (y * 3.0).round() as i64,
@@ -454,6 +520,9 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                if let Some(st) = self.state.as_mut() {
+                    st.mark_activity();
+                }
                 if !self.try_shortcut(&event) {
                     if let Some(bytes) = key_to_bytes(&event, self.mods) {
                         if let Some(st) = self.state.as_mut() {
@@ -473,6 +542,17 @@ impl ApplicationHandler for App {
         }
     }
 
+    /// The subscriber thread woke us: fresh output (damage) and/or a real notification arrived.
+    /// Mark activity so the loop polls at `FRAME` briefly (catching a burst of output), and redraw
+    /// — `render` drains the damaged set and refetches only those panes. Toasts are drained in
+    /// `about_to_wait`, which runs right after this in the same loop iteration.
+    fn user_event(&mut self, _el: &ActiveEventLoop, _event: ()) {
+        if let Some(st) = self.state.as_mut() {
+            st.mark_activity();
+            st.window.request_redraw();
+        }
+    }
+
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let Some(st) = self.state.as_mut() else { return };
 
@@ -485,19 +565,16 @@ impl ApplicationHandler for App {
             return;
         }
 
-        // Drain daemon notifications and toast the ones that arrived while unfocused.
-        if let Ok(ResultBody::Notifications(notes)) = st.client.call(Call::PollNotifications) {
-            for n in notes {
-                if !st.focused {
-                    st.fire_toast(&n);
-                }
-            }
-        } else {
-            // Daemon gone: nothing left to render.
+        // A Ready client that lost the daemon irrecoverably (render's GetLayout errored): give up.
+        if st.fatal {
             el.exit();
             return;
         }
 
+        // Toasts now ride the subscriber channel; fire the ones seen while unfocused.
+        st.drain_toasts();
+
+        // A clicked toast focuses the window.
         if let Some(nf) = &st.notifier {
             if !nf.poll_activations().is_empty() {
                 st.window.focus_window();
@@ -506,32 +583,27 @@ impl ApplicationHandler for App {
             }
         }
 
-        // M12 (feature "browser"): drain queued Browse requests into the WebView2 pane.
-        #[cfg(feature = "browser")]
-        if let Ok(ResultBody::Browses(urls)) = st.client.call(Call::PollBrowse) {
-            for url in urls {
-                match &st.browser {
-                    Some(b) => b.navigate(&url),
-                    None => match gmux_browser::BrowserPane::open(&url) {
-                        Ok(b) => st.browser = Some(b),
-                        Err(e) => eprintln!("gmux: browser pane failed: {e}"),
-                    },
-                }
-            }
-        }
-
-        // Re-send our geometry roughly once per second (30 of the 33ms poll ticks) so a
-        // restarted daemon relearns pane sizes.
-        st.heartbeat_ticks += 1;
-        if st.heartbeat_ticks >= 30 {
-            st.heartbeat_ticks = 0;
+        // Idle housekeeping (~1s), with NO redraw: resend geometry so a restarted daemon relearns
+        // pane sizes, hot-reload config, keep the subscriber thread alive, drain browser requests.
+        let now = Instant::now();
+        if now.duration_since(st.last_heartbeat) >= HEARTBEAT {
+            st.last_heartbeat = now;
             st.sync_size();
             st.maybe_reload_config();
+            st.ensure_subscriber();
+            #[cfg(feature = "browser")]
+            st.poll_browse();
         }
 
-        // Poll the daemon for fresh output by re-rendering.
-        st.window.request_redraw();
-        el.set_control_flow(ControlFlow::WaitUntil(Instant::now() + FRAME));
+        // Active (recent input / a wake / an in-progress drag): keep polling at FRAME and redraw.
+        // Idle: sleep until the next heartbeat with no redraw — a wake (input or subscriber event)
+        // pops us out early.
+        if st.is_active(now) {
+            st.window.request_redraw();
+            el.set_control_flow(ControlFlow::WaitUntil(now + FRAME));
+        } else {
+            el.set_control_flow(ControlFlow::WaitUntil(now + HEARTBEAT));
+        }
     }
 }
 
@@ -668,6 +740,9 @@ impl State {
         self.keymap = Keymap::build(&config);
         apply_theme(&mut self.renderer, &config);
         self.send_palette(&config); // re-theme the daemon's panes on hot-reload
+        // The daemon re-resolves every grid's colors but emits no damage wires for it, so the
+        // snapshot cache is stale until the next output — force a full refetch.
+        self.force_full = true;
         let new_font = config.font_px.unwrap_or(DEFAULT_FONT_PX);
         if (new_font - self.font_px).abs() > f32::EPSILON {
             eprintln!("gmux: font size change requires a restart to take effect");
@@ -691,6 +766,8 @@ impl State {
                 if let Some(p) = self.init_palette.take() {
                     self.client.control(p); // theme the daemon's panes to match config
                 }
+                self.ensure_subscriber(); // start streaming output/notifications now that it's live
+                self.mark_activity(); // poll a few frames so the first output settles
                 self.window.request_redraw();
             }
             Ok(Err(e)) => {
@@ -701,6 +778,59 @@ impl State {
             Err(TryRecvError::Disconnected) => {
                 eprintln!("gmux: daemon connect thread ended without a result");
                 el.exit();
+            }
+        }
+    }
+
+    /// Note user/wake activity; within `ACTIVE_WINDOW` of this the loop polls at `FRAME`.
+    fn mark_activity(&mut self) {
+        self.last_activity = Instant::now();
+    }
+
+    /// Whether the loop should keep polling at `FRAME`: a drag/selection is in progress, or the
+    /// last activity was recent.
+    fn is_active(&self, now: Instant) -> bool {
+        self.drag.is_some()
+            || self.sel_dragging
+            || self.sidebar_drag.is_some()
+            || now.duration_since(self.last_activity) < ACTIVE_WINDOW
+    }
+
+    /// Drain the subscriber channel, toasting the notifications that arrived while unfocused.
+    fn drain_toasts(&mut self) {
+        while let Ok(n) = self.toast_rx.try_recv() {
+            if !self.focused {
+                self.fire_toast(&n);
+            }
+        }
+    }
+
+    /// Spawn (or respawn) the output subscriber thread if it isn't running. Called on connect and
+    /// from the heartbeat, so a thread that died on pipe EOF (daemon restart) is replaced within ~1s.
+    fn ensure_subscriber(&mut self) {
+        let alive = self.sub_alive.as_ref().is_some_and(|a| a.load(Ordering::Relaxed));
+        if alive {
+            return;
+        }
+        // A respawn means the daemon may have restarted (the old subscriber saw EOF); refetch every
+        // pane next render so a rebuilt session doesn't render from stale cached snapshots.
+        self.force_full = true;
+        self.sub_alive =
+            Some(spawn_output_subscriber(self.proxy.clone(), self.damaged.clone(), self.toast_tx.clone()));
+    }
+
+    /// M12 (feature "browser"): drain queued Browse requests into the WebView2 pane.
+    #[cfg(feature = "browser")]
+    fn poll_browse(&mut self) {
+        if let Ok(ResultBody::Browses(urls)) = self.client.call(Call::PollBrowse) {
+            for url in urls {
+                match &self.browser {
+                    Some(b) => b.navigate(&url),
+                    None => match gmux_browser::BrowserPane::open(&url) {
+                        Ok(b) => self.browser = Some(b),
+                        Err(e) => eprintln!("gmux: browser pane failed: {e}"),
+                    },
+                }
             }
         }
     }
@@ -1017,28 +1147,61 @@ impl State {
                 tb.set_progress(if any { NProgress::Paused } else { NProgress::None }, None);
             }
 
+            // Damage-gate the (expensive) per-pane GetGrid: fetch a pane only when it has fresh
+            // output, on a layout change (geometry differs), for the scrolled/selected active pane,
+            // or when it isn't cached yet. Undamaged panes reuse their cached snapshot, so the
+            // renderer always gets a full views list.
+            let hash = layout_fetch_hash(&layout);
+            let force_full = self.force_full || hash != self.last_layout_hash;
+            self.force_full = false;
+            self.last_layout_hash = hash;
+            let damaged = take_damaged(&self.damaged);
+            let live: HashSet<u64> = layout.panes.iter().map(|p| p.id).collect();
+            evict_stale(&mut self.snap_cache, &live);
+
             for pr in &layout.panes {
                 // Only the active pane scrolls; the rest always show the live screen.
                 let offset = if pr.active { self.scroll_offset } else { 0 };
-                if let Ok(ResultBody::Grid(g)) = self.client.call(Call::GetGrid { pane: pr.id, offset }) {
-                    if pr.active {
-                        // Accept the server's clamp and remember the history depth / rows for
-                        // local wheel clamping and page sizing.
-                        self.scroll_offset = g.offset as usize;
-                        self.scroll_history = g.history as usize;
-                        self.active_rows = g.rows as usize;
-                        self.active_bracketed = g.bracketed_paste;
+                let active_dyn = pr.active
+                    && (self.scroll_offset > 0
+                        || self.selection.as_ref().is_some_and(|s| s.pane == pr.id));
+                let need = needs_fetch(pr.id, force_full, &damaged, active_dyn, self.snap_cache.contains_key(&pr.id));
+                let snap = if need {
+                    match self.client.call(Call::GetGrid { pane: pr.id, offset }) {
+                        Ok(ResultBody::Grid(g)) => {
+                            if pr.active {
+                                // Accept the server's clamp and remember the history depth / rows
+                                // for local wheel clamping and page sizing.
+                                self.scroll_offset = g.offset as usize;
+                                self.scroll_history = g.history as usize;
+                                self.active_rows = g.rows as usize;
+                                self.active_bracketed = g.bracketed_paste;
+                            }
+                            let mut s = grid_to_snapshot(&g);
+                            if g.offset > 0 {
+                                // Scrolled into history: park the cursor off-grid so no cell draws it.
+                                s.cursor = (g.cols, g.rows);
+                            }
+                            self.snap_cache.insert(pr.id, s.clone());
+                            Some(s)
+                        }
+                        // Fetch failed this frame: fall back to the cached snapshot if we have one.
+                        _ => self.snap_cache.get(&pr.id).cloned(),
                     }
-                    let mut snap = grid_to_snapshot(&g);
-                    if g.offset > 0 {
-                        // Scrolled into history: park the cursor off-grid so no cell draws it.
-                        snap.cursor = (g.cols, g.rows);
-                    }
-                    let att = if pr.attention { Attention::Pending } else { Attention::Quiet };
-                    let rect = Rect { x: pr.x + sidebar_w, y: pr.y, w: pr.w, h: pr.h };
-                    snaps.push((snap, att, pr.active, rect, g.offset, pr.id, pr.title.clone()));
-                }
+                } else {
+                    self.snap_cache.get(&pr.id).cloned()
+                };
+                let Some(snap) = snap else { continue };
+                let att = if pr.attention { Attention::Pending } else { Attention::Quiet };
+                let rect = Rect { x: pr.x + sidebar_w, y: pr.y, w: pr.w, h: pr.h };
+                // Only the active pane can be scrolled; cached (non-active) panes are always live.
+                let scrolled = if pr.active { self.scroll_offset as u32 } else { 0 };
+                snaps.push((snap, att, pr.active, rect, scrolled, pr.id, pr.title.clone()));
             }
+        } else if matches!(self.client, Client::Ready(_)) {
+            // A Ready client that can't answer GetLayout has lost the daemon (reconnect+respawn
+            // already failed inside `call`): flag it so the loop exits instead of hanging white.
+            self.fatal = true;
         }
         let views: Vec<PaneView> = snaps
             .iter()
@@ -1096,6 +1259,7 @@ fn grid_to_snapshot(g: &GridWire) -> PaneSnapshot {
         italic: false,
         underline: false,
         inverse: false,
+        wide: false,
     };
     let mut cells = Vec::with_capacity(rows);
     for r in 0..rows {
@@ -1111,6 +1275,7 @@ fn grid_to_snapshot(g: &GridWire) -> PaneSnapshot {
                     italic: cw.flags & CELL_ITALIC != 0,
                     underline: cw.flags & CELL_UNDERLINE != 0,
                     inverse: cw.flags & CELL_INVERSE != 0,
+                    wide: cw.flags & CELL_WIDE != 0,
                 },
                 None => blank,
             });
@@ -1118,6 +1283,37 @@ fn grid_to_snapshot(g: &GridWire) -> PaneSnapshot {
         cells.push(row);
     }
     PaneSnapshot { cells, cursor: (g.cursor_col, g.cursor_row), cols: g.cols, rows: g.rows }
+}
+
+/// A hash of the layout's geometry (active pane + each pane's id/rect). A change means a tab
+/// switch, split, close, or resize happened, so every visible pane's grid must be refetched.
+/// Deliberately excludes tab metadata (name/attention/progress) — those are sidebar-only and don't
+/// affect which grids to fetch.
+fn layout_fetch_hash(layout: &LayoutWire) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    layout.active_pane.hash(&mut h);
+    for p in &layout.panes {
+        (p.id, p.x, p.y, p.w, p.h).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Take and clear the shared damaged-pane set (empty if the lock is poisoned).
+fn take_damaged(set: &Mutex<HashSet<u64>>) -> HashSet<u64> {
+    set.lock().map(|mut d| std::mem::take(&mut *d)).unwrap_or_default()
+}
+
+/// Drop cached snapshots for panes no longer present in the layout.
+fn evict_stale(cache: &mut HashMap<u64, PaneSnapshot>, live: &HashSet<u64>) {
+    cache.retain(|id, _| live.contains(id));
+}
+
+/// Whether pane `id` needs a fresh GetGrid this frame: a full refetch was forced (layout change),
+/// it produced output (in the damaged set), it's the active pane while scrolled/selected, or it
+/// isn't cached yet.
+fn needs_fetch(id: u64, force_full: bool, damaged: &HashSet<u64>, active_dyn: bool, in_cache: bool) -> bool {
+    force_full || active_dyn || !in_cache || damaged.contains(&id)
 }
 
 /// Last-modified time of the config file, or `None` if it doesn't exist / can't be stat'd.
@@ -1308,5 +1504,80 @@ mod tests {
         assert!(dir.join("first-run").exists(), "marker file should be created");
         assert!(!first_run(&dir), "second call should see the marker");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Damage-set take: the shared set is drained into the caller and cleared, so a second take is
+    /// empty — the render's "fetch these, then forget them" contract.
+    #[test]
+    fn take_damaged_drains_and_clears() {
+        let set = Mutex::new(HashSet::new());
+        set.lock().unwrap().extend([1u64, 2, 3]);
+        assert_eq!(take_damaged(&set), HashSet::from([1, 2, 3]));
+        assert!(take_damaged(&set).is_empty(), "second take is empty — the set was cleared");
+        assert!(set.lock().unwrap().is_empty());
+    }
+
+    /// Cache eviction keeps only panes still in the layout (a closed pane's snapshot is dropped).
+    #[test]
+    fn evict_stale_keeps_only_live_panes() {
+        let mut cache: HashMap<u64, PaneSnapshot> = HashMap::new();
+        for id in [1u64, 2, 3] {
+            cache.insert(id, grid_to_snapshot(&grid(1, 1, &[' '])));
+        }
+        evict_stale(&mut cache, &HashSet::from([1u64, 3]));
+        let mut kept: Vec<u64> = cache.keys().copied().collect();
+        kept.sort();
+        assert_eq!(kept, vec![1, 3]);
+    }
+
+    /// Fetch gate: forced full, damage, an active scrolled/selected pane, or a cache miss each
+    /// force a GetGrid; an idle cached undamaged pane is skipped (reuses its snapshot).
+    #[test]
+    fn needs_fetch_gates_on_damage_force_and_cache() {
+        let dmg = HashSet::from([7u64]);
+        assert!(!needs_fetch(1, false, &dmg, false, true), "cached + undamaged + idle: skip");
+        assert!(needs_fetch(7, false, &dmg, false, true), "damaged: fetch");
+        assert!(needs_fetch(1, false, &dmg, false, false), "cache miss: fetch");
+        assert!(needs_fetch(1, true, &dmg, false, true), "forced full: fetch");
+        assert!(needs_fetch(1, false, &dmg, true, true), "active scrolled/selected: fetch");
+    }
+
+    /// The fetch hash tracks geometry (active pane + pane rects) and ignores tab metadata, so a
+    /// mere attention/progress change doesn't trigger a full refetch but a resize does.
+    #[test]
+    fn layout_fetch_hash_tracks_geometry_only() {
+        let panes = || vec![rect(1, 0, 0, 80, 40), rect(2, 80, 0, 80, 40)];
+        let base = LayoutWire { active_pane: 1, tabs: vec![], panes: panes() };
+        let tab = gmux_proto::TabWire {
+            index: 0, name: "changed".into(), branch: None, attention: true, active: true,
+            progress: Some(50), progress_error: false,
+        };
+        let same = LayoutWire { active_pane: 1, tabs: vec![tab], panes: panes() };
+        assert_eq!(layout_fetch_hash(&base), layout_fetch_hash(&same), "tab metadata is ignored");
+        let resized = LayoutWire { active_pane: 1, tabs: vec![], panes: vec![rect(1, 0, 0, 100, 40), rect(2, 100, 0, 60, 40)] };
+        assert_ne!(layout_fetch_hash(&base), layout_fetch_hash(&resized), "a resize changes the hash");
+        let refocused = LayoutWire { active_pane: 2, tabs: vec![], panes: panes() };
+        assert_ne!(layout_fetch_hash(&base), layout_fetch_hash(&refocused), "a focus change changes the hash");
+    }
+
+    /// grid_to_snapshot maps the wire's CELL_WIDE flag (bit 4) onto Cell.wide; the spacer isn't wide.
+    #[test]
+    fn grid_to_snapshot_maps_wide_flag() {
+        let g = GridWire {
+            cols: 2,
+            rows: 1,
+            cursor_col: 0,
+            cursor_row: 0,
+            cells: vec![
+                gmux_proto::CellWire { ch: '中', fg: [0; 3], bg: [0; 3], flags: CELL_WIDE },
+                gmux_proto::CellWire { ch: ' ', fg: [0; 3], bg: [0; 3], flags: 0 },
+            ],
+            history: 0,
+            offset: 0,
+            bracketed_paste: false,
+        };
+        let snap = grid_to_snapshot(&g);
+        assert!(snap.cells[0][0].wide, "wide char maps to Cell.wide");
+        assert!(!snap.cells[0][1].wide, "the spacer cell is not wide");
     }
 }

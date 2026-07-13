@@ -7,7 +7,7 @@
 
 pub mod remote;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader};
 use std::sync::{Arc, Mutex};
 
@@ -21,6 +21,7 @@ use gmux_pipe::{PipeServer, PipeStream};
 use gmux_proto::{
     read_msg, write_msg, Call, CellWire, GridWire, LayoutWire, NotifyWire, PaneInfo, PaneRectWire,
     Request, Response, ResultBody, TabWire, CELL_BOLD, CELL_INVERSE, CELL_ITALIC, CELL_UNDERLINE,
+    CELL_WIDE,
 };
 
 use remote::RemoteAttachment;
@@ -125,6 +126,8 @@ impl Server {
         let mut notes = Vec::new();
         let mut exited = Vec::new();
         let mut progress = Vec::new();
+        // Panes whose grid changed this tick — coalesced (a HashSet) to one damage wire per pane.
+        let mut damaged: HashSet<PaneId> = HashSet::new();
         for w in self.session.windows() {
             for p in w.panes() {
                 for ev in p.drain_events() {
@@ -141,15 +144,24 @@ impl Server {
                         }),
                         PaneEvent::Exited => exited.push(p.id),
                         PaneEvent::Progress { state, pct } => progress.push((p.id, state, pct)),
+                        PaneEvent::Output => {
+                            damaged.insert(p.id);
+                        }
                         _ => {}
                     }
                 }
             }
         }
-        // The push batch is the notifications plus a synthetic wire per exit; subscribers see both.
+        // The push batch is the notifications plus a synthetic wire per exit and per damaged pane;
+        // subscribers see all three. `pane-output` wires are push-only (never queued for
+        // PollNotifications) and are filtered back out for subscribers that didn't opt into
+        // `output` — so toasts and plain `gmux subscribe` streams never see damage traffic.
         let mut batch = notes.clone();
         for id in &exited {
             batch.push(exit_notify(id.0));
+        }
+        for id in &damaged {
+            batch.push(output_notify(id.0));
         }
         self.notifications.extend(notes);
         for (id, state, pct) in progress {
@@ -381,8 +393,9 @@ impl Server {
                 Response::ok(id, ResultBody::Notifications(std::mem::take(&mut self.notifications)))
             }
             // Registration happens in serve_connection (it owns the writer clone to add to the
-            // subscriber list); handle() only acks so the client knows the stream is armed.
-            Call::Subscribe => Response::ok(id, ResultBody::Done),
+            // subscriber list, with the `output` flag); handle() only acks so the client knows the
+            // stream is armed.
+            Call::Subscribe { .. } => Response::ok(id, ResultBody::Done),
             Call::SetPalette { fg, bg, ansi } => {
                 let mut palette = Palette::default();
                 palette.fg = Rgb { r: fg[0], g: fg[1], b: fg[2] };
@@ -563,6 +576,9 @@ fn grid_wire(p: &Pane, offset: usize) -> GridWire {
             if c.inverse {
                 flags |= CELL_INVERSE;
             }
+            if c.wide {
+                flags |= CELL_WIDE;
+            }
             cells.push(CellWire {
                 ch: c.ch,
                 fg: [c.fg.r, c.fg.g, c.fg.b],
@@ -612,6 +628,13 @@ fn exit_notify(pane: u64) -> NotifyWire {
     NotifyWire { pane, title: "pane-exited".into(), body: String::new(), urgency: 1 }
 }
 
+/// The wire form of per-pane damage for `output` subscribers: a `NotifyWire` with the reserved
+/// `"pane-output"` title and the damaged pane's id (see `Call::Subscribe` docs). Filtered out of
+/// non-`output` subscriber streams by [`push_to_subscribers`].
+fn output_notify(pane: u64) -> NotifyWire {
+    NotifyWire { pane, title: "pane-output".into(), body: String::new(), urgency: 0 }
+}
+
 /// Push one event `batch` to every subscriber as a `Response{id:0}` line, dropping (via
 /// `retain`) any subscriber whose write fails — a disconnected client is simply removed. A empty
 /// batch is a no-op. Split out so it can be unit-tested with an in-process pipe pair (no console).
@@ -623,15 +646,45 @@ fn exit_notify(pane: u64) -> NotifyWire {
 // ponytail: a subscriber that stops reading entirely can still fill its 64 KiB buffer and block
 // the push thread (stalling delivery to other subscribers, never the daemon loop) — per-subscriber
 // writer threads if that ever matters.
-fn push_to_subscribers(subscribers: &mut Vec<PipeStream>, batch: &[NotifyWire]) {
+//
+// Each subscriber carries its `output` opt-in flag. `pane-output` damage wires go only to
+// `output == true` subscribers; everyone else gets the batch with those wires stripped (and no
+// line at all if that leaves nothing). Two lines are serialized at most once per push, not once
+// per subscriber.
+fn push_to_subscribers(subscribers: &mut Vec<(PipeStream, bool)>, batch: &[NotifyWire]) {
     use std::io::Write;
     if batch.is_empty() {
         return;
     }
+    // Full line: every wire, for `output` subscribers.
+    let Some(full) = serialize_push(batch) else { return };
+    // Filtered line: drop `pane-output` damage wires, for non-`output` subscribers. `None` when
+    // that leaves an empty batch — those subscribers simply get nothing this tick.
+    let filtered: Vec<NotifyWire> =
+        batch.iter().filter(|n| n.title != "pane-output").cloned().collect();
+    let filtered_line = if filtered.len() == batch.len() {
+        Some(full.clone()) // nothing stripped — reuse the full line
+    } else if filtered.is_empty() {
+        None
+    } else {
+        serialize_push(&filtered)
+    };
+    subscribers.retain_mut(|(w, output)| {
+        let line = if *output { Some(&full) } else { filtered_line.as_ref() };
+        match line {
+            Some(l) => w.write_all(l.as_bytes()).is_ok(),
+            None => true, // no line for this subscriber this tick; keep it connected
+        }
+    });
+}
+
+/// Serialize one push batch as a `Response{id:0}` JSON line (newline-terminated). `None` if
+/// serialization somehow fails (a poisoned/inexpressible value) — the caller then skips the push.
+fn serialize_push(batch: &[NotifyWire]) -> Option<String> {
     let push = Response::ok(0, ResultBody::Notifications(batch.to_vec()));
-    let Ok(mut line) = serde_json::to_string(&push) else { return };
+    let mut line = serde_json::to_string(&push).ok()?;
     line.push('\n');
-    subscribers.retain_mut(|w| w.write_all(line.as_bytes()).is_ok());
+    Some(line)
 }
 
 /// Read the `persist_screen` flag from the same `%APPDATA%\gmux\gmux.json` the GUI reads (M7
@@ -690,7 +743,9 @@ pub fn run(shell: String, pipe_base: &str) -> io::Result<()> {
     // Push subscribers, kept in their own mutex (not the Server one): tick() runs under the Server
     // lock, but the push writes go through these separate writer handles *after* the Server lock is
     // released, so a slow/blocked subscriber can never stall a request thread holding the Server.
-    let subscribers: Arc<Mutex<Vec<PipeStream>>> = Arc::new(Mutex::new(Vec::new()));
+    // Each entry pairs a writer handle with its `output` opt-in (whether it wants `pane-output`
+    // damage wires) — see `Call::Subscribe`.
+    let subscribers: Arc<Mutex<Vec<(PipeStream, bool)>>> = Arc::new(Mutex::new(Vec::new()));
     let name = gmux_pipe::pipe_name_for_user(pipe_base);
     let handler_server = server.clone();
     let handler_subs = subscribers.clone();
@@ -739,7 +794,7 @@ pub fn run(shell: String, pipe_base: &str) -> io::Result<()> {
 fn serve_connection(
     stream: PipeStream,
     server: &Arc<Mutex<Server>>,
-    subscribers: &Arc<Mutex<Vec<PipeStream>>>,
+    subscribers: &Arc<Mutex<Vec<(PipeStream, bool)>>>,
 ) {
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
@@ -755,7 +810,10 @@ fn serve_connection(
                 return;
             }
         };
-        let is_subscribe = matches!(req.call, Call::Subscribe);
+        let subscribe_output = match &req.call {
+            Call::Subscribe { output } => Some(*output),
+            _ => None,
+        };
         let resp = match server.lock() {
             Ok(mut s) => s.handle(&req),
             Err(_) => Response::err(req.id, "server lock poisoned"),
@@ -763,13 +821,14 @@ fn serve_connection(
         if write_msg(&mut writer, &resp).is_err() {
             return;
         }
-        // On a successful Subscribe, register a second writer handle so the daemon loop can push
-        // event batches on this connection. The read loop continues (further requests still serve).
-        if is_subscribe && resp.error.is_none() {
+        // On a successful Subscribe, register a second writer handle (with its `output` flag) so
+        // the daemon loop can push event batches on this connection. The read loop continues
+        // (further requests still serve).
+        if let (Some(output), true) = (subscribe_output, resp.error.is_none()) {
             match writer.try_clone() {
                 Ok(w) => {
                     if let Ok(mut subs) = subscribers.lock() {
-                        subs.push(w);
+                        subs.push((w, output));
                     }
                 }
                 Err(_) => return,
@@ -1013,7 +1072,7 @@ mod tests {
             NotifyWire { pane: 3, title: "hi".into(), body: "there".into(), urgency: 2 },
             exit_notify(7),
         ];
-        let mut subs = vec![server_side.try_clone().unwrap()];
+        let mut subs = vec![(server_side.try_clone().unwrap(), true)];
         push_to_subscribers(&mut subs, &batch);
         assert_eq!(subs.len(), 1, "a live subscriber is retained");
 
@@ -1044,7 +1103,7 @@ mod tests {
 
         let client = client_connect(&name).unwrap();
         let server_side = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        let mut subs = vec![server_side];
+        let mut subs = vec![(server_side, true)];
 
         // Empty batch: nothing written, subscriber untouched.
         push_to_subscribers(&mut subs, &[]);
@@ -1062,5 +1121,72 @@ mod tests {
             push_to_subscribers(&mut subs, &batch);
         }
         assert!(subs.is_empty(), "a subscriber whose peer hung up must be dropped");
+    }
+
+    /// `pane-output` damage wires reach only `output == true` subscribers; an `output == false`
+    /// subscriber sees the batch with them stripped, and gets no line at all for a tick whose only
+    /// wires were damage. Uses two in-process pipe pairs — no console/ConPTY.
+    #[test]
+    fn output_flag_gates_pane_output_wires() {
+        use gmux_pipe::{client_connect, PipeServer};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::mpsc;
+
+        static N: AtomicU32 = AtomicU32::new(0);
+        let name = format!("gmux-subtest-outflag-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
+
+        let (tx, rx) = mpsc::channel();
+        let _server = PipeServer::start(&name, move |stream| {
+            let _ = tx.send(stream);
+        })
+        .unwrap();
+
+        // Connect two subscribers, sequencing connect->recv so each server-side stream maps to its
+        // client: A opts into output, B does not.
+        let client_a = client_connect(&name).unwrap();
+        let server_a = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let client_b = client_connect(&name).unwrap();
+        let server_b = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let mut subs = vec![(server_a, true), (server_b, false)];
+
+        let mut reader_a = BufReader::new(client_a);
+        let mut reader_b = BufReader::new(client_b);
+        let read = |r: &mut BufReader<_>| -> Vec<NotifyWire> {
+            match read_msg::<Response>(r).unwrap().unwrap().result {
+                Some(ResultBody::Notifications(n)) => n,
+                other => panic!("expected Notifications, got {other:?}"),
+            }
+        };
+
+        // Mixed batch: a real notification + a damage wire.
+        let hi = NotifyWire { pane: 1, title: "hi".into(), body: String::new(), urgency: 1 };
+        push_to_subscribers(&mut subs, &[hi.clone(), output_notify(5)]);
+        assert_eq!(read(&mut reader_a), vec![hi.clone(), output_notify(5)], "output=true sees damage");
+        assert_eq!(read(&mut reader_b), vec![hi.clone()], "output=false has damage stripped");
+
+        // Damage-only batch: A gets it, B is skipped (no line). Prove B was skipped by pushing a
+        // following real notification — B's very next line is that one, not the damage tick.
+        push_to_subscribers(&mut subs, &[output_notify(7)]);
+        assert_eq!(read(&mut reader_a), vec![output_notify(7)], "output=true sees damage-only tick");
+        let bye = NotifyWire { pane: 2, title: "bye".into(), body: String::new(), urgency: 1 };
+        push_to_subscribers(&mut subs, &[bye.clone()]);
+        assert_eq!(read(&mut reader_b), vec![bye], "output=false skipped the damage-only tick");
+
+        assert_eq!(subs.len(), 2, "both subscribers stay connected");
+    }
+
+    /// `grid_wire` maps a double-width (CJK) cell to `CELL_WIDE` and leaves the trailing spacer
+    /// flagless. Exercises the whole path bytes -> vt grid -> `Cell.wide` -> `CellWire.flags`.
+    /// Console-free remote pane, so it runs headless.
+    #[test]
+    fn grid_wire_maps_wide_flag() {
+        use gmux_mux::Pane;
+        let p = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        p.push_output("中".as_bytes()); // U+4E2D, double-width
+        let wire = grid_wire(&p, 0);
+        assert_eq!(wire.cells[0].ch, '中');
+        assert_eq!(wire.cells[0].flags & CELL_WIDE, CELL_WIDE, "wide char sets CELL_WIDE");
+        assert_eq!(wire.cells[1].ch, ' ', "the cell after a wide char is a blank spacer");
+        assert_eq!(wire.cells[1].flags & CELL_WIDE, 0, "spacer is not itself wide");
     }
 }

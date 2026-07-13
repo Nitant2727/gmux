@@ -397,3 +397,22 @@ fn cells_at_offset_scrolls_into_history() {
     let clamped = t.cells_at_offset(9999);
     assert_eq!(clamped.len(), 5);
 }
+
+// ---------------------------------------------------------------------------
+// Wide (double-width CJK) cells.
+// ---------------------------------------------------------------------------
+
+/// A double-width char (U+4E2D 中) sets `wide` on its cell and leaves the following spacer cell
+/// blank (`ch == ' '`), so the renderer/wire can size it across two columns.
+#[test]
+fn wide_char_flags_cell_and_leaves_spacer() {
+    let mut t = Terminal::new(80, 24);
+    t.advance("中".as_bytes()); // UTF-8: E4 B8 AD
+    let row = &t.visible_cells()[0];
+    assert_eq!(row[0].ch, '中');
+    assert!(row[0].wide, "double-width char must set Cell.wide");
+    assert!(!row[1].wide, "spacer cell is not itself wide");
+    assert_eq!(row[1].ch, ' ', "the cell after a wide char is a blank spacer");
+    // The cursor advances two columns past a wide glyph.
+    assert_eq!(t.cursor(), (2, 0));
+}
