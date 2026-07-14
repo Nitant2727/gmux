@@ -186,7 +186,7 @@ mod tests {
             progress: None,
             progress_error: false,
         }];
-        r.render_frame(&view, &rows, sw, &[], w, h, "", false);
+        r.render_frame(&view, &rows, sw, &[], w, h, "", false, None, None);
         let px = read_rgba(&r, &tex, w, h).expect("readback");
         // Panel bg is #181825 (r≈24); active fill is #313244 (r≈49). Threshold 40 splits them.
         let corner = pixel(&px, w, 1, rows_y0 + 1);
@@ -253,6 +253,63 @@ mod tests {
             selected[0] as i32 - unselected[0] as i32 > 60,
             "selected cell should be visibly highlighted, got sel={selected:?} unsel={unselected:?}"
         );
+    }
+
+    #[test]
+    fn search_bar_renders_band() {
+        // A frame with a SearchBar on the active pane draws a band at the pane bottom whose text
+        // glyphs (the TEXT-white query "foo_") appear only there — absent without a SearchBar.
+        use crate::renderer::{PaneView, SearchBar};
+        use gmux_mux::Rect;
+        let bg = Rgb { r: 200, g: 20, b: 20 }; // distinct cell bg (vs the band's dark BG_SIDEBAR)
+        let fg = Rgb { r: 0, g: 0, b: 0 };
+        let snap = PaneSnapshot { cells: vec![vec![cell(' ', fg, bg); 8]; 4], cursor: (99, 99), cols: 8, rows: 4 };
+        let Some(r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
+            return;
+        };
+        let (cw, ch) = (r.cell_w(), r.cell_h());
+        let (w, h) = (cw * 8 + 60, ch * 4 + 100);
+        let tex = r.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gmux-search-test"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let pv = || PaneView {
+            snap: &snap,
+            attention: Attention::Quiet,
+            active: true,
+            rect: Rect { x: 0, y: 0, w, h },
+            scrolled: 0,
+            title: String::new(),
+            selection: None,
+        };
+        // Band spans y in [h-31, h-9] (cy=MARGIN=8, border=1, SEARCH_BAR=22). Count TEXT-white
+        // pixels there (the query glyphs) — none appear without a SearchBar.
+        let white_in_band = |px: &[u8]| {
+            let mut n = 0;
+            for y in (h - 30)..(h - 10) {
+                for x in 0..w {
+                    let p = pixel(px, w, x, y);
+                    if p[0] > 150 && p[1] > 150 && p[2] > 150 {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let sb = SearchBar { query: "foo".into(), current: 1, total: 5 };
+        r.render_frame(&view, &[], 0, &[pv()], w, h, "", false, Some(&sb), None);
+        let with = white_in_band(&read_rgba(&r, &tex, w, h).expect("readback"));
+        r.render_frame(&view, &[], 0, &[pv()], w, h, "", false, None, None);
+        let without = white_in_band(&read_rgba(&r, &tex, w, h).expect("readback"));
+        assert!(with > 3, "search band should draw the query text ({with} white px)");
+        assert_eq!(without, 0, "no search bar → no band text ({without} white px)");
     }
 
     /// The cell width the dynamic atlas assigns to `ch` when asked for a wide tile: 2 if a font in

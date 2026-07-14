@@ -297,6 +297,35 @@ impl Pane {
         self.terminal.lock().unwrap().history_len()
     }
 
+    /// Case-insensitive substring search over scrollback + the visible screen. Returns the scroll
+    /// offsets (lines above the live bottom, usable directly as `GetGrid.offset`) of matching lines,
+    /// nearest-to-bottom first, capped at 500. Empty query -> no matches.
+    ///
+    /// The offset mapping: [`Terminal::scrollback_text`]`(0)` returns the full grid
+    /// `topmost..=bottommost` (only *leading* blank lines trimmed), so its last element is always the
+    /// live-bottom line and a line's distance from the bottom `(len-1) - i` is exactly its grid
+    /// `GetGrid.offset` — top-trimming shifts every remaining index equally, preserving that distance.
+    pub fn search(&self, query: &str) -> Vec<u32> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        // ponytail: per-line to_lowercase allocs; a scrollback search is user-initiated and cold, so
+        // the naive scan is fine — swap for an allocation-free case-fold if it ever shows on a profile.
+        let needle = query.to_lowercase();
+        let lines = self.scrollback_text(0);
+        let last = lines.len().saturating_sub(1);
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate().rev() {
+            if line.to_lowercase().contains(&needle) {
+                out.push((last - i) as u32);
+                if out.len() >= 500 {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
     /// Whether the pane's application enabled bracketed paste (DECSET 2004).
     pub fn bracketed_paste(&self) -> bool {
         self.terminal.lock().unwrap().bracketed_paste()

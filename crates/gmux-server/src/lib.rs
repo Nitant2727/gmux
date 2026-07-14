@@ -239,6 +239,10 @@ impl Server {
                 Some(p) => Response::ok(id, ResultBody::Text(capture(p, *scrollback))),
                 None => Response::err(id, format!("no pane %{pane}")),
             },
+            Call::SearchPane { pane, query } => match self.find(*pane) {
+                Some(p) => Response::ok(id, ResultBody::Matches(p.search(query))),
+                None => Response::err(id, format!("no pane %{pane}")),
+            },
             Call::SplitPane { dir, command } => {
                 let sd = match dir.as_str() {
                     "h" => SplitDir::Horizontal,
@@ -824,17 +828,19 @@ fn serve_connection(
             return;
         }
         // On a successful Subscribe, register a second writer handle (with its `output` flag) so
-        // the daemon loop can push event batches on this connection. The read loop continues
-        // (further requests still serve).
+        // the daemon loop can push event batches on this connection, then STOP reading it: a
+        // pending synchronous ReadFile and a WriteFile on the same pipe instance serialize on the
+        // kernel's file-object lock, so keeping a blocking read parked here would wedge the push
+        // thread's first write forever (both real subscribers — the GUI's and `gmux subscribe` —
+        // are write-never clients anyway). Dropping our reader is fine: the registered clone keeps
+        // the instance open, and a dead client surfaces as a push write error (retain drops it).
         if let (Some(output), true) = (subscribe_output, resp.error.is_none()) {
-            match writer.try_clone() {
-                Ok(w) => {
-                    if let Ok(mut subs) = subscribers.lock() {
-                        subs.push((w, output));
-                    }
+            if let Ok(w) = writer.try_clone() {
+                if let Ok(mut subs) = subscribers.lock() {
+                    subs.push((w, output));
                 }
-                Err(_) => return,
             }
+            return;
         }
     }
 }
@@ -1086,6 +1092,71 @@ mod tests {
         let _ = &mut server_side;
     }
 
+    /// End-to-end over the real request path: a client that subscribes THROUGH `serve_connection`
+    /// still receives pushes. Regression test for the push-write deadlock: serve_connection used
+    /// to park a blocking ReadFile on the subscribed connection, and synchronous pipe operations
+    /// on one instance serialize on the kernel's file-object lock — the push thread's first
+    /// WriteFile wedged forever behind that never-returning read (the GUI showed a permanently
+    /// stale grid). The fix makes Subscribe terminal: the connection becomes push-only. The push
+    /// here runs on a helper thread with a timeout so a regression fails instead of hanging.
+    #[test]
+    fn subscribe_via_serve_connection_still_receives_pushes() {
+        use gmux_mux::{Pane, Session};
+        use gmux_pipe::{client_connect, PipeServer};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        static N: AtomicU32 = AtomicU32::new(0);
+        let name =
+            format!("gmux-subtest-serve-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
+
+        let server = Arc::new(Mutex::new(Server {
+            session: Session::start("t", Pane::remote(1, 80, 24, Box::new(|_| {}))),
+            shell: "pwsh".into(),
+            last_view: (800, 600),
+            notifications: Vec::new(),
+            browse_requests: Vec::new(),
+            ticks: 0,
+            remotes: Vec::new(),
+            progress: HashMap::new(),
+            palette: Palette::default(),
+            persist_screen: true,
+        }));
+        let subs: Arc<Mutex<Vec<(PipeStream, bool)>>> = Arc::new(Mutex::new(Vec::new()));
+        let hs = server.clone();
+        let hsubs = subs.clone();
+        let _pipe = PipeServer::start(&name, move |stream| serve_connection(stream, &hs, &hsubs)).unwrap();
+
+        let client = client_connect(&name).unwrap();
+        let mut writer = client.try_clone().unwrap();
+        let mut reader = BufReader::new(client);
+        write_msg(&mut writer, &Request { id: 1, call: Call::Subscribe { output: true } }).unwrap();
+        let ack: Response = read_msg(&mut reader).unwrap().unwrap();
+        assert!(ack.error.is_none(), "subscribe must ack ok");
+
+        // Wait for serve_connection to register the push writer.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while subs.lock().unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "subscriber never registered");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let psubs = subs.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            push_to_subscribers(&mut psubs.lock().unwrap(), &[output_notify(9)]);
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("push write deadlocked — is the subscribed connection still being read?");
+
+        let push: Response = read_msg(&mut reader).unwrap().unwrap();
+        assert_eq!(push.id, 0, "pushes are unsolicited id:0 envelopes");
+        assert_eq!(push.result, Some(ResultBody::Notifications(vec![output_notify(9)])));
+    }
+
     /// An empty batch is a no-op (no line written), and a subscriber whose peer has hung up is
     /// dropped from the list on the next push (its write fails).
     #[test]
@@ -1175,6 +1246,46 @@ mod tests {
         assert_eq!(read(&mut reader_b), vec![bye], "output=false skipped the damage-only tick");
 
         assert_eq!(subs.len(), 2, "both subscribers stay connected");
+    }
+
+    /// `SearchPane` routes through the pane and returns `Matches`; an unknown pane errors. Uses a
+    /// console-free remote pane fed numbered lines, so it runs headless.
+    #[test]
+    fn search_pane_returns_matches_and_errors_on_unknown_pane() {
+        use gmux_mux::{Pane, Session};
+        let pane = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        let pid = pane.id.0;
+        let mut server = Server {
+            session: Session::start("t", pane),
+            shell: "pwsh".into(),
+            last_view: (800, 600),
+            notifications: Vec::new(),
+            browse_requests: Vec::new(),
+            ticks: 0,
+            remotes: Vec::new(),
+            progress: HashMap::new(),
+            palette: Palette::default(),
+            persist_screen: true,
+        };
+        // Fill past the 24-row screen so the live bottom is real content (line "s29"), not blank
+        // padding, giving representative offsets: "s29" is the live bottom (0), "s27" is 2 above.
+        let mut feed = String::new();
+        for i in 0..30 {
+            if i > 0 {
+                feed.push_str("\r\n");
+            }
+            feed.push_str(&format!("s{i}"));
+        }
+        server.session.pane(PaneId(pid)).unwrap().push_output(feed.as_bytes());
+
+        // "s27" is 2 lines above the live bottom ("s29") -> offset 2; case-insensitive.
+        let resp = server.handle(&Request { id: 1, call: Call::SearchPane { pane: pid, query: "S27".into() } });
+        assert_eq!(resp.result, Some(ResultBody::Matches(vec![2])));
+
+        // Unknown pane errors.
+        let miss = server.handle(&Request { id: 2, call: Call::SearchPane { pane: 999, query: "x".into() } });
+        assert!(miss.result.is_none());
+        assert!(miss.error.is_some());
     }
 
     /// `grid_wire` maps a double-width (CJK) cell to `CELL_WIDE` and leaves the trailing spacer

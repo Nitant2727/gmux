@@ -37,6 +37,11 @@ pub enum Call {
     /// viewport: `Some(0)` = all retained scrollback + screen, `Some(n)` = the most-recent `n`
     /// lines, `None` = the visible screen only.
     CapturePane { pane: u64, #[serde(default)] scrollback: Option<usize> },
+    /// Search a pane's scrollback + visible screen for `query` (case-insensitive substring).
+    /// Replies [`ResultBody::Matches`]: the scroll offsets (lines above the live bottom, usable
+    /// directly as [`Call::GetGrid`]'s `offset`) of matching lines, nearest-to-bottom first, capped
+    /// at 500. An empty `query` yields no matches; an unknown pane errors.
+    SearchPane { pane: u64, #[serde(default)] query: String },
     /// Split the active pane. `dir` is "h" (side-by-side) or "v" (stacked).
     SplitPane { dir: String, #[serde(default)] command: Option<String> },
     /// Open a new window (tab).
@@ -179,6 +184,8 @@ pub enum ResultBody {
     Hello { server_version: String, protocol: u32 },
     Panes(Vec<PaneInfo>),
     Text(String),
+    /// Scroll offsets of `search-pane` matches (see [`Call::SearchPane`]).
+    Matches(Vec<u32>),
     PaneId(u64),
     Layout(LayoutWire),
     Grid(GridWire),
@@ -347,6 +354,7 @@ mod tests {
             Call::ListPanes,
             Call::SendKeys { pane: 5, text: "ls".into(), enter: true },
             Call::CapturePane { pane: 5, scrollback: Some(100) },
+            Call::SearchPane { pane: 5, query: "TODO".into() },
             Call::SplitPane { dir: "h".into(), command: None },
             Call::NewWindow { command: Some("cmd.exe".into()) },
             Call::Notify { pane: Some(5), title: "T".into(), body: "B".into() },
@@ -597,6 +605,23 @@ mod tests {
         let line = r#"{"id":9,"x":0,"y":0,"w":80,"h":24,"active":false,"attention":false}"#;
         let rect: PaneRectWire = serde_json::from_str(line).unwrap();
         assert_eq!(rect.title, "");
+    }
+
+    #[test]
+    fn search_pane_is_kebab_case_and_matches_roundtrips() {
+        // Method name is kebab-case like the rest of the protocol.
+        let s = serde_json::to_string(&Request { id: 1, call: Call::SearchPane { pane: 2, query: "err".into() } }).unwrap();
+        assert!(s.contains("\"method\":\"search-pane\""), "{s}");
+        // Hand-written JSON omitting the (defaulted) query still parses -> empty query.
+        let req: Request = serde_json::from_str(r#"{"id":2,"method":"search-pane","params":{"pane":7}}"#).unwrap();
+        assert_eq!(req.call, Call::SearchPane { pane: 7, query: String::new() });
+        // The Matches result round-trips (kebab-case "matches").
+        let resp = Response::ok(3, ResultBody::Matches(vec![0, 5, 42]));
+        let mut buf = Vec::new();
+        write_msg(&mut buf, &resp).unwrap();
+        assert!(String::from_utf8(buf.clone()).unwrap().contains("\"matches\""));
+        let back: Response = read_msg(&mut Cursor::new(buf)).unwrap().unwrap();
+        assert_eq!(back, resp);
     }
 
     #[test]
