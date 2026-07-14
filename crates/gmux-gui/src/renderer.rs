@@ -3,7 +3,7 @@
 //! glyphs). Vertex buffers are rebuilt per frame (damage tracking is a later optimization).
 
 use bytemuck::{Pod, Zeroable};
-use gmux_mux::{Attention, PaneSnapshot, Rect, Rgb};
+use gmux_mux::{Attention, Cell, PaneSnapshot, Rect, Rgb};
 use wgpu::util::DeviceExt;
 
 use crate::atlas::{Atlas, GlyphLookup};
@@ -18,6 +18,7 @@ const ACCENT: Rgb = Rgb { r: 0x89, g: 0xb4, b: 0xfa }; // active borders / highl
 const TEXT: Rgb = Rgb { r: 0xcd, g: 0xd6, b: 0xf4 };
 const TEXT_DIM: Rgb = Rgb { r: 0x7f, g: 0x84, b: 0x9c };
 const ATTENTION: Rgb = Rgb { r: 0xf3, g: 0x8b, b: 0xa8 }; // attention dot / ring
+const PEACH: Rgb = Rgb { r: 0xfa, g: 0xb3, b: 0x87 }; // search-match highlight (Catppuccin Peach)
 const PROGRESS: Rgb = Rgb { r: 0xa6, g: 0xe3, b: 0xa1 };
 const ERROR: Rgb = Rgb { r: 0xf3, g: 0x8b, b: 0xa8 };
 const PANE_BORDER_INACTIVE: Rgb = Rgb { r: 0x31, g: 0x32, b: 0x44 };
@@ -460,6 +461,9 @@ impl Renderer {
         px_h: u32,
         draw_border: bool,
         selection: Option<((u16, u16), (u16, u16))>,
+        // Active-pane search needle (query pre-folded to lowercase chars); highlights every visible
+        // occurrence. `None` for inactive panes / no search.
+        search: Option<&[char]>,
     ) -> (Vec<BgVertex>, Vec<GlyphVertex>) {
         let cw = self.atlas.cell_w as f32;
         let ch = self.atlas.cell_h as f32;
@@ -478,6 +482,8 @@ impl Renderer {
         let (cursor_col, cursor_row) = snap.cursor;
 
         for (r, row) in snap.cells.iter().enumerate() {
+            // Per-row search-match mask (one folded scan per row); `None` when not searching.
+            let row_matches = search.map(|needle| mark_matches(row, needle));
             for (c, cell) in row.iter().enumerate() {
                 let x0 = c as f32 * cw;
                 let y0 = r as f32 * ch;
@@ -494,12 +500,21 @@ impl Renderer {
                 let selected = in_selection(selection, r, c)
                     || (lead_wide && in_selection(selection, r, c - 1))
                     || (cell.wide && in_selection(selection, r, c + 1));
+                // Search match: same wide-glyph spacer-inherit rule as selection/cursor.
+                let matched = row_matches.as_ref().is_some_and(|h| {
+                    let at = |col: usize| h.get(col).copied().unwrap_or(false);
+                    at(c) || (lead_wide && at(c - 1)) || (cell.wide && at(c + 1))
+                });
                 // Selection: swap fg/bg and tint the (swapped) bg 30% toward ACCENT so the
-                // highlight reads over any content (blank cells, dark-on-dark, etc.).
+                // highlight reads over any content (blank cells, dark-on-dark, etc.). A search match
+                // does the same toward PEACH (stronger blend); selection wins on overlap.
                 let (mut cell_bg, mut cell_fg) = (cell.bg, cell.fg);
                 if selected {
                     std::mem::swap(&mut cell_bg, &mut cell_fg);
                     cell_bg = blend(ACCENT, cell_bg, 0.3);
+                } else if matched {
+                    std::mem::swap(&mut cell_bg, &mut cell_fg);
+                    cell_bg = blend(PEACH, cell_bg, 0.6);
                 }
                 // Cursor: pre-blend at ~70% over the cell bg (opaque bg pipeline can't alpha-blend).
                 let bg_color = if is_cursor { blend(CURSOR, cell_bg, 0.7) } else { cell_bg };
@@ -597,6 +612,7 @@ impl Renderer {
                 pv.rect.h.max(1),
                 true,
                 pv.selection,
+                None,
             );
             draws.push(Draw {
                 rect: pv.rect,
@@ -921,8 +937,26 @@ impl Renderer {
             // ponytail: search band shrinks the visible cell area by SEARCH_BAR, but the daemon isn't
             // told — so the bottom cell row is covered (not resized away) while searching. Acceptable.
             let ih = (ch_ - bw - TITLE_STRIP - INSET - pad - if search_here { SEARCH_BAR } else { 0.0 }).max(1.0);
-            let (bg, glyphs) =
-                self.build_vertices(pv.snap, pv.attention, pv.active, iw as u32, ih as u32, false, pv.selection);
+            // Search-match highlight on the active pane only, when the query is non-empty AND the
+            // daemon reported matches — gating on total keeps the highlight and the "no matches"
+            // label from contradicting (a pane switch keeps the query but drops the matches).
+            let needle: Option<Vec<char>> = if pv.active {
+                search
+                    .filter(|sb| !sb.query.is_empty() && sb.total > 0)
+                    .map(|sb| sb.query.chars().map(fold).collect())
+            } else {
+                None
+            };
+            let (bg, glyphs) = self.build_vertices(
+                pv.snap,
+                pv.attention,
+                pv.active,
+                iw as u32,
+                ih as u32,
+                false,
+                pv.selection,
+                needle.as_deref(),
+            );
             draws.push(Draw {
                 rect: Rect { x: ix as u32, y: iy as u32, w: iw as u32, h: ih as u32 },
                 bg_n: bg.len() as u32,
@@ -980,9 +1014,13 @@ impl Renderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            // Sidebar (full-surface viewport).
-            pass.set_viewport(0.0, 0.0, fw, fh, 0.0, 1.0);
-            pass.set_scissor_rect(0, 0, surf_w, surf_h);
+            // Sidebar (full-surface viewport). Clamp guards a degenerate surface (minimize → 1×1);
+            // an unset viewport/scissor defaults to the full (valid) target, so the draws below stay
+            // safe even when the clamp skips the set.
+            if let Some((x, y, w, h)) = clamp_rect(0, 0, surf_w, surf_h, surf_w, surf_h) {
+                pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
+                pass.set_scissor_rect(x, y, w, h);
+            }
             if !sbg.is_empty() {
                 pass.set_pipeline(&self.bg_pipeline);
                 pass.set_vertex_buffer(0, sbg_buf.slice(..));
@@ -1001,12 +1039,12 @@ impl Renderer {
             }
             // Panes (viewport per pane).
             for d in &draws {
-                let (x, y) = (d.rect.x, d.rect.y);
-                if x >= surf_w || y >= surf_h {
-                    continue; // inset origin off-surface (absurdly small window): nothing to draw
-                }
-                let w = d.rect.w.max(1).min(surf_w.saturating_sub(x)).max(1);
-                let h = d.rect.h.max(1).min(surf_h.saturating_sub(y)).max(1);
+                // Clamp the inset rect to the surface; skip the pane when it clamps to empty
+                // (off-surface origin on an absurdly small / minimized window).
+                let Some((x, y, w, h)) = clamp_rect(d.rect.x, d.rect.y, d.rect.w, d.rect.h, surf_w, surf_h)
+                else {
+                    continue;
+                };
                 pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
                 pass.set_scissor_rect(x, y, w, h);
                 if d.bg_n > 0 {
@@ -1022,9 +1060,11 @@ impl Renderer {
                 }
             }
             // Scroll-badge overlay (full-surface viewport, above the pane cells).
-            if !obg.is_empty() || !ogl.is_empty() {
-                pass.set_viewport(0.0, 0.0, fw, fh, 0.0, 1.0);
-                pass.set_scissor_rect(0, 0, surf_w, surf_h);
+            if let Some((x, y, w, h)) =
+                clamp_rect(0, 0, surf_w, surf_h, surf_w, surf_h).filter(|_| !obg.is_empty() || !ogl.is_empty())
+            {
+                pass.set_viewport(x as f32, y as f32, w as f32, h as f32, 0.0, 1.0);
+                pass.set_scissor_rect(x, y, w, h);
                 if !obg.is_empty() {
                     pass.set_pipeline(&self.rounded_pipeline);
                     pass.set_vertex_buffer(0, obg_buf.slice(..));
@@ -1067,6 +1107,49 @@ fn truncate_ellipsis(s: &str, max: usize) -> String {
     t
 }
 
+/// Approximate case-fold for per-cell match comparison: the first char of the Unicode lowercase
+/// mapping. ponytail: rare multi-char folds (e.g. 'İ' → "i̇") collapse to their first char; the
+/// daemon folds whole lines, so those cases may differ from the count in the search bar — accepted
+/// for a terminal highlight.
+fn fold(ch: char) -> char {
+    ch.to_lowercase().next().unwrap_or(ch)
+}
+
+/// Mark every cell of `row` covered by a case-insensitive occurrence of `needle` (the query already
+/// folded to lowercase chars). Both sides fold with [`fold`], so comparison is per-cell. A wide
+/// glyph's ' ' spacer participates as an ordinary cell here; the caller extends a match onto the
+/// spacer via the same lead_wide rule it uses for selection/cursor.
+fn mark_matches(row: &[Cell], needle: &[char]) -> Vec<bool> {
+    let n = row.len();
+    let mut hit = vec![false; n];
+    if needle.is_empty() || needle.len() > n {
+        return hit;
+    }
+    let folded: Vec<char> = row.iter().map(|c| fold(c.ch)).collect();
+    for start in 0..=(n - needle.len()) {
+        if folded[start..start + needle.len()] == *needle {
+            hit[start..start + needle.len()].fill(true);
+        }
+    }
+    hit
+}
+
+/// Clamp a pixel rect to a `tw × th` render target, returning `None` when it clamps to empty (origin
+/// off-target or zero-sized). wgpu validates `set_scissor_rect`/`set_viewport` against the
+/// attachment and panics on any rect not contained in it — defense-in-depth for a minimize that
+/// collapses the surface (seen as a 1×1 target).
+fn clamp_rect(x: u32, y: u32, w: u32, h: u32, tw: u32, th: u32) -> Option<(u32, u32, u32, u32)> {
+    if x >= tw || y >= th {
+        return None;
+    }
+    let w = w.min(tw - x);
+    let h = h.min(th - y);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((x, y, w, h))
+}
+
 const SHADERS: &str = r#"
 struct BgOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec4<f32> };
 @vertex fn bg_vs(@location(0) pos: vec2<f32>, @location(1) color: vec4<f32>) -> BgOut {
@@ -1106,3 +1189,81 @@ struct GlyphOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>,
     return vec4<f32>(i.color.rgb, i.color.a * cov);
 }
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell(ch: char) -> Cell {
+        let c = Rgb { r: 0, g: 0, b: 0 };
+        Cell { ch, fg: c, bg: c, bold: false, italic: false, underline: false, inverse: false, wide: false }
+    }
+
+    #[test]
+    fn mark_matches_ascii_case_insensitive() {
+        let row: Vec<Cell> = "Hello".chars().map(cell).collect();
+        let fold_q = |s: &str| s.chars().map(fold).collect::<Vec<char>>();
+        // "lo" hits indices 3,4.
+        assert_eq!(mark_matches(&row, &fold_q("lo")), vec![false, false, false, true, true]);
+        // Uppercase query still matches the mixed-case cells (case-insensitive both ways).
+        assert_eq!(mark_matches(&row, &fold_q("HELLO")), vec![true; 5]);
+        // No occurrence, and a needle longer than the row: all false, no panic.
+        assert_eq!(mark_matches(&row, &fold_q("xyz")), vec![false; 5]);
+        assert_eq!(mark_matches(&row, &fold_q("helloo")), vec![false; 5]);
+    }
+
+    #[test]
+    fn mark_matches_wide_char_row() {
+        // The wide lead holds the char; the spacer holds ' '. A single-wide-char needle marks only
+        // the lead — the renderer extends the highlight onto the spacer via the cell.wide rule.
+        let mut lead = cell('中');
+        lead.wide = true;
+        let row = vec![lead, cell(' '), cell('x')];
+        assert_eq!(mark_matches(&row, &[fold('中')]), vec![true, false, false]);
+    }
+
+    #[test]
+    fn clamp_rect_guards_degenerate() {
+        assert_eq!(clamp_rect(0, 0, 10, 10, 20, 20), Some((0, 0, 10, 10))); // fits
+        assert_eq!(clamp_rect(5, 5, 100, 100, 20, 20), Some((5, 5, 15, 15))); // overhang clamps
+        assert_eq!(clamp_rect(20, 0, 5, 5, 20, 20), None); // origin at edge
+        assert_eq!(clamp_rect(0, 20, 5, 5, 20, 20), None);
+        assert_eq!(clamp_rect(0, 0, 0, 5, 20, 20), None); // zero-sized
+        assert_eq!(clamp_rect(0, 0, 1, 1, 1, 1), Some((0, 0, 1, 1))); // 1×1 target fits
+        assert_eq!(clamp_rect(1, 0, 1, 1, 1, 1), None); // offset on a 1×1 target
+    }
+
+    #[test]
+    fn render_frame_into_1x1_does_not_panic() {
+        // Minimize regression: a full frame (pane + search bar) into a 1×1 surface must not trip
+        // the wgpu "Scissor Rect not contained in the render target" panic.
+        let Some(r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let tex = r.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gmux-1x1"),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let snap = PaneSnapshot { cells: vec![vec![cell('h'), cell('i')]], cursor: (0, 0), cols: 2, rows: 1 };
+        let pv = PaneView {
+            snap: &snap,
+            attention: Attention::default(),
+            active: true,
+            rect: Rect { x: 0, y: 0, w: 1, h: 1 },
+            scrolled: 0,
+            title: "t".into(),
+            selection: None,
+        };
+        let sb = SearchBar { query: "hi".into(), current: 1, total: 1 };
+        r.render_frame(&view, &[], 0, &[pv], 1, 1, "", false, Some(&sb), None);
+        let _ = r.device.poll(wgpu::PollType::wait_indefinitely());
+    }
+}

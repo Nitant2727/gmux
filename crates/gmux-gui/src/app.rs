@@ -44,6 +44,11 @@ const ACTIVE_WINDOW: Duration = Duration::from_millis(500);
 /// with no per-tick redraw, so an idle GUI stops fetching grids entirely.
 const HEARTBEAT: Duration = Duration::from_secs(1);
 const RESIZE_THROTTLE: Duration = Duration::from_millis(33); // ~30 resize sends/s while dragging
+/// Below this surface dimension (px) the window is treated as minimized: skip reconfigure/render so
+/// wgpu's scissor-rect validation can't panic on a degenerate (~1x1) render target.
+const MIN_SURFACE: u32 = 16;
+/// Consecutive same-cell clicks within this window escalate single → double (word) → triple (line).
+const CLICK_INTERVAL: Duration = Duration::from_millis(500);
 /// Gap (px) the renderer draws between split panes. ponytail: mirrored from renderer.rs's `GAP`
 /// design token (owned by the other task) so the divider hit-test can grab that visible band — if
 /// it changes there, mirror it here.
@@ -306,6 +311,31 @@ fn pixel_to_cell(
     (col as u16, row as u16)
 }
 
+/// A "word char" for double-click selection: alphanumeric plus the terminal-ish punctuation that
+/// keeps paths/urls/flags intact (`_ - . / \ ~ : @ % + = ? & #`). Space is deliberately excluded,
+/// so a wide glyph's ' ' spacer ends the word.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric()
+        || matches!(c, '_' | '-' | '.' | '/' | '\\' | '~' | ':' | '@' | '%' | '+' | '=' | '?' | '&' | '#')
+}
+
+/// Inclusive column span of the word at `col`: the maximal run of `is_word_char` cells covering it.
+/// A non-word (or out-of-range) cell spans just itself. Pure, so unit-tested.
+fn word_span(chars: &[char], col: usize) -> (usize, usize) {
+    if col >= chars.len() || !is_word_char(chars[col]) {
+        return (col, col);
+    }
+    let mut s = col;
+    while s > 0 && is_word_char(chars[s - 1]) {
+        s -= 1;
+    }
+    let mut e = col;
+    while e + 1 < chars.len() && is_word_char(chars[e + 1]) {
+        e += 1;
+    }
+    (s, e)
+}
+
 /// Order a selection's two endpoints into reading order (row-major), so `start <= end`. Matches the
 /// renderer's `PaneView.selection` contract.
 fn normalize_selection(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
@@ -362,6 +392,12 @@ struct State {
     init_palette: Option<Call>,
     active_pane: u64,
     focused: bool,
+    /// True while the window is minimized (surface shrunk to a degenerate size): `render`
+    /// early-returns so no frame is acquired at ~1x1. Cleared by the restore `Resized`.
+    minimized: bool,
+    /// Last window title pushed to the OS ("<pane> — gmux"); cached so we only `set_title` on a
+    /// change (retitling re-enters the event loop on Windows).
+    last_title: String,
     hwnd: isize,
     /// Last known cursor position (physical px), tracked from `CursorMoved` for click hit-testing.
     cursor: (f64, f64),
@@ -371,6 +407,10 @@ struct State {
     selection: Option<Selection>,
     /// True while a left-drag is actively building `selection` (press inside a pane's cell area).
     sel_dragging: bool,
+    /// Consecutive-click tracking for double-click word / triple-click line select: the last
+    /// press's `(pane, cell, time, count)`. A same-cell press within `CLICK_INTERVAL` escalates
+    /// `count` 1 → 2 → 3 then wraps to 1.
+    last_click: Option<(u64, (u16, u16), Instant, u8)>,
     /// A sidebar row press that may turn into a tab reorder, or `None`.
     sidebar_drag: Option<SidebarDrag>,
     /// The active window's pane rectangles from the last rendered layout (content-area coords, i.e.
@@ -539,11 +579,14 @@ impl ApplicationHandler for App {
             init_palette: Some(palette_call(&user_config)), // pushed once the connection is live
             active_pane: 0,
             focused: true,
+            minimized: false,
+            last_title: "gmux".to_string(), // the window is created with this title
             hwnd,
             cursor: (0.0, 0.0),
             drag: None,
             selection: None,
             sel_dragging: false,
+            last_click: None,
             sidebar_drag: None,
             last_panes: Vec::new(),
             tab_count: 0,
@@ -599,8 +642,17 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Resized(sz) => {
                 if let Some(st) = self.state.as_mut() {
-                    st.config.width = sz.width.max(1);
-                    st.config.height = sz.height.max(1);
+                    // Minimizing shrinks the surface to ~1x1; configuring + rendering at that size
+                    // trips a wgpu scissor-rect validation panic. Skip the reconfigure/redraw while
+                    // degenerate and flag it (render() also early-returns). The restore Resized
+                    // (real size) clears the flag and forces a full refetch + redraw below.
+                    if sz.width < MIN_SURFACE || sz.height < MIN_SURFACE {
+                        st.minimized = true;
+                        return;
+                    }
+                    st.minimized = false;
+                    st.config.width = sz.width;
+                    st.config.height = sz.height;
                     st.surface.configure(&st.renderer.device, &st.config);
                     st.sync_size();
                     st.force_full = true; // panes reflow at the new size: refetch every grid
@@ -811,6 +863,15 @@ impl ApplicationHandler for App {
             st.sync_size();
             st.maybe_reload_config();
             st.ensure_subscriber();
+            // render() — the only place that flags a dead daemon — never runs while minimized,
+            // so probe here too; an unrecoverable daemon death would otherwise leave a zombie
+            // taskbar entry until restore. ListPanes is read-only (no layout resize side effect).
+            if st.minimized
+                && matches!(st.client, Client::Ready(_))
+                && st.client.call(Call::ListPanes).is_err()
+            {
+                st.fatal = true;
+            }
             #[cfg(feature = "browser")]
             st.poll_browse();
         }
@@ -832,6 +893,16 @@ impl App {
     fn try_shortcut(&mut self, event: &KeyEvent) -> bool {
         let mods = self.mods;
         let Some(st) = self.state.as_mut() else { return false };
+
+        // A bare modifier press is a chord prefix, not a key: letting it fall through to the
+        // "any key clears the selection" step below would kill the selection on the Ctrl of
+        // Ctrl+Shift+C before the C ever arrives — copy would never see a selection.
+        if matches!(
+            &event.logical_key,
+            Key::Named(NamedKey::Control | NamedKey::Shift | NamedKey::Alt | NamedKey::Super)
+        ) {
+            return false;
+        }
 
         // Ctrl+Shift+C copies the active selection (hardcoded — not a rebindable action, and it
         // must run before the "any key clears the selection" step below).
@@ -1147,9 +1218,55 @@ impl State {
             let (cw, ch) = self.cell_dims();
             let rect = Rect { x: pr.x + sidebar_w, y: pr.y, w: pr.w, h: pr.h };
             let cell = pixel_to_cell(cx as f32, cy as f32, rect, sidebar_w, self.config.width, self.config.height, cw, ch);
-            self.selection = Some(Selection { pane: pr.id, start: cell, end: cell });
-            self.sel_dragging = true;
-            self.window.request_redraw();
+            // Escalate consecutive same-cell clicks: single → double (word) → triple (line) → single.
+            let now = Instant::now();
+            let count = match self.last_click {
+                Some((p, c, t, n)) if p == pr.id && c == cell && now.duration_since(t) < CLICK_INTERVAL => n % 3 + 1,
+                _ => 1,
+            };
+            self.last_click = Some((pr.id, cell, now, count));
+            match count {
+                2 => self.select_word(pr.id, cell),
+                3 => self.select_line(pr.id, cell.1),
+                // Single click: anchor a selection; a subsequent drag extends it (existing behavior).
+                _ => {
+                    self.selection = Some(Selection { pane: pr.id, start: cell, end: cell });
+                    self.sel_dragging = true;
+                    self.window.request_redraw();
+                }
+            }
+        }
+    }
+
+    /// Double-click: select the word at `cell` in `pane`, using that pane's cached snapshot row for
+    /// the char run. A blank (space) cell selects nothing (clears any selection), matching a plain
+    /// click on empty space. ponytail: a drag after this behaves as a fresh single-cell drag (no
+    /// word-wise extension) — `sel_dragging` stays false, so `on_release` won't re-copy either.
+    fn select_word(&mut self, pane: u64, cell: (u16, u16)) {
+        let row: Vec<char> = self
+            .snap_cache
+            .get(&pane)
+            .and_then(|s| s.cells.get(cell.1 as usize))
+            .map(|r| r.iter().map(|c| c.ch).collect())
+            .unwrap_or_default();
+        if row.get(cell.0 as usize).map_or(true, |c| *c == ' ') {
+            self.clear_selection();
+            return;
+        }
+        let (s, e) = word_span(&row, cell.0 as usize);
+        self.selection = Some(Selection { pane, start: (s as u16, cell.1), end: (e as u16, cell.1) });
+        self.window.request_redraw();
+    }
+
+    /// Triple-click: select the whole `row` of `pane` (full grid width; `grid_selection_text` trims
+    /// trailing blanks on copy). Ctrl+Shift+C copies it via the existing path.
+    fn select_line(&mut self, pane: u64, row: u16) {
+        match self.snap_cache.get(&pane).map(|s| s.cols) {
+            Some(cols) if cols > 0 => {
+                self.selection = Some(Selection { pane, start: (0, row), end: (cols - 1, row) });
+                self.window.request_redraw();
+            }
+            _ => self.clear_selection(),
         }
     }
 
@@ -1232,9 +1349,15 @@ impl State {
             self.sel_dragging = false;
             let is_click = self.selection.as_ref().map_or(true, |s| s.start == s.end);
             if is_click {
-                // No movement: a plain focus click (the old press-to-focus behavior).
+                // No movement: a plain focus click (the old press-to-focus behavior). Only a
+                // CROSS-pane click resets the scroll: the release between the first and second
+                // press of a double/triple-click lands here, and resetting on a same-pane click
+                // would yank a scrolled pane to its tail before select_word/select_line run
+                // (selecting/copying tail content instead of the clicked row).
                 if let Some(pane) = self.selection.take().map(|s| s.pane) {
-                    self.scroll_offset = 0;
+                    if pane != self.active_pane {
+                        self.scroll_offset = 0;
+                    }
                     self.client.control(Call::FocusPaneId { pane });
                 }
                 self.window.request_redraw();
@@ -1650,7 +1773,31 @@ impl State {
         flash_window(self.hwnd, true);
     }
 
+    /// Sync the window title to the active pane: "<pane title> — gmux", or plain "gmux" when there
+    /// are no panes / the active pane's title is empty. Only calls `set_title` on an actual change —
+    /// retitling re-enters the event loop on Windows, so spamming it every frame stalls input.
+    fn sync_title(&mut self) {
+        let title = self
+            .last_panes
+            .iter()
+            .find(|p| p.id == self.active_pane)
+            .map(|p| p.title.trim())
+            .filter(|t| !t.is_empty())
+            .map(|t| format!("{t} \u{2014} gmux"))
+            .unwrap_or_else(|| "gmux".to_string());
+        if title != self.last_title {
+            self.window.set_title(&title);
+            self.last_title = title;
+        }
+    }
+
     fn render(&mut self) {
+        // Minimized / degenerate surface: don't acquire a frame at all (a ~1x1 render target trips
+        // a wgpu scissor-rect validation panic). Nothing is acquired here, so the
+        // every-acquired-frame-must-present invariant is untouched. Restore re-arms via `Resized`.
+        if self.minimized || self.config.width < MIN_SURFACE || self.config.height < MIN_SURFACE {
+            return;
+        }
         use wgpu::CurrentSurfaceTexture::{Suboptimal, Success};
         let frame = match self.surface.get_current_texture() {
             Success(t) | Suboptimal(t) => t,
@@ -1766,6 +1913,7 @@ impl State {
         // Persist this frame's spans for Ctrl+click hit-testing (and clear them when the layout
         // fetch failed, so a stale span can't open a URL that is no longer under the cursor).
         self.url_spans = url_spans;
+        self.sync_title(); // window title follows the active pane (last_panes/active_pane now current)
         let views: Vec<PaneView> = snaps
             .iter()
             .map(|(s, a, active, rect, scrolled, id, title)| {
@@ -2084,6 +2232,31 @@ mod tests {
         assert_eq!(pixel_to_cell(0.0, 0.0, rect, sw, surf_w, surf_h, cwid, chgt), (0, 0));
         // Far bottom-right clamps to the last visible cell (cols=76 -> 75, rows=27 -> 26).
         assert_eq!(pixel_to_cell(1e6, 1e6, rect, sw, surf_w, surf_h, cwid, chgt), (75, 26));
+    }
+
+    /// Double-click word span: expands over word chars (incl. `-`, `/`, `.` etc.), stops at spaces,
+    /// and a non-word or out-of-range cell spans only itself.
+    #[test]
+    fn word_span_expands_over_word_chars() {
+        // 0:f 1:o 2:o 3:· 4:b 5:a 6:r 7:- 8:b 9:a 10:z 11:· 12:q 13:u 14:x
+        let line: Vec<char> = "foo bar-baz qux".chars().collect();
+        assert_eq!(word_span(&line, 6), (4, 10), "'-' is a word char: the whole bar-baz spans");
+        assert_eq!(word_span(&line, 0), (0, 2), "word at the start");
+        assert_eq!(word_span(&line, 14), (12, 14), "word at the end");
+        assert_eq!(word_span(&line, 3), (3, 3), "a space spans only itself");
+    }
+
+    /// Word span with wide glyphs, their ' ' spacer, and all-space rows: the spacer ends the word,
+    /// a space cell is just itself, and an out-of-range column clamps to a single cell.
+    #[test]
+    fn word_span_wide_spacer_and_all_spaces() {
+        // Wide '中' at col 0 with a ' ' spacer at col 1, then '文' + spacer.
+        let wide: Vec<char> = vec!['中', ' ', '文', ' '];
+        assert_eq!(word_span(&wide, 0), (0, 0), "the wide lead is a word; its spacer ends it");
+        assert_eq!(word_span(&wide, 1), (1, 1), "the spacer (a space) spans only itself");
+        let spaces: Vec<char> = vec![' ', ' ', ' '];
+        assert_eq!(word_span(&spaces, 1), (1, 1), "an all-space row: no expansion");
+        assert_eq!(word_span(&spaces, 9), (9, 9), "out-of-range column clamps to itself");
     }
 
     /// Selection endpoints normalize into reading order (row-major), regardless of drag direction.
