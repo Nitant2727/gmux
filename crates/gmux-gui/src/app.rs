@@ -62,6 +62,11 @@ const BORDER: f32 = 1.0; // pane border (the 2px attention ring is ignored — 1
 const INSET: f32 = 8.0; // cell-area inset inside the border
 const TITLE_STRIP: f32 = 22.0; // title band inside the border, above the cells
 const SEARCH_BAR: f32 = 22.0; // search band inside the border, covering the bottom of the cells
+const SCROLLBAR_W: f32 = 8.0; // scrollback scrollbar strip at the cell-area right edge (mirrors renderer.rs)
+// Font-zoom bounds. ponytail: mirror of renderer.rs's atlas clamp (8..=40) — the atlas won't
+// rasterize outside this range, so the GUI clamps to the same window before calling set_font_px.
+const FONT_MIN: f32 = 8.0;
+const FONT_MAX: f32 = 40.0;
 
 // Sidebar row hit-test metrics. ponytail: hardcoded here to mirror the renderer's design tokens
 // (16px top padding, ~20px "WORKSPACES" section label, 48px rows, 4px gaps). The renderer (owned by
@@ -270,6 +275,22 @@ fn step_index(current: usize, len: usize, dir: i64) -> usize {
     (((current as i64 + dir) % n + n) % n) as usize
 }
 
+/// Clamp a requested font size to the atlas's rasterizable range (mirrors renderer.rs). Pure/tested.
+fn clamp_font_px(px: f32) -> f32 {
+    px.clamp(FONT_MIN, FONT_MAX)
+}
+
+/// Map a scrollbar-thumb cursor y to a scrollback offset. The track's top maps to the deepest
+/// history (`history`), its bottom to the live screen (0). A zero-height track or empty history
+/// yields 0. Pure/tested.
+fn scrollbar_offset_at(cursor_y: f32, track_top: f32, track_h: f32, history: usize) -> usize {
+    if track_h <= 0.0 || history == 0 {
+        return 0;
+    }
+    let frac = ((cursor_y - track_top) / track_h).clamp(0.0, 1.0);
+    ((1.0 - frac) * history as f32).round() as usize
+}
+
 /// Open a detected URL in the default browser. ponytail: `explorer.exe <url>` rather than the
 /// settings' `cmd /c start` pattern — the URL is untrusted terminal content, and `cmd` shell-parses
 /// `&`/`|` and expands `%VAR%`, so `cmd /c start "" http://x&calc` would run calc. `explorer` hands
@@ -418,6 +439,9 @@ struct State {
     last_panes: Vec<PaneRectWire>,
     /// Sidebar row count from the last layout, to bound a sidebar click's row index.
     tab_count: usize,
+    /// Stable window ids per sidebar row from the last layout — middle-click closes by id, not
+    /// index, so a window removed daemon-side since the last render can't shift the target.
+    tab_ids: Vec<u64>,
     notifier: Option<Notifier>,
     taskbar: Option<Taskbar>,
     last_toast: std::collections::HashMap<u64, Instant>,
@@ -425,6 +449,9 @@ struct State {
     // depth and grid rows from the daemon for local clamping / page sizing.
     scroll_offset: usize,
     scroll_history: usize,
+    /// True while the scrollback scrollbar thumb is being dragged (mouse-down on the thumb/track):
+    /// cursor motion maps directly to `scroll_offset` and other selection/report paths are skipped.
+    scrollbar_drag: bool,
     active_rows: usize,
     /// Whether the active pane's app enabled bracketed paste (from the last GetGrid).
     active_bracketed: bool,
@@ -466,6 +493,10 @@ struct State {
     // Config-driven keybindings + the last config mtime we loaded, for hot-reload.
     keymap: Keymap,
     font_px: f32,
+    /// The font size the config file asks for (last loaded). `font_px` may differ after a live
+    /// Ctrl+wheel / zoom-action; `zoom_reset` snaps back to this, and a config hot-reload that
+    /// changes it applies live.
+    config_font_px: f32,
     config_mtime: Option<std::time::SystemTime>,
     /// Active in-terminal search (Ctrl+Shift+F), or `None`. While `Some`, keystrokes build the query
     /// instead of reaching the pane.
@@ -533,8 +564,10 @@ impl ApplicationHandler for App {
         surface.configure(&device, &config);
 
         // Load user config up front: font size feeds the atlas build, theme feeds the renderer.
+        // Clamped like every later font path (zoom/reload) — an out-of-range config value would
+        // otherwise render at e.g. 60px until the first zoom SHRINKS it to the 40px clamp.
         let user_config = Config::load();
-        let font_px = user_config.font_px.unwrap_or(DEFAULT_FONT_PX);
+        let font_px = clamp_font_px(user_config.font_px.unwrap_or(DEFAULT_FONT_PX));
         let keymap = Keymap::build(&user_config);
         let config_mtime = config_mtime();
 
@@ -590,11 +623,13 @@ impl ApplicationHandler for App {
             sidebar_drag: None,
             last_panes: Vec::new(),
             tab_count: 0,
+            tab_ids: Vec::new(),
             notifier,
             taskbar,
             last_toast: std::collections::HashMap::new(),
             scroll_offset: 0,
             scroll_history: 0,
+            scrollbar_drag: false,
             active_rows: 0,
             active_bracketed: false,
             active_mouse_mode: 0,
@@ -613,6 +648,7 @@ impl ApplicationHandler for App {
             fatal: false,
             keymap,
             font_px,
+            config_font_px: font_px,
             config_mtime,
             search: None,
             preedit: None,
@@ -704,6 +740,7 @@ impl ApplicationHandler for App {
                     st.drag = None;
                     st.sel_dragging = false;
                     st.sidebar_drag = None;
+                    st.scrollbar_drag = false;
                     st.mark_activity(); // one more frame to clear the parked hover highlight
                     st.window.request_redraw();
                 }
@@ -716,8 +753,10 @@ impl ApplicationHandler for App {
                     // In-progress local drags (divider/selection/reorder) always keep the motion;
                     // otherwise forward it to a mouse-reporting pane (drag / any-motion), and only
                     // when the app doesn't take it run the local hover/selection logic.
-                    let local_drag_live =
-                        st.drag.is_some() || st.sel_dragging || st.sidebar_drag.is_some();
+                    let local_drag_live = st.drag.is_some()
+                        || st.sel_dragging
+                        || st.sidebar_drag.is_some()
+                        || st.scrollbar_drag;
                     if local_drag_live || !st.report_motion(shift) {
                         st.on_cursor_moved();
                     }
@@ -740,13 +779,24 @@ impl ApplicationHandler for App {
                     if pressed && ctrl && button == MouseButton::Left && st.open_url_at_cursor() {
                         return;
                     }
-                    // Local surfaces win first: an in-progress divider/selection/reorder drag,
-                    // or a fresh press on a divider band, must not be swallowed by app reporting.
-                    let local_drag_live =
-                        st.drag.is_some() || st.sel_dragging || st.sidebar_drag.is_some();
+                    // Middle-click on a sidebar tab closes that window and consumes the click.
+                    if pressed && button == MouseButton::Middle && st.close_tab_under_cursor() {
+                        return;
+                    }
+                    // Local surfaces win first: an in-progress divider/selection/reorder/scrollbar
+                    // drag, or a fresh press on a divider band, must not be swallowed by reporting.
+                    let local_drag_live = st.drag.is_some()
+                        || st.sel_dragging
+                        || st.sidebar_drag.is_some()
+                        || st.scrollbar_drag;
                     let grabs_divider = pressed
                         && button == MouseButton::Left
                         && st.divider_under_cursor();
+                    // A left press on the scrollbar thumb/track starts a scrollbar drag — after the
+                    // divider check, before app reporting. Consumes the click when it lands on the bar.
+                    if pressed && button == MouseButton::Left && !grabs_divider && st.grab_scrollbar() {
+                        return;
+                    }
                     // App mouse reporting: if the active pane wants mouse events and this one is
                     // inside its cell area without Shift, forward it and suppress local behavior.
                     if !local_drag_live && !grabs_divider {
@@ -768,8 +818,21 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let shift = self.mods.shift_key();
+                let ctrl = self.mods.control_key();
                 if let Some(st) = self.state.as_mut() {
                     st.mark_activity();
+                    // Ctrl+wheel zooms the font (wheel up = larger) and consumes the event, before
+                    // any scrollback / app-reporting handling.
+                    if ctrl {
+                        let dir = match delta {
+                            MouseScrollDelta::LineDelta(_, y) => y,
+                            MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                        };
+                        if dir != 0.0 {
+                            st.zoom(if dir > 0.0 { 2.0 } else { -2.0 });
+                        }
+                        return;
+                    }
                     // Shift+wheel always drives gmux scrollback; an unmodified wheel over a
                     // mouse-reporting pane is forwarded to its app instead.
                     if !shift && st.report_wheel(delta) {
@@ -968,7 +1031,11 @@ impl State {
             Action::ToggleZoom => {
                 self.client.control(Call::ToggleZoom);
                 self.sync_size();
+                self.force_full = true; // the zoomed pane fills the window; refetch every grid
             }
+            Action::ZoomIn => self.zoom(2.0),
+            Action::ZoomOut => self.zoom(-2.0),
+            Action::ZoomReset => self.apply_font_px(self.config_font_px),
             Action::NewWindow => {
                 self.client.control(Call::NewWindow { command: None });
                 self.sync_size();
@@ -1056,12 +1123,36 @@ impl State {
         // The daemon re-resolves every grid's colors but emits no damage wires for it, so the
         // snapshot cache is stale until the next output — force a full refetch.
         self.force_full = true;
-        let new_font = config.font_px.unwrap_or(DEFAULT_FONT_PX);
-        if (new_font - self.font_px).abs() > f32::EPSILON {
-            eprintln!("gmux: font size change requires a restart to take effect");
-            self.font_px = new_font; // remember it so we don't warn again every reload
+        // A font-size change in the config applies live (rebuilds the atlas + resends geometry).
+        // Compared against `config_font_px` (not `font_px`) so a live Ctrl+wheel zoom isn't undone
+        // by an unrelated reload — only an actual change to the file's value re-applies.
+        let new_font = clamp_font_px(config.font_px.unwrap_or(DEFAULT_FONT_PX));
+        if (new_font - self.config_font_px).abs() > f32::EPSILON {
+            self.config_font_px = new_font;
+            self.apply_font_px(new_font);
         }
         self.window.request_redraw();
+    }
+
+    /// Set the font size live: clamp to the atlas range, rebuild the glyph atlas, then resend
+    /// geometry so the daemon re-cells every pane at the new cell size and refetch every grid.
+    fn apply_font_px(&mut self, px: f32) {
+        let px = clamp_font_px(px);
+        if (px - self.font_px).abs() < f32::EPSILON {
+            // Already at this size (wheel spun past a clamp bound, or reset at the config size):
+            // skip the disk font reload, atlas/texture rebuild, geometry resend, and full refetch.
+            return;
+        }
+        self.renderer.set_font_px(px);
+        self.font_px = px;
+        self.sync_size(); // new cell_w/cell_h -> daemon re-divides panes into cells
+        self.force_full = true;
+        self.window.request_redraw();
+    }
+
+    /// Nudge the font size by `delta` px (Ctrl+wheel / zoom-in/out actions).
+    fn zoom(&mut self, delta: f32) {
+        self.apply_font_px(self.font_px + delta);
     }
 
     /// Poll the background connect thread. Once the daemon answers, promote the connection to
@@ -1273,6 +1364,10 @@ impl State {
     /// Route cursor motion to the active interaction: extend a text selection, promote a sidebar
     /// press to a tab reorder past the drag threshold, or (a divider drag) throttle a `ResizeSplit`.
     fn on_cursor_moved(&mut self) {
+        if self.scrollbar_drag {
+            self.drag_scrollbar_to_cursor();
+            return;
+        }
         if self.sel_dragging {
             self.extend_selection_to_cursor();
             return;
@@ -1333,6 +1428,7 @@ impl State {
     /// it, or treat a zero-movement press as a plain focus click), and clear any divider drag.
     fn on_release(&mut self) {
         self.drag = None;
+        self.scrollbar_drag = false;
         if let Some(sd) = self.sidebar_drag.take() {
             if sd.reordering {
                 let target = self.renderer.sidebar_row_at(self.cursor.1 as f32, self.tab_count);
@@ -1560,6 +1656,90 @@ impl State {
             && cy >= rect.y as f64
             && cy < (rect.y + rect.h) as f64;
         Some((rect, inside))
+    }
+
+    /// The active pane's scrollback scrollbar track rectangle `(x0, y0, x1, y1)` in window coords:
+    /// an 8px strip at the cell-area right edge, spanning the cell area's height. Mirrors the
+    /// renderer's cell-area geometry (MARGIN/GAP/BORDER/INSET/TITLE_STRIP) so the hit-test matches
+    /// the drawn bar. `rect` is the pane rect in window coords (sidebar offset applied).
+    fn scrollbar_track(&self, rect: Rect) -> (f32, f32, f32, f32) {
+        // The scrollbar sits at the cell-area right edge, so only the top/right/bottom insets matter
+        // (the left margin is irrelevant here). Mirrors renderer.rs's per-pane edge shrink.
+        let (surf_w, surf_h) = (self.config.width, self.config.height);
+        let (ox, oy, ow, oh) = (rect.x as f32, rect.y as f32, rect.w as f32, rect.h as f32);
+        let t = if rect.y == 0 { MARGIN } else { GAP / 2.0 };
+        let rgt = if rect.x + rect.w >= surf_w { MARGIN } else { GAP / 2.0 };
+        let bot = if rect.y + rect.h >= surf_h { MARGIN } else { GAP / 2.0 };
+        let x1 = ox + ow - rgt - BORDER - INSET; // cell-area right edge
+        let x0 = x1 - SCROLLBAR_W;
+        let y0 = oy + t + BORDER + TITLE_STRIP + INSET; // cell-area top
+        // While searching the renderer shrinks the visible cell area by SEARCH_BAR — mirror it,
+        // or the thumb is miscalibrated by that band and lags the cursor during a drag.
+        let sb = if self.search.is_some() { SEARCH_BAR } else { 0.0 };
+        let y1 = (y0 + (oh - t - bot - 2.0 * BORDER - TITLE_STRIP - 2.0 * INSET - sb)).max(y0);
+        (x0, y0, x1, y1)
+    }
+
+    /// A left press on the scrollbar thumb/track begins a scrollbar drag and jumps the viewport to
+    /// the cursor. Returns true (consuming the click) only when the press lands on the bar and there
+    /// is scrollback to scroll (`scroll_offset > 0` and history present).
+    fn grab_scrollbar(&mut self) -> bool {
+        if self.scroll_offset == 0 || self.scroll_history == 0 {
+            return false;
+        }
+        let (cx, cy) = self.cursor;
+        if cx < 0.0 || cy < 0.0 {
+            return false;
+        }
+        let Some((rect, _)) = self.active_pane_rect() else { return false };
+        let (x0, y0, x1, y1) = self.scrollbar_track(rect);
+        let (fx, fy) = (cx as f32, cy as f32);
+        if fx < x0 || fx > x1 || fy < y0 || fy > y1 {
+            return false;
+        }
+        self.scrollbar_drag = true;
+        self.drag_scrollbar_to_cursor();
+        true
+    }
+
+    /// Map the current cursor y to a scrollback offset within the active pane's scrollbar track and
+    /// jump the viewport there. Called while `scrollbar_drag` is live.
+    fn drag_scrollbar_to_cursor(&mut self) {
+        let Some((rect, _)) = self.active_pane_rect() else { return };
+        let (_, y0, _, y1) = self.scrollbar_track(rect);
+        let off = scrollbar_offset_at(self.cursor.1 as f32, y0, y1 - y0, self.scroll_history);
+        if off != self.scroll_offset {
+            self.scroll_offset = off;
+            self.selection = None;
+            self.force_full = true;
+            self.window.request_redraw();
+        }
+    }
+
+    /// Close the sidebar tab under the cursor (middle-click). Returns true (consuming the click)
+    /// when the cursor is over a sidebar row; a click in the sidebar's empty area or outside it
+    /// no-ops.
+    fn close_tab_under_cursor(&mut self) -> bool {
+        let (cx, cy) = self.cursor;
+        if cx < 0.0 || cy < 0.0 {
+            return false;
+        }
+        let (sidebar_w, _, _) = self.areas();
+        if (cx as u32) >= sidebar_w {
+            return false;
+        }
+        match self.renderer.sidebar_row_at(cy as f32, self.tab_count).and_then(|i| self.tab_ids.get(i)) {
+            Some(&win) => {
+                // By stable id: a window removed daemon-side since the last render shifts the
+                // indices, but never re-targets an id (ids are never reused — a stale id no-ops).
+                self.client.control(Call::CloseWindow { id: win });
+                self.sync_size();
+                self.force_full = true;
+                self.window.request_redraw();
+                true
+            }
+            None => false,
+        }
     }
 
     /// The cursor's 1-based cell within `rect` (mouse reports are 1-based; `pixel_to_cell` clamps
@@ -1835,6 +2015,7 @@ impl State {
             // Cache for mouse hit-testing (content-area coords; the sidebar offset is applied below).
             self.last_panes = layout.panes.clone();
             self.tab_count = layout.tabs.len();
+            self.tab_ids = layout.tabs.iter().map(|t| t.id).collect();
 
             rows = layout
                 .tabs
@@ -1929,6 +2110,7 @@ impl State {
                     active: *active,
                     rect: *rect,
                     scrolled: *scrolled,
+                    history: if *active { self.scroll_history as u32 } else { 0 },
                     title: title.clone(),
                     selection,
                 }
@@ -2337,7 +2519,7 @@ mod tests {
         let panes = || vec![rect(1, 0, 0, 80, 40), rect(2, 80, 0, 80, 40)];
         let base = LayoutWire { active_pane: 1, tabs: vec![], panes: panes() };
         let tab = gmux_proto::TabWire {
-            index: 0, name: "changed".into(), branch: None, attention: true, active: true,
+            index: 0, id: 7, name: "changed".into(), branch: None, attention: true, active: true,
             progress: Some(50), progress_error: false,
         };
         let same = LayoutWire { active_pane: 1, tabs: vec![tab], panes: panes() };
@@ -2432,5 +2614,29 @@ mod tests {
         assert_eq!(step_index(0, 3, -1), 2);
         assert_eq!(step_index(2, 3, 1), 0);
         assert_eq!(step_index(0, 0, 1), 0);
+    }
+
+    /// The scrollbar y->offset map: the track top is the deepest history, the bottom the live
+    /// screen, and the cursor clamps to the track. A zero-height track or empty history yields 0.
+    #[test]
+    fn scrollbar_offset_maps_top_to_history_bottom_to_zero() {
+        // track_top = 0, track_h = 100, history = 50.
+        assert_eq!(scrollbar_offset_at(0.0, 0.0, 100.0, 50), 50); // top -> deepest history
+        assert_eq!(scrollbar_offset_at(100.0, 0.0, 100.0, 50), 0); // bottom -> live screen
+        assert_eq!(scrollbar_offset_at(50.0, 0.0, 100.0, 50), 25); // mid -> half
+        // Cursor past either end clamps to the track's ends.
+        assert_eq!(scrollbar_offset_at(-20.0, 0.0, 100.0, 50), 50);
+        assert_eq!(scrollbar_offset_at(200.0, 0.0, 100.0, 50), 0);
+        // Degenerate track / empty history -> 0 (no divide-by-zero).
+        assert_eq!(scrollbar_offset_at(10.0, 0.0, 0.0, 50), 0);
+        assert_eq!(scrollbar_offset_at(10.0, 0.0, 100.0, 0), 0);
+    }
+
+    /// Font-size clamp keeps requests inside the atlas's rasterizable range (8..=40).
+    #[test]
+    fn clamp_font_px_bounds_the_atlas_range() {
+        assert_eq!(clamp_font_px(4.0), 8.0);
+        assert_eq!(clamp_font_px(100.0), 40.0);
+        assert_eq!(clamp_font_px(18.0), 18.0);
     }
 }
