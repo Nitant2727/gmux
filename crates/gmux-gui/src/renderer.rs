@@ -39,6 +39,7 @@ const ATTN_DOT: f32 = 8.0;
 const RADIUS: f32 = 6.0; // rounded corner radius for sidebar rows + pane chrome
 const BADGE_RADIUS: f32 = 4.0; // scroll badge chip
 const TITLE_STRIP: f32 = 22.0; // pane title band inside the border, above the cells
+const SEARCH_BAR: f32 = 22.0; // search band inside the border, below the cells (active pane only)
 
 const fn clear_of(c: Rgb) -> wgpu::Color {
     wgpu::Color { r: c.r as f64 / 255.0, g: c.g as f64 / 255.0, b: c.b as f64 / 255.0, a: 1.0 }
@@ -89,6 +90,14 @@ pub struct SidebarRow {
     pub progress: Option<u8>,
     /// A pane reported a progress error: renders " !" after the name (takes precedence over pct).
     pub progress_error: bool,
+}
+
+/// The active pane's search overlay: a band drawn at the pane bottom. `current`/`total` are shown
+/// as-is (app.rs owns their semantics); `total == 0` with a non-empty `query` renders "no matches".
+pub struct SearchBar {
+    pub query: String,
+    pub current: usize,
+    pub total: usize,
 }
 
 #[repr(C)]
@@ -496,6 +505,21 @@ impl Renderer {
                 let bg_color = if is_cursor { blend(CURSOR, cell_bg, 0.7) } else { cell_bg };
                 push_quad(&mut bg, x0, y0, x0 + cw, y0 + ch, rgba(bg_color));
 
+                // Inactive panes dim their text so the focused pane pops.
+                let mut fg = rgba(cell_fg);
+                if !active {
+                    for ch in fg.iter_mut().take(3) {
+                        *ch *= 0.8;
+                    }
+                }
+
+                // Underline (SGR 4 / detected URLs): a 1px fg strip at the cell bottom, per cell so
+                // it stays continuous across wide-glyph spacers. Same pipeline as the bg quads —
+                // pushed after them, so it paints over the cell bg and under the glyphs.
+                if cell.underline {
+                    push_quad(&mut bg, x0, y0 + ch - 2.0, x0 + cw, y0 + ch - 1.0, fg);
+                }
+
                 // Wide (CJK) glyphs span two cells; the daemon sends a ' ' spacer in the next cell
                 // (which draws no glyph of its own). The bg quad above is still drawn for both cells.
                 if let Some((uv, cells)) = self.glyph_uv(cell.ch, cell.wide) {
@@ -506,13 +530,6 @@ impl Renderer {
                         (to_ndc(x0 + gw, y0 + ch), [uv[2], uv[3]]),
                         (to_ndc(x0, y0 + ch), [uv[0], uv[3]]),
                     );
-                    // Inactive panes dim their text so the focused pane pops.
-                    let mut fg = rgba(cell_fg);
-                    if !active {
-                        for ch in fg.iter_mut().take(3) {
-                            *ch *= 0.8;
-                        }
-                    }
                     for (p, t) in [a, b, cc, a, cc, d] {
                         glyphs.push(GlyphVertex { pos: p, uv: t, color: fg });
                     }
@@ -778,7 +795,8 @@ impl Renderer {
         (bg, rd, gl)
     }
 
-    /// Render a full frame: the sidebar (left column) plus the panes.
+    /// Render a full frame: the sidebar (left column) plus the panes. `search`/`preedit` overlay the
+    /// active pane (search band at the bottom; IME preedit at the cursor).
     pub fn render_frame(
         &self,
         view: &wgpu::TextureView,
@@ -789,6 +807,8 @@ impl Renderer {
         surf_h: u32,
         empty_msg: &str,
         plus_hover: bool,
+        search: Option<&SearchBar>,
+        preedit: Option<&str>,
     ) {
         let (fw, fh) = (surf_w.max(1) as f32, surf_h.max(1) as f32);
         // `sbg` is the opaque sidebar panel; `srd` is the rounded chrome (sidebar rows + pane
@@ -866,12 +886,41 @@ impl Renderer {
                 self.text_run(&label, br - bw_chip + bpx, bt + bpy, rgba(ACCENT), fw, fh, &mut ogl);
             }
 
+            // Search band: a SEARCH_BAR-tall BG_SIDEBAR band at the active pane's bottom, inside the
+            // border (title strip owns the top). Round the bottom corners; square the top where it
+            // meets the cells. Content: dim "find:" label, the query in TEXT with a '_' caret, and a
+            // right-aligned "current/total" in ACCENT (or "no matches" in ERROR).
+            let search_here = pv.active && search.is_some();
+            if let (true, Some(sb)) = (pv.active, search) {
+                let (bx0, bx1) = (cx + bw, cx + cw_ - bw);
+                let by1 = cy + ch_ - bw;
+                let by0 = by1 - SEARCH_BAR;
+                let sr = (RADIUS - bw).max(0.0);
+                push_rounded(&mut srd, bx0, by0, bx1, by1, sr, rgba(BG_SIDEBAR), fw, fh);
+                push_rounded(&mut srd, bx0, by0, bx1, by1 - sr, 0.0, rgba(BG_SIDEBAR), fw, fh);
+                let ty = (by0 + (SEARCH_BAR - ch_cell) / 2.0).max(by0);
+                let lx = bx0 + 12.0;
+                self.text_run("find:", lx, ty, rgba(TEXT_DIM), fw, fh, &mut sgl);
+                let q = format!("{}_", sb.query);
+                self.text_run(&q, lx + 6.0 * cw_cell, ty, rgba(TEXT), fw, fh, &mut sgl); // +1 cell = space
+                let (counter, col) = if sb.total == 0 && !sb.query.is_empty() {
+                    ("no matches".to_string(), ERROR)
+                } else {
+                    (format!("{}/{}", sb.current, sb.total), ACCENT)
+                };
+                let cwn = counter.chars().count() as f32 * cw_cell;
+                self.text_run(&counter, (bx1 - 12.0 - cwn).max(lx), ty, rgba(col), fw, fh, &mut sgl);
+            }
+
             // Cell area: inset INSET on the sides and bottom, and below the title strip on top.
             // Cells draw at fixed size from its top-left; the viewport clips overflow, the BG_PANE
             // fill shows through any remainder.
             let pad = bw + INSET;
             let (ix, iy) = (cx + pad, cy + bw + TITLE_STRIP + INSET);
-            let (iw, ih) = ((cw_ - 2.0 * pad).max(1.0), (ch_ - bw - TITLE_STRIP - INSET - pad).max(1.0));
+            let iw = (cw_ - 2.0 * pad).max(1.0);
+            // ponytail: search band shrinks the visible cell area by SEARCH_BAR, but the daemon isn't
+            // told — so the bottom cell row is covered (not resized away) while searching. Acceptable.
+            let ih = (ch_ - bw - TITLE_STRIP - INSET - pad - if search_here { SEARCH_BAR } else { 0.0 }).max(1.0);
             let (bg, glyphs) =
                 self.build_vertices(pv.snap, pv.attention, pv.active, iw as u32, ih as u32, false, pv.selection);
             draws.push(Draw {
@@ -881,6 +930,18 @@ impl Renderer {
                 bg: vb(bytemuck::cast_slice(&bg)),
                 glyph: vb(bytemuck::cast_slice(&glyphs)),
             });
+
+            // IME preedit: at the active pane's cursor cell, an overlay (drawn last) — a filled rect
+            // sized to the text, the text in TEXT, and a 1px underline beneath. Clamped inside cells.
+            if let (true, Some(pe)) = (pv.active, preedit.filter(|p| !p.is_empty())) {
+                let (col, row) = pv.snap.cursor;
+                let pw = pe.chars().count() as f32 * cw_cell;
+                let px = (ix + col as f32 * cw_cell).min(ix + iw - pw).max(ix);
+                let py = (iy + row as f32 * ch_cell).min(iy + ih - ch_cell).max(iy);
+                push_rounded(&mut obg, px, py, px + pw, py + ch_cell, 0.0, rgba(SIDEBAR_ROW_ACTIVE), fw, fh);
+                push_rounded(&mut obg, px, py + ch_cell - 1.0, px + pw, py + ch_cell, 0.0, rgba(TEXT), fw, fh);
+                self.text_run(pe, px, py, rgba(TEXT), fw, fh, &mut ogl);
+            }
         }
 
         // Empty state: no panes to draw.

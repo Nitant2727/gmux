@@ -20,7 +20,7 @@ use winit::window::{Window, WindowId};
 
 use crate::config::{config_path, default_template, Action, Config, Keymap};
 use crate::daemon_client::{spawn_output_subscriber, DaemonClient};
-use crate::renderer::{PaneView, SidebarRow};
+use crate::renderer::{PaneView, SearchBar, SidebarRow};
 use crate::Renderer;
 
 // The Windows clipboard helper lives in its own file but is declared here (a child of `app`) so the
@@ -56,6 +56,7 @@ const MARGIN: f32 = 8.0; // outer margin at a content boundary (GAP/2 at an inte
 const BORDER: f32 = 1.0; // pane border (the 2px attention ring is ignored — 1px error at most)
 const INSET: f32 = 8.0; // cell-area inset inside the border
 const TITLE_STRIP: f32 = 22.0; // title band inside the border, above the cells
+const SEARCH_BAR: f32 = 22.0; // search band inside the border, covering the bottom of the cells
 
 // Sidebar row hit-test metrics. ponytail: hardcoded here to mirror the renderer's design tokens
 // (16px top padding, ~20px "WORKSPACES" section label, 48px rows, 4px gaps). The renderer (owned by
@@ -168,6 +169,110 @@ struct SidebarDrag {
     from_row: usize,
     start_y: f64,
     reordering: bool,
+}
+
+/// Active in-terminal search (Ctrl+Shift+F). `matches` are scroll offsets from `Call::SearchPane`
+/// (nearest-to-bottom first, directly usable as `GetGrid.offset`); `current` indexes into them.
+struct SearchState {
+    query: String,
+    matches: Vec<u32>,
+    current: usize,
+}
+
+/// A detected http/https URL in a pane's viewport: the inclusive cell column range on `row` and the
+/// URL text. Rebuilt each render for Ctrl+click hit-testing; the cells are also underlined in-place.
+struct UrlSpan {
+    row: u16,
+    start: u16,
+    end: u16,
+    url: String,
+}
+
+/// Length (in chars) of an `http://` / `https://` scheme at the start of `s`, else 0.
+fn url_scheme_len(s: &[char]) -> usize {
+    const HTTPS: [char; 8] = ['h', 't', 't', 'p', 's', ':', '/', '/'];
+    const HTTP: [char; 7] = ['h', 't', 't', 'p', ':', '/', '/'];
+    if s.starts_with(&HTTPS) {
+        8
+    } else if s.starts_with(&HTTP) {
+        7
+    } else {
+        0
+    }
+}
+
+/// Find http/https URLs in a row of chars. Returns `(start, end_exclusive)` column spans: a scheme
+/// followed by a run of non-space chars, with trailing `.,);]` trimmed (so a link at a sentence end
+/// doesn't swallow the period). Column == char index because each cell is exactly one char (wide
+/// spacers included). Pure/tested.
+fn find_urls(chars: &[char]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let scheme = url_scheme_len(&chars[i..]);
+        if scheme == 0 {
+            i += 1;
+            continue;
+        }
+        let mut j = i + scheme;
+        while j < chars.len() && !chars[j].is_whitespace() {
+            j += 1;
+        }
+        while j > i + scheme && matches!(chars[j - 1], '.' | ',' | ';' | ')' | ']') {
+            j -= 1;
+        }
+        // A bare scheme (a URL wrapped right after "https://") isn't clickable content.
+        if j > i + scheme {
+            spans.push((i, j));
+        }
+        i = j;
+    }
+    spans
+}
+
+/// Scan a snapshot for URLs: underline each URL's cells (always-on affordance) and return the spans
+/// for Ctrl+click hit-testing. Mutates `snap` in place.
+fn detect_urls(snap: &mut PaneSnapshot) -> Vec<UrlSpan> {
+    let mut spans = Vec::new();
+    for (r, row) in snap.cells.iter_mut().enumerate() {
+        let chars: Vec<char> = row.iter().map(|c| c.ch).collect();
+        for (s, e) in find_urls(&chars) {
+            for cell in row[s..e].iter_mut() {
+                cell.underline = true;
+            }
+            spans.push(UrlSpan {
+                row: r as u16,
+                start: s as u16,
+                end: (e - 1) as u16, // inclusive end column (e > s always)
+                url: chars[s..e].iter().collect(),
+            });
+        }
+    }
+    spans
+}
+
+/// The URL under cell `(col, row)` in a pane's span list, if any. Pure/tested.
+fn url_at(spans: &[UrlSpan], col: u16, row: u16) -> Option<&str> {
+    spans.iter().find(|s| s.row == row && col >= s.start && col <= s.end).map(|s| s.url.as_str())
+}
+
+/// Wrap-around index step: move `current` by `dir` within `0..len`. `len == 0` stays 0. Pure/tested.
+fn step_index(current: usize, len: usize, dir: i64) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let n = len as i64;
+    (((current as i64 + dir) % n + n) % n) as usize
+}
+
+/// Open a detected URL in the default browser. ponytail: `explorer.exe <url>` rather than the
+/// settings' `cmd /c start` pattern — the URL is untrusted terminal content, and `cmd` shell-parses
+/// `&`/`|` and expands `%VAR%`, so `cmd /c start "" http://x&calc` would run calc. `explorer` hands
+/// the single arg straight to the http protocol handler with no shell parsing.
+fn open_url(url: &str) {
+    if let Err(e) = std::process::Command::new("explorer").arg(url).spawn() {
+        eprintln!("gmux: could not open url {url}: {e}");
+    }
 }
 
 /// Map a physical pixel `(px, py)` (window coords) to a `(col, row)` cell in a pane whose `rect` is
@@ -322,6 +427,14 @@ struct State {
     keymap: Keymap,
     font_px: f32,
     config_mtime: Option<std::time::SystemTime>,
+    /// Active in-terminal search (Ctrl+Shift+F), or `None`. While `Some`, keystrokes build the query
+    /// instead of reaching the pane.
+    search: Option<SearchState>,
+    /// Current IME preedit (composition) string, drawn at the active pane's cursor; cleared on
+    /// Commit/Disabled.
+    preedit: Option<String>,
+    /// Detected URL spans per pane (viewport cell coords), rebuilt each render for Ctrl+click.
+    url_spans: HashMap<u64, Vec<UrlSpan>>,
     /// M12: the flag-gated WebView2 browser pane (its own top-level window), opened on the first
     /// `Browse` request drained from the daemon.
     #[cfg(feature = "browser")]
@@ -458,6 +571,9 @@ impl ApplicationHandler for App {
             keymap,
             font_px,
             config_mtime,
+            search: None,
+            preedit: None,
+            url_spans: HashMap::new(),
             #[cfg(feature = "browser")]
             browser: None,
         };
@@ -495,19 +611,35 @@ impl ApplicationHandler for App {
             WindowEvent::Ime(ime) => {
                 if let Some(st) = self.state.as_mut() {
                     match ime {
-                        // Committed composition (a finished CJK/emoji sequence): send it as text to
-                        // the active pane, like typing — snap back to live and drop any selection.
+                        // Committed composition (a finished CJK/emoji sequence). While searching it
+                        // appends to the query, not the pane; otherwise send it as text to the active
+                        // pane, like typing — snap back to live and drop any selection.
                         Ime::Commit(text) => {
                             st.mark_activity();
-                            st.clear_selection();
-                            st.scroll_offset = 0;
-                            st.client.control(Call::SendKeys { pane: st.active_pane, text, enter: false });
+                            st.preedit = None;
+                            if st.search.is_some() {
+                                if let Some(s) = st.search.as_mut() {
+                                    s.query.push_str(&text);
+                                }
+                                st.refresh_search();
+                                st.window.request_redraw();
+                            } else {
+                                st.clear_selection();
+                                st.scroll_offset = 0;
+                                st.client.control(Call::SendKeys { pane: st.active_pane, text, enter: false });
+                            }
                         }
-                        // ponytail: inline preedit display (the composition string drawn in-grid) is
-                        // future work; composition still works via the OS's floating IME window,
-                        // which shows the candidate list until Commit.
-                        Ime::Preedit(..) => {}
-                        Ime::Enabled | Ime::Disabled => {}
+                        // Composition in progress: stash the preedit string for the renderer to draw
+                        // at the active pane's cursor. Empty clears it (composition cancelled).
+                        Ime::Preedit(text, _cursor) => {
+                            st.preedit = if text.is_empty() { None } else { Some(text) };
+                            st.window.request_redraw();
+                        }
+                        Ime::Enabled => {}
+                        Ime::Disabled => {
+                            st.preedit = None;
+                            st.window.request_redraw();
+                        }
                     }
                 }
             }
@@ -541,9 +673,21 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let shift = self.mods.shift_key();
+                let ctrl = self.mods.control_key();
                 if let Some(st) = self.state.as_mut() {
                     st.mark_activity();
                     let pressed = state == ElementState::Pressed;
+                    // A press on the active pane's search band hits chrome, not cells — the cell
+                    // row under the band is hidden, so selection/URL/reporting there would act on
+                    // something the user can't see. Swallow it.
+                    if pressed && st.search.is_some() && st.cursor_in_search_band() {
+                        return;
+                    }
+                    // Ctrl+left-click on a detected URL opens it and consumes the click — checked
+                    // before mouse reporting and before selection/focus.
+                    if pressed && ctrl && button == MouseButton::Left && st.open_url_at_cursor() {
+                        return;
+                    }
                     // Local surfaces win first: an in-progress divider/selection/reorder drag,
                     // or a fresh press on a divider band, must not be swallowed by app reporting.
                     let local_drag_live =
@@ -590,6 +734,14 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if let Some(st) = self.state.as_mut() {
                     st.mark_activity();
+                }
+                // Search mode intercepts every key before the keymap/SendKeys: build the query,
+                // navigate matches (Enter/Shift+Enter), edit (Backspace), or exit (Escape).
+                if let Some(st) = self.state.as_mut() {
+                    if st.search.is_some() {
+                        st.search_key(&event, self.mods);
+                        return;
+                    }
                 }
                 if !self.try_shortcut(&event) {
                     if let Some(bytes) = key_to_bytes(&event, self.mods) {
@@ -812,6 +964,7 @@ impl State {
                     eprintln!("gmux: could not open settings {}: {e}", path.display());
                 }
             }
+            Action::Search => self.enter_search(),
         }
         self.window.request_redraw();
     }
@@ -1116,8 +1269,155 @@ impl State {
         }
     }
 
+    /// Enter search mode: an empty query, no matches yet. Keystrokes now build the query.
+    fn enter_search(&mut self) {
+        self.search = Some(SearchState { query: String::new(), matches: Vec::new(), current: 0 });
+        self.window.request_redraw();
+    }
+
+    /// Leave search mode and snap the active pane back to its live screen.
+    fn exit_search(&mut self) {
+        self.search = None;
+        self.scroll_offset = 0;
+        self.force_full = true; // refetch the active pane at the live tail
+        self.window.request_redraw();
+    }
+
+    /// A key press while search mode is active: edit the query, navigate matches, or exit.
+    fn search_key(&mut self, event: &KeyEvent, mods: ModifiersState) {
+        // Paste appends to the query (honors the configured Paste chord). Control chars (a
+        // pasted newline) would corrupt the single-line query — keep printable text only.
+        if self.keymap.action(mods, &event.logical_key) == Some(Action::Paste) {
+            if let Some(text) = clipboard::get_text(self.hwnd) {
+                if let Some(s) = self.search.as_mut() {
+                    s.query.extend(text.chars().filter(|c| !c.is_control()));
+                }
+                self.refresh_search();
+            }
+            self.window.request_redraw();
+            return;
+        }
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.exit_search(),
+            Key::Named(NamedKey::Enter) => {
+                self.search_step(if mods.shift_key() { -1 } else { 1 });
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(s) = self.search.as_mut() {
+                    s.query.pop();
+                }
+                self.refresh_search();
+            }
+            Key::Named(NamedKey::Space) => {
+                if let Some(s) = self.search.as_mut() {
+                    s.query.push(' ');
+                }
+                self.refresh_search();
+            }
+            // Printable input. AltGr arrives as Ctrl+Alt on Windows, so accept Ctrl+Alt text
+            // (@ { } € on non-US layouts); reject pure-Ctrl and Super chords as non-text.
+            Key::Character(text) if !mods.super_key() && !(mods.control_key() && !mods.alt_key()) => {
+                if let Some(s) = self.search.as_mut() {
+                    s.query.push_str(text.as_str());
+                }
+                self.refresh_search();
+            }
+            _ => {}
+        }
+        self.window.request_redraw();
+    }
+
+    /// Re-run the search for the current query and jump to the first match. An empty query clears
+    /// the matches (and leaves the viewport where it is).
+    fn refresh_search(&mut self) {
+        let Some(query) = self.search.as_ref().map(|s| s.query.clone()) else { return };
+        let matches = if query.is_empty() {
+            Vec::new()
+        } else {
+            match self.client.call(Call::SearchPane { pane: self.active_pane, query }) {
+                Ok(ResultBody::Matches(m)) => m,
+                _ => Vec::new(),
+            }
+        };
+        if let Some(s) = self.search.as_mut() {
+            s.matches = matches;
+            s.current = 0;
+        }
+        self.jump_to_current_match();
+    }
+
+    /// Move to the next/previous match (wrapping) and jump the viewport to it.
+    fn search_step(&mut self, dir: i64) {
+        let Some(s) = self.search.as_mut() else { return };
+        if s.matches.is_empty() {
+            return;
+        }
+        s.current = step_index(s.current, s.matches.len(), dir);
+        self.jump_to_current_match();
+    }
+
+    /// Scroll the active pane to the current match's offset (a `search-pane` result is a `GetGrid`
+    /// offset). Forces a refetch so the server-side clamp applies via the normal render path.
+    ///
+    /// The match's natural offset puts it on the BOTTOM visible row — exactly the row the search
+    /// band covers (the renderer shrinks the viewport by `SEARCH_BAR` without resizing the pty).
+    /// Scroll back a little less so the match lands above the band. Matches within a band-row of
+    /// the live bottom can't be lifted (can't scroll below live); they stay partially covered.
+    fn jump_to_current_match(&mut self) {
+        if let Some(off) = self.search.as_ref().and_then(|s| s.matches.get(s.current).copied()) {
+            let ch = self.cell_dims().1;
+            let band_rows = (SEARCH_BAR as u32).div_ceil(ch) as usize;
+            self.scroll_offset = (off as usize).saturating_sub(band_rows);
+            self.force_full = true;
+            self.window.request_redraw();
+        }
+    }
+
+    /// Ctrl+click handler: open the URL under the cursor, if any. Returns true when one was opened
+    /// (so the caller suppresses reporting/selection). Mirrors `on_click`'s pane hit-test.
+    fn open_url_at_cursor(&mut self) -> bool {
+        let (cx, cy) = self.cursor;
+        if cx < 0.0 || cy < 0.0 {
+            return false;
+        }
+        let (sidebar_w, _, _) = self.areas();
+        if (cx as u32) < sidebar_w {
+            return false;
+        }
+        let cxp = (cx - sidebar_w as f64) as u32;
+        let py = cy as u32;
+        let Some(pr) = self
+            .last_panes
+            .iter()
+            .find(|p| cxp >= p.x && cxp < p.x + p.w && py >= p.y && py < p.y + p.h)
+            .cloned()
+        else {
+            return false;
+        };
+        let (cw, ch) = self.cell_dims();
+        let rect = Rect { x: pr.x + sidebar_w, y: pr.y, w: pr.w, h: pr.h };
+        let (col, row) = pixel_to_cell(cx as f32, cy as f32, rect, sidebar_w, self.config.width, self.config.height, cw, ch);
+        let Some(spans) = self.url_spans.get(&pr.id) else { return false };
+        match url_at(spans, col, row) {
+            Some(url) => {
+                open_url(url);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn cell_dims(&self) -> (u32, u32) {
         (self.renderer.cell_w().max(1), self.renderer.cell_h().max(1))
+    }
+
+    /// Whether the cursor sits on the active pane's search band (the bottom `SEARCH_BAR` strip the
+    /// renderer draws while searching, plus the margin/border sliver below it — clicks there hit
+    /// nothing anyway).
+    fn cursor_in_search_band(&self) -> bool {
+        let Some((rect, inside)) = self.active_pane_rect() else { return false };
+        inside
+            && self.cursor.1 >= (rect.y + rect.h) as f64 - (SEARCH_BAR + MARGIN + BORDER) as f64
     }
 
     /// Whether the active pane's app asked for SGR (1006) mouse encoding.
@@ -1370,11 +1670,19 @@ impl State {
         let mut rows: Vec<SidebarRow> = Vec::new();
         // Per pane: snapshot, attention, active, rect (window coords), scroll offset, id, title.
         let mut snaps: Vec<(PaneSnapshot, Attention, bool, Rect, u32, u64, String)> = Vec::new();
+        // URL spans detected this frame, keyed by pane id (rebuilt every render).
+        let mut url_spans: HashMap<u64, Vec<UrlSpan>> = HashMap::new();
         if let Ok(ResultBody::Layout(layout)) = self.client.call(Call::GetLayout { w: content_w, h }) {
             if layout.active_pane != self.active_pane {
                 // The active pane changed daemon-side (e.g. the old one exited): the scroll offset
-                // belonged to the previous pane, so snap the new one to its live screen.
+                // belonged to the previous pane, so snap the new one to its live screen. Any open
+                // search's matches are offsets into the OLD pane's scrollback — drop them so Enter
+                // can't jump the new pane to a meaningless line (typing re-searches the new pane).
                 self.scroll_offset = 0;
+                if let Some(s) = self.search.as_mut() {
+                    s.matches.clear();
+                    s.current = 0;
+                }
             }
             self.active_pane = layout.active_pane;
             // Cache for mouse hit-testing (content-area coords; the sidebar offset is applied below).
@@ -1438,7 +1746,12 @@ impl State {
                 } else {
                     self.snap_cache.get(&pr.id).cloned()
                 };
-                let Some(snap) = snap else { continue };
+                let Some(mut snap) = snap else { continue };
+                // Underline detected URLs in-place and stash their spans for Ctrl+click hit-testing.
+                let spans = detect_urls(&mut snap);
+                if !spans.is_empty() {
+                    url_spans.insert(pr.id, spans);
+                }
                 let att = if pr.attention { Attention::Pending } else { Attention::Quiet };
                 let rect = Rect { x: pr.x + sidebar_w, y: pr.y, w: pr.w, h: pr.h };
                 // Only the active pane can be scrolled; cached (non-active) panes are always live.
@@ -1450,6 +1763,9 @@ impl State {
             // already failed inside `call`): flag it so the loop exits instead of hanging white.
             self.fatal = true;
         }
+        // Persist this frame's spans for Ctrl+click hit-testing (and clear them when the layout
+        // fetch failed, so a stale span can't open a URL that is no longer under the cursor).
+        self.url_spans = url_spans;
         let views: Vec<PaneView> = snaps
             .iter()
             .map(|(s, a, active, rect, scrolled, id, title)| {
@@ -1487,7 +1803,24 @@ impl State {
             }
             plus_hover = self.renderer.sidebar_new_tab_at(cy as f32, self.tab_count);
         }
-        self.renderer.render_frame(&view, &rows, sidebar_w, &views, w, h, empty_msg, plus_hover);
+        // Search bar shows a 1-based "current/total" (renderer renders the numbers as-is).
+        let search_bar = self.search.as_ref().map(|s| SearchBar {
+            query: s.query.clone(),
+            current: if s.matches.is_empty() { 0 } else { s.current + 1 },
+            total: s.matches.len(),
+        });
+        self.renderer.render_frame(
+            &view,
+            &rows,
+            sidebar_w,
+            &views,
+            w,
+            h,
+            empty_msg,
+            plus_hover,
+            search_bar.as_ref(),
+            self.preedit.as_deref(),
+        );
         // Present explicitly: dropping a SurfaceTexture does NOT present it — unpresented frames
         // exhaust the swapchain and every later acquire times out (window stays white/stale).
         self.renderer.queue.present(frame);
@@ -1899,5 +2232,32 @@ mod tests {
         assert_eq!(mouse_button_code(MouseButton::Middle), Some(1));
         assert_eq!(mouse_button_code(MouseButton::Right), Some(2));
         assert_eq!(mouse_button_code(MouseButton::Back), None);
+    }
+
+    /// URL spans: scheme + non-space run, trailing sentence punctuation trimmed, and a bare
+    /// scheme (a URL wrapped right at "https://") skipped entirely.
+    #[test]
+    fn find_urls_detects_trims_and_skips_bare_scheme() {
+        let line: Vec<char> =
+            "see https://example.com/a. or (http://x.io/p) https:// end".chars().collect();
+        let texts: Vec<String> = find_urls(&line)
+            .iter()
+            .map(|&(s, e)| line[s..e].iter().collect())
+            .collect();
+        assert_eq!(texts, vec!["https://example.com/a", "http://x.io/p"]);
+    }
+
+    /// `url_at` hit-tests the inclusive column span on the right row; `step_index` wraps both
+    /// directions and stays 0 for an empty list.
+    #[test]
+    fn url_at_is_inclusive_and_step_index_wraps() {
+        let spans = vec![UrlSpan { row: 2, start: 5, end: 9, url: "u".into() }];
+        assert_eq!(url_at(&spans, 5, 2), Some("u"));
+        assert_eq!(url_at(&spans, 9, 2), Some("u"));
+        assert_eq!(url_at(&spans, 10, 2), None);
+        assert_eq!(url_at(&spans, 5, 1), None);
+        assert_eq!(step_index(0, 3, -1), 2);
+        assert_eq!(step_index(2, 3, 1), 0);
+        assert_eq!(step_index(0, 0, 1), 0);
     }
 }

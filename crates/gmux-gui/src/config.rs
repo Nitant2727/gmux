@@ -31,6 +31,7 @@ pub enum Action {
     ScrollPageDown,
     Paste,
     OpenSettings,
+    Search,
 }
 
 impl Action {
@@ -51,6 +52,7 @@ impl Action {
             "scroll_page_down" => Action::ScrollPageDown,
             "paste" => Action::Paste,
             "open_settings" => Action::OpenSettings,
+            "search" => Action::Search,
             _ => return None,
         })
     }
@@ -73,6 +75,7 @@ const DEFAULTS: &[(&str, &str, Action)] = &[
     ("scroll_page_down", "shift+pagedown", Action::ScrollPageDown),
     ("paste", "ctrl+shift+v", Action::Paste),
     ("open_settings", "ctrl+,", Action::OpenSettings),
+    ("search", "ctrl+shift+f", Action::Search),
 ];
 
 #[derive(Debug, Default, Deserialize)]

@@ -169,6 +169,7 @@ fn idempotent(call: &Call) -> bool {
             | Call::ResizeView { .. }
             | Call::PollNotifications
             | Call::SetPalette { .. }
+            | Call::SearchPane { .. }
     )
 }
 
