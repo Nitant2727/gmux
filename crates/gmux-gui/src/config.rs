@@ -32,6 +32,9 @@ pub enum Action {
     Paste,
     OpenSettings,
     Search,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
 }
 
 impl Action {
@@ -53,6 +56,9 @@ impl Action {
             "paste" => Action::Paste,
             "open_settings" => Action::OpenSettings,
             "search" => Action::Search,
+            "zoom_in" => Action::ZoomIn,
+            "zoom_out" => Action::ZoomOut,
+            "zoom_reset" => Action::ZoomReset,
             _ => return None,
         })
     }
@@ -76,6 +82,9 @@ const DEFAULTS: &[(&str, &str, Action)] = &[
     ("paste", "ctrl+shift+v", Action::Paste),
     ("open_settings", "ctrl+,", Action::OpenSettings),
     ("search", "ctrl+shift+f", Action::Search),
+    ("zoom_in", "ctrl+=", Action::ZoomIn),
+    ("zoom_out", "ctrl+-", Action::ZoomOut),
+    ("zoom_reset", "ctrl+0", Action::ZoomReset),
 ];
 
 #[derive(Debug, Default, Deserialize)]
@@ -476,6 +485,37 @@ mod tests {
         assert_eq!(km.action(m, &k), Some(Action::Paste));
         // The action name maps both ways (config `keys` uses these names).
         assert_eq!(Action::from_name("paste"), Some(Action::Paste));
+    }
+
+    #[test]
+    fn zoom_chords_parse_and_bind() {
+        // The three zoom chords use single-char tokens (`=`, `-`, `0`) that go through named_key's
+        // Key::Character fallback — no chord-parser change needed.
+        assert_eq!(
+            parse_chord("ctrl+="),
+            Some((ModifiersState::CONTROL, Key::Character("=".into())))
+        );
+        assert_eq!(
+            parse_chord("ctrl+-"),
+            Some((ModifiersState::CONTROL, Key::Character("-".into())))
+        );
+        assert_eq!(
+            parse_chord("ctrl+0"),
+            Some((ModifiersState::CONTROL, Key::Character("0".into())))
+        );
+        let km = Keymap::default();
+        for (chord, action) in [
+            ("ctrl+=", Action::ZoomIn),
+            ("ctrl+-", Action::ZoomOut),
+            ("ctrl+0", Action::ZoomReset),
+        ] {
+            let (m, k) = parse_chord(chord).unwrap();
+            assert_eq!(km.action(m, &k), Some(action), "{chord} binds {action:?}");
+        }
+        // The action names round-trip (config `keys` uses these).
+        assert_eq!(Action::from_name("zoom_in"), Some(Action::ZoomIn));
+        assert_eq!(Action::from_name("zoom_out"), Some(Action::ZoomOut));
+        assert_eq!(Action::from_name("zoom_reset"), Some(Action::ZoomReset));
     }
 
     #[test]

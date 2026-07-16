@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 use gmux_mux::{
     FocusDir, Pane, PaneEvent, PaneId, Palette, ProgressState, PtySize, Rgb, Session,
-    SessionSnapshot, SplitDir, Urgency, Window,
+    SessionSnapshot, SplitDir, Urgency, Window, WindowId,
 };
 use gmux_pipe::{PipeServer, PipeStream};
 use gmux_proto::{
@@ -381,6 +381,35 @@ impl Server {
                 }
                 Response::ok(id, ResultBody::Done)
             }
+            Call::CloseWindow { id: win } => {
+                // A middle-click gesture, addressed by stable id (indices go stale between the
+                // GUI's last render and the click). Ids are never reused, so a gone id can only
+                // miss — answered as a no-op rather than an error.
+                let wid = WindowId(*win);
+                let exists = self.session.windows().iter().any(|w| w.id == wid);
+                if !exists || self.session.windows().len() <= 1 {
+                    // Refuse to close the LAST window (mirrors close_active_window's guard): a
+                    // stray middle-click must not empty the session — that would flip
+                    // all_exited(), exit the daemon, and delete the restore snapshot.
+                    Response::ok(id, ResultBody::Done)
+                } else if let Some((ai, rw)) = self
+                    .remotes
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, r)| r.remote_window_for(wid).map(|rw| (i, rw)))
+                {
+                    // Mirrored window: kill it remote-side and let the resulting %window-close
+                    // prune the local mirror AND the attachment's maps. Removing it locally
+                    // instead would leave a stale map entry that resurrects the tab on the next
+                    // %layout-change (and silently discard the remote window's output).
+                    self.remotes[ai].kill_remote_window(rw);
+                    Response::ok(id, ResultBody::Done)
+                } else {
+                    // Local window: drop it (its panes die on drop, like ClosePane's close_active).
+                    self.session.remove_window(wid);
+                    Response::ok(id, ResultBody::Done)
+                }
+            }
             Call::SelectWindow { index } => {
                 self.session.select_window(*index);
                 Response::ok(id, ResultBody::Done)
@@ -453,6 +482,7 @@ impl Server {
                 let (progress, progress_error) = window_progress(win, &self.progress);
                 TabWire {
                     index: i,
+                    id: win.id.0,
                     name: info.name,
                     branch: info.branch,
                     attention: info.attention,
@@ -906,6 +936,54 @@ mod tests {
         // A second poll is empty — the queue was taken, not copied.
         let again = server.handle(&Request { id: 4, call: Call::PollBrowse });
         assert_eq!(again.result, Some(ResultBody::Browses(Vec::new())));
+    }
+
+    /// `CloseWindow` drops the whole window by stable id (its panes die on drop); a gone id is a
+    /// no-op; the LAST window is never closed (a stray middle-click must not empty the session,
+    /// exit the daemon, and wipe the snapshot). Console-free remote panes, runs headless.
+    #[test]
+    fn close_window_drops_window_and_errors_out_of_range() {
+        use gmux_mux::{Pane, Session};
+        // Pane ids are auto-allocated (the first arg is the remote id), so capture them.
+        let a = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        let ida = a.id;
+        let mut server = Server {
+            session: Session::start("t", a),
+            shell: "pwsh".into(),
+            last_view: (800, 600),
+            notifications: Vec::new(),
+            browse_requests: Vec::new(),
+            ticks: 0,
+            remotes: Vec::new(),
+            progress: HashMap::new(),
+            palette: Palette::default(),
+            persist_screen: true,
+        };
+        // A second remote pane in its own window -> two tabs.
+        let b = Pane::remote(2, 80, 24, Box::new(|_| {}));
+        let idb = b.id;
+        server.session.add_window(b);
+        assert_eq!(server.session.windows().len(), 2);
+
+        // Close the first window by its stable id: count drops, its pane is gone, the second survives.
+        let first_wid = server.session.windows()[0].id.0;
+        let resp = server.handle(&Request { id: 1, call: Call::CloseWindow { id: first_wid } });
+        assert_eq!(resp.result, Some(ResultBody::Done));
+        assert_eq!(server.session.windows().len(), 1);
+        assert!(server.session.pane(ida).is_none(), "closed window's pane is dropped");
+        assert!(server.session.pane(idb).is_some(), "surviving window's pane remains");
+
+        // A stale (already-closed) id is a harmless no-op, not an error.
+        let resp = server.handle(&Request { id: 2, call: Call::CloseWindow { id: first_wid } });
+        assert_eq!(resp.result, Some(ResultBody::Done));
+        assert_eq!(server.session.windows().len(), 1);
+
+        // The LAST window is never closed: the session must not empty (daemon exit + snapshot wipe).
+        let last_wid = server.session.windows()[0].id.0;
+        let resp = server.handle(&Request { id: 3, call: Call::CloseWindow { id: last_wid } });
+        assert_eq!(resp.result, Some(ResultBody::Done));
+        assert_eq!(server.session.windows().len(), 1, "last window survives a close request");
+        assert!(server.session.pane(idb).is_some());
     }
 
     /// `SetPalette` re-themes existing (console-free remote) panes: after it, SGR 31 red resolves

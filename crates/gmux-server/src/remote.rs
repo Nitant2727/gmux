@@ -140,6 +140,18 @@ impl RemoteAttachment {
         self.transport.kill_pane(remote);
     }
 
+    /// The remote `@window` mirrored by local window `id`, if this attachment owns it.
+    pub fn remote_window_for(&self, id: WindowId) -> Option<u64> {
+        self.windows.iter().find_map(|(remote, local)| (*local == id).then_some(*remote))
+    }
+
+    /// Ask the remote to kill window `@remote`. The local mirror (window + attachment maps) is
+    /// pruned by the resulting `%window-close` — closing locally first would leave a stale map
+    /// entry that resurrects the tab on the next `%layout-change`.
+    pub fn kill_remote_window(&mut self, remote: u64) {
+        self.transport.send_command(&format!("kill-window -t @{remote}"));
+    }
+
     /// Forward queued input and apply all pending transport events to `session`. Returns `false`
     /// once the attachment is finished (`%exit` or EOF) — its panes are then marked exited (the
     /// daemon's normal exited-pane sweep removes them) and the caller should drop it.

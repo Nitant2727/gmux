@@ -92,6 +92,13 @@ pub enum Call {
     },
     /// Switch tabs: `next` true = next window, false = previous.
     SwitchWindow { next: bool },
+    /// Close a window (tab) by its STABLE id (`TabWire::id`, a middle-click) — not by sidebar
+    /// index, which goes stale when a window is removed daemon-side between the GUI's last
+    /// render and the click (every later index shifts). A gone id is a harmless no-op.
+    CloseWindow {
+        #[serde(default)]
+        id: u64,
+    },
     /// Activate a window (tab) by its index in the sidebar (a sidebar click). Out-of-range
     /// indices are ignored server-side.
     SelectWindow {
@@ -277,6 +284,10 @@ pub struct PaneRectWire {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TabWire {
     pub index: usize,
+    /// Stable window id (`WindowId`), the target for `Call::CloseWindow` — survives reorders
+    /// and removals that shift `index`. `#[serde(default)]` so old daemons still parse.
+    #[serde(default)]
+    pub id: u64,
     pub name: String,
     pub branch: Option<String>,
     pub attention: bool,
@@ -392,6 +403,9 @@ mod tests {
         let req = Request { id: 1, call: Call::ListPanes };
         let s = serde_json::to_string(&req).unwrap();
         assert!(s.contains("\"method\":\"list-panes\""), "{s}");
+        let req = Request { id: 1, call: Call::CloseWindow { id: 0 } };
+        let s = serde_json::to_string(&req).unwrap();
+        assert!(s.contains("\"method\":\"close-window\""), "{s}");
     }
 
     #[test]
@@ -415,6 +429,7 @@ mod tests {
             Call::ToggleZoom,
             Call::ResizeSplit { pane: 4, dx: 0.5, dy: -0.25 },
             Call::SwitchWindow { next: true },
+            Call::CloseWindow { id: 2 },
             Call::SelectWindow { index: 2 },
             Call::FocusPaneId { pane: 7 },
             Call::MoveWindow { from: 3, to: 1 },
@@ -458,8 +473,8 @@ mod tests {
         let layout = LayoutWire {
             active_pane: 1,
             tabs: vec![
-                TabWire { index: 0, name: "a".into(), branch: Some("main".into()), attention: false, active: true, progress: Some(42), progress_error: false },
-                TabWire { index: 1, name: "b".into(), branch: None, attention: true, active: false, progress: None, progress_error: true },
+                TabWire { index: 0, id: 10, name: "a".into(), branch: Some("main".into()), attention: false, active: true, progress: Some(42), progress_error: false },
+                TabWire { index: 1, id: 11, name: "b".into(), branch: None, attention: true, active: false, progress: None, progress_error: true },
             ],
             panes: Vec::new(),
         };

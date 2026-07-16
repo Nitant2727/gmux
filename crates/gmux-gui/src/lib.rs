@@ -241,6 +241,7 @@ mod tests {
             active: true,
             rect: Rect { x: 0, y: 0, w, h },
             scrolled: 0,
+            history: 0,
             title: String::new(),
             selection: Some(((1, 0), (1, 0))),
         };
@@ -286,6 +287,7 @@ mod tests {
             active: true,
             rect: Rect { x: 0, y: 0, w, h },
             scrolled: 0,
+            history: 0,
             title: String::new(),
             selection: None,
         };

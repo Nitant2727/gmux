@@ -41,6 +41,7 @@ const RADIUS: f32 = 6.0; // rounded corner radius for sidebar rows + pane chrome
 const BADGE_RADIUS: f32 = 4.0; // scroll badge chip
 const TITLE_STRIP: f32 = 22.0; // pane title band inside the border, above the cells
 const SEARCH_BAR: f32 = 22.0; // search band inside the border, below the cells (active pane only)
+const SCROLLBAR_W: f32 = 8.0; // scrollback scrollbar strip at the cell-area right edge (active pane only)
 
 const fn clear_of(c: Rgb) -> wgpu::Color {
     wgpu::Color { r: c.r as f64 / 255.0, g: c.g as f64 / 255.0, b: c.b as f64 / 255.0, a: 1.0 }
@@ -72,6 +73,9 @@ pub struct PaneView<'a> {
     pub rect: Rect,
     /// Scrollback offset: 0 = live tail; >0 draws a '+{n}' badge top-right of the pane.
     pub scrolled: u32,
+    /// Total scrollback depth available (lines above the live screen). With `scrolled` it sizes and
+    /// positions the scrollbar thumb; 0 = no scrollback, so no scrollbar is drawn.
+    pub history: u32,
     /// Title shown in the pane's title strip (daemon-provided; short cwd / pane name).
     pub title: String,
     /// Selected cell range `((start_col,start_row),(end_col,end_row))`, normalized start<=end in
@@ -150,6 +154,20 @@ fn push_rounded(out: &mut Vec<RoundedVertex>, x0: f32, y0: f32, x1: f32, y1: f32
     }
 }
 
+/// The scrollback scrollbar thumb `(top, bottom)` in px within a `track_h`-tall track. The thumb
+/// height is proportional to the visible fraction `rows / (rows + history)`, floored at 24px and
+/// capped at the track. Position is linear in `scrolled` over `[0, history]`: `scrolled == 0` pins
+/// the thumb to the bottom (live screen), `scrolled == history` to the top (deepest history). A
+/// zero `history` degenerates to a full-height thumb pinned at the bottom (no divide-by-zero).
+/// Pure/tested.
+fn scrollbar_thumb(track_h: f32, rows: u32, history: u32, scrolled: u32) -> (f32, f32) {
+    let denom = (rows + history).max(1) as f32;
+    let thumb_h = (track_h * rows as f32 / denom).max(24.0).min(track_h);
+    let frac = if history == 0 { 0.0 } else { scrolled as f32 / history as f32 };
+    let top = (track_h - thumb_h) * (1.0 - frac);
+    (top, top + thumb_h)
+}
+
 /// Prefer Cascadia (Mono, then Code) from the Windows fonts dir; fall back to the platform
 /// monospace (Consolas). Same ab_glyph path as the atlas — ASCII-only, unchanged.
 fn load_atlas(px: f32) -> Atlas {
@@ -173,6 +191,9 @@ pub struct Renderer {
     atlas_bind_group: wgpu::BindGroup,
     atlas_tex: wgpu::Texture, // dynamic glyph tiles are written here incrementally
     atlas: Atlas,
+    /// The atlas texture+sampler bind-group layout, kept so `set_font_px` can rebuild the bind
+    /// group (new texture) against the same layout the glyph pipeline was created with.
+    atlas_bind_layout: wgpu::BindGroupLayout,
     // Theme knobs (see `set_theme`). Cell fg/bg still come from the daemon's grid; these only drive
     // the window clear color and the sidebar text color.
     clear: wgpu::Color,
@@ -209,73 +230,11 @@ impl Renderer {
         format: wgpu::TextureFormat,
         font_px: f32,
     ) -> Renderer {
+        // Atlas GPU setup (texture + bind group against a shared layout). Extracted into
+        // `atlas_bind_layout` / `atlas_texture` so `set_font_px` can rebuild them on a live zoom.
         let atlas = load_atlas(font_px);
-
-        // Full-size R8 coverage texture. Only the initial region (ASCII grid + box tile) is uploaded
-        // now; dynamic glyph tiles are written incrementally into the shelves below via
-        // `queue.write_texture` (see `glyph_uv`). The rest zero-inits on first sample.
-        let tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("gmux-atlas"),
-            size: wgpu::Extent3d { width: atlas.width, height: atlas.height, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &tex,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &atlas.pixels,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(atlas.width),
-                rows_per_image: Some(atlas.init_h),
-            },
-            wgpu::Extent3d { width: atlas.width, height: atlas.init_h, depth_or_array_layers: 1 },
-        );
-        let tex_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("gmux-atlas-sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-
-        let bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("gmux-atlas-bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let atlas_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("gmux-atlas-bg"),
-            layout: &bind_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&tex_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
-            ],
-        });
+        let bind_layout = Self::atlas_bind_layout(&device);
+        let (tex, atlas_bind_group) = Self::atlas_texture(&device, &queue, &atlas, &bind_layout);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gmux-shaders"),
@@ -396,9 +355,104 @@ impl Renderer {
             atlas_bind_group,
             atlas_tex: tex,
             atlas,
+            atlas_bind_layout: bind_layout,
             clear: DEFAULT_CLEAR,
             text: TEXT,
         }
+    }
+
+    /// The atlas texture + sampler bind-group layout (shared by the glyph pipeline and every
+    /// rebuilt atlas bind group). Extracted so `set_font_px` rebuilds the bind group against the
+    /// exact layout the pipeline was created with.
+    fn atlas_bind_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+        device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("gmux-atlas-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        })
+    }
+
+    /// Build the full-size R8 coverage texture for `atlas` (uploading only its initial ASCII+box
+    /// region; the rest zero-inits and dynamic glyph tiles are written later via `glyph_uv`) plus a
+    /// bind group pointing at it, using the shared `layout`. Returns `(texture, bind_group)`.
+    fn atlas_texture(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        atlas: &Atlas,
+        layout: &wgpu::BindGroupLayout,
+    ) -> (wgpu::Texture, wgpu::BindGroup) {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gmux-atlas"),
+            size: wgpu::Extent3d { width: atlas.width, height: atlas.height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &atlas.pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(atlas.width),
+                rows_per_image: Some(atlas.init_h),
+            },
+            wgpu::Extent3d { width: atlas.width, height: atlas.init_h, depth_or_array_layers: 1 },
+        );
+        let tex_view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("gmux-atlas-sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gmux-atlas-bg"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&tex_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+        (tex, bind_group)
+    }
+
+    /// Change the font size live (Ctrl+wheel / zoom actions / config reload). Rebuilds the glyph
+    /// atlas at `px` (new cell metrics; the dynamic glyph map re-rasterizes lazily) and its GPU
+    /// texture + bind group. Clamped to the atlas's rasterizable range. Callers resend geometry so
+    /// the daemon re-cells panes at the new `cell_w`/`cell_h`.
+    pub fn set_font_px(&mut self, px: f32) {
+        let px = px.clamp(8.0, 40.0);
+        // ponytail: reloads font bytes from disk each call (rare, user-driven); cache if it shows.
+        let atlas = load_atlas(px);
+        let (tex, bind_group) =
+            Self::atlas_texture(&self.device, &self.queue, &atlas, &self.atlas_bind_layout);
+        self.atlas = atlas;
+        self.atlas_tex = tex;
+        self.atlas_bind_group = bind_group;
     }
 
     /// Apply theme colors: `bg` becomes the window clear color, `fg` the sidebar text color.
@@ -583,6 +637,7 @@ impl Renderer {
                 active: true,
                 rect: Rect { x: 0, y: 0, w: px_w, h: px_h },
                 scrolled: 0,
+                history: 0,
                 title: String::new(),
                 selection: None,
             }],
@@ -889,6 +944,28 @@ impl Renderer {
                 self.text_run(&title, tx, ty, rgba(TEXT_DIM), fw, fh, &mut sgl);
             }
 
+            // Cell-area geometry (hoisted so the scrollbar, scroll badge, and search band share this
+            // rect). Inset INSET on the sides and bottom, below the title strip on top; the search
+            // band (active pane) covers the bottom SEARCH_BAR of the visible height.
+            let search_here = pv.active && search.is_some();
+            let pad = bw + INSET;
+            let (ix, iy) = (cx + pad, cy + bw + TITLE_STRIP + INSET);
+            let iw = (cw_ - 2.0 * pad).max(1.0);
+            // ponytail: search band shrinks the visible cell area by SEARCH_BAR, but the daemon isn't
+            // told — so the bottom cell row is covered (not resized away) while searching. Acceptable.
+            let ih = (ch_ - bw - TITLE_STRIP - INSET - pad - if search_here { SEARCH_BAR } else { 0.0 }).max(1.0);
+
+            // Scrollback scrollbar: an 8px strip at the cell-area right edge (BG_SIDEBAR track +
+            // ACCENT thumb), pushed into the overlay BEFORE the scroll badge so the badge sits on
+            // top where they overlap top-right. Active pane with scrollback only.
+            if pv.active && pv.scrolled > 0 {
+                let (t0, t1) = scrollbar_thumb(ih, pv.snap.rows as u32, pv.history, pv.scrolled);
+                let sbx1 = ix + iw;
+                let sbx0 = sbx1 - SCROLLBAR_W;
+                push_rounded(&mut obg, sbx0, iy, sbx1, iy + ih, 0.0, rgba(BG_SIDEBAR), fw, fh); // track
+                push_rounded(&mut obg, sbx0, iy + t0, sbx1, iy + t1, 0.0, rgba(ACCENT), fw, fh); // thumb
+            }
+
             // Scroll badge: '+{n}' chip top-right inside the pane, below the title strip (drawn
             // later, above the cells).
             if pv.scrolled > 0 {
@@ -906,7 +983,6 @@ impl Renderer {
             // border (title strip owns the top). Round the bottom corners; square the top where it
             // meets the cells. Content: dim "find:" label, the query in TEXT with a '_' caret, and a
             // right-aligned "current/total" in ACCENT (or "no matches" in ERROR).
-            let search_here = pv.active && search.is_some();
             if let (true, Some(sb)) = (pv.active, search) {
                 let (bx0, bx1) = (cx + bw, cx + cw_ - bw);
                 let by1 = cy + ch_ - bw;
@@ -928,15 +1004,8 @@ impl Renderer {
                 self.text_run(&counter, (bx1 - 12.0 - cwn).max(lx), ty, rgba(col), fw, fh, &mut sgl);
             }
 
-            // Cell area: inset INSET on the sides and bottom, and below the title strip on top.
-            // Cells draw at fixed size from its top-left; the viewport clips overflow, the BG_PANE
-            // fill shows through any remainder.
-            let pad = bw + INSET;
-            let (ix, iy) = (cx + pad, cy + bw + TITLE_STRIP + INSET);
-            let iw = (cw_ - 2.0 * pad).max(1.0);
-            // ponytail: search band shrinks the visible cell area by SEARCH_BAR, but the daemon isn't
-            // told — so the bottom cell row is covered (not resized away) while searching. Acceptable.
-            let ih = (ch_ - bw - TITLE_STRIP - INSET - pad - if search_here { SEARCH_BAR } else { 0.0 }).max(1.0);
+            // Cells draw at fixed size from the cell-area top-left (`ix`,`iy`; computed above); the
+            // viewport clips overflow and the BG_PANE fill shows through any remainder.
             // Search-match highlight on the active pane only, when the query is non-empty AND the
             // daemon reported matches — gating on total keeps the highlight and the "no matches"
             // label from contradicting (a pane switch keeps the query but drops the matches).
@@ -1234,6 +1303,26 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_thumb_positions() {
+        // rows == history: the thumb is half the track and slides between bottom and top.
+        assert_eq!(scrollbar_thumb(100.0, 10, 10, 0), (50.0, 100.0)); // live screen -> bottom
+        assert_eq!(scrollbar_thumb(100.0, 10, 10, 10), (0.0, 50.0)); // deepest history -> top
+        assert_eq!(scrollbar_thumb(100.0, 10, 10, 5), (25.0, 75.0)); // midway
+
+        // A tiny visible fraction floors the thumb height at 24px, still pinned to the bottom at 0.
+        let (t, b) = scrollbar_thumb(100.0, 1, 100, 0);
+        assert_eq!(b - t, 24.0);
+        assert_eq!(b, 100.0);
+
+        // history == 0 degenerates to a full-height thumb pinned to the bottom (no divide-by-zero).
+        assert_eq!(scrollbar_thumb(100.0, 10, 0, 0), (0.0, 100.0));
+
+        // A track shorter than the 24px floor caps the thumb at the track height (stays in bounds).
+        let (t, b) = scrollbar_thumb(10.0, 10, 10, 0);
+        assert!(t >= 0.0 && b <= 10.0 && b > t, "thumb {t}..{b} within a 10px track");
+    }
+
+    #[test]
     fn render_frame_into_1x1_does_not_panic() {
         // Minimize regression: a full frame (pane + search bar) into a 1×1 surface must not trip
         // the wgpu "Scissor Rect not contained in the render target" panic.
@@ -1259,6 +1348,7 @@ mod tests {
             active: true,
             rect: Rect { x: 0, y: 0, w: 1, h: 1 },
             scrolled: 0,
+            history: 0,
             title: "t".into(),
             selection: None,
         };
