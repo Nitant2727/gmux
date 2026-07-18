@@ -32,6 +32,10 @@ pub struct Window {
     root: Node,
     active: PaneId,
     zoom: bool,
+    /// User-set name override (a sidebar rename); `None` uses the derived workspace name. ponytail:
+    /// not persisted — SessionSnapshot carries no window name today, so a rename does not survive a
+    /// daemon restart. Add a name field to WindowSnapshot the day that should stick.
+    name: Option<String>,
 }
 
 impl Window {
@@ -39,7 +43,7 @@ impl Window {
         let id = pane.id;
         let mut panes = HashMap::new();
         panes.insert(id, pane);
-        Window { id: WindowId::alloc(), panes, root: Node::leaf(id), active: id, zoom: false }
+        Window { id: WindowId::alloc(), panes, root: Node::leaf(id), active: id, zoom: false, name: None }
     }
 
     pub fn active_id(&self) -> PaneId {
@@ -74,7 +78,13 @@ impl Window {
     }
     /// Build a window from a pre-constructed pane map + split tree (used by session restore).
     pub fn from_parts(panes: HashMap<PaneId, Pane>, root: Node, active: PaneId) -> Window {
-        Window { id: WindowId::alloc(), panes, root, active, zoom: false }
+        Window { id: WindowId::alloc(), panes, root, active, zoom: false, name: None }
+    }
+
+    /// Set (or clear) this window's custom name override. An empty `name` clears it back to the
+    /// derived workspace name (see [`Window::workspace_info`]).
+    pub fn set_name(&mut self, name: String) {
+        self.name = if name.is_empty() { None } else { Some(name) };
     }
 
     /// Replace this window's split tree wholesale (the remote-tmux mirror path, where the remote's
@@ -147,11 +157,13 @@ impl Window {
     pub fn workspace_info(&self) -> WorkspaceInfo {
         let cwd = self.active_pane().cwd();
         let branch = cwd.as_deref().and_then(|c| workspace::git_branch(std::path::Path::new(c)));
-        let name = cwd
-            .as_deref()
-            .map(workspace::cwd_name)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "shell".to_string());
+        // A custom name (sidebar rename) wins over the derived cwd name.
+        let name = self.name.clone().unwrap_or_else(|| {
+            cwd.as_deref()
+                .map(workspace::cwd_name)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "shell".to_string())
+        });
         let attention = self.panes().any(|p| p.attention().is_pending());
         WorkspaceInfo { name, cwd, branch, attention }
     }
@@ -590,6 +602,18 @@ mod tests {
         let rs = win.layout_rects(100, 40);
         let wa = rs.iter().find(|(id, _)| *id == ida).unwrap().1.w;
         assert_eq!(wa, 70, "left pane grew to 0.5 + 0.2 of the width");
+    }
+
+    /// A custom name override wins over the derived workspace name; an empty name clears it back.
+    /// A remote pane has no cwd, so the derived name is "shell".
+    #[test]
+    fn set_name_overrides_and_clears_workspace_name() {
+        let mut win = remote_window();
+        assert_eq!(win.workspace_info().name, "shell", "derived name with no cwd");
+        win.set_name("backend".to_string());
+        assert_eq!(win.workspace_info().name, "backend", "custom name wins");
+        win.set_name(String::new());
+        assert_eq!(win.workspace_info().name, "shell", "empty name clears the override");
     }
 
     #[test]

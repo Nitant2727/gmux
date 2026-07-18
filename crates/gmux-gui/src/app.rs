@@ -189,6 +189,20 @@ struct SearchState {
     current: usize,
 }
 
+/// Active sidebar tab rename (started by double-clicking a row). `id` is the stable `WindowId`;
+/// `buffer` is the edited name. While `Some`, all keyboard input builds the buffer (mutually
+/// exclusive with search). Committed via `Call::RenameWindow` on Enter, dropped on Escape.
+struct RenameState {
+    id: u64,
+    buffer: String,
+}
+
+/// Whether `row` was clicked twice within `CLICK_INTERVAL` (a sidebar double-click starts a
+/// rename). Pure, so unit-tested.
+fn sidebar_double_click(last: Option<(usize, Instant)>, row: usize, now: Instant) -> bool {
+    matches!(last, Some((r, t)) if r == row && now.duration_since(t) < CLICK_INTERVAL)
+}
+
 /// A detected http/https URL in a pane's viewport: the inclusive cell column range on `row` and the
 /// URL text. Rebuilt each render for Ctrl+click hit-testing; the cells are also underlined in-place.
 struct UrlSpan {
@@ -432,6 +446,9 @@ struct State {
     /// press's `(pane, cell, time, count)`. A same-cell press within `CLICK_INTERVAL` escalates
     /// `count` 1 → 2 → 3 then wraps to 1.
     last_click: Option<(u64, (u16, u16), Instant, u8)>,
+    /// Last sidebar row press `(row, time)`, for double-click (rename) detection — the pane-cell
+    /// `last_click` above is keyed by pane/cell and doesn't apply to sidebar rows.
+    last_sidebar_click: Option<(usize, Instant)>,
     /// A sidebar row press that may turn into a tab reorder, or `None`.
     sidebar_drag: Option<SidebarDrag>,
     /// The active window's pane rectangles from the last rendered layout (content-area coords, i.e.
@@ -442,6 +459,12 @@ struct State {
     /// Stable window ids per sidebar row from the last layout — middle-click closes by id, not
     /// index, so a window removed daemon-side since the last render can't shift the target.
     tab_ids: Vec<u64>,
+    /// Tab names per sidebar row from the last layout, cached to seed a rename buffer with the
+    /// current name (rename starts from a mouse gesture, outside the render that builds the rows).
+    tab_names: Vec<String>,
+    /// Active sidebar tab rename (double-click a row), or `None`. While `Some`, all keyboard input
+    /// edits the buffer instead of reaching the pane — mutually exclusive with `search`.
+    rename: Option<RenameState>,
     notifier: Option<Notifier>,
     taskbar: Option<Taskbar>,
     last_toast: std::collections::HashMap<u64, Instant>,
@@ -620,10 +643,13 @@ impl ApplicationHandler for App {
             selection: None,
             sel_dragging: false,
             last_click: None,
+            last_sidebar_click: None,
             sidebar_drag: None,
             last_panes: Vec::new(),
             tab_count: 0,
             tab_ids: Vec::new(),
+            tab_names: Vec::new(),
+            rename: None,
             notifier,
             taskbar,
             last_toast: std::collections::HashMap::new(),
@@ -699,13 +725,17 @@ impl ApplicationHandler for App {
             WindowEvent::Ime(ime) => {
                 if let Some(st) = self.state.as_mut() {
                     match ime {
-                        // Committed composition (a finished CJK/emoji sequence). While searching it
-                        // appends to the query, not the pane; otherwise send it as text to the active
-                        // pane, like typing — snap back to live and drop any selection.
+                        // Committed composition (a finished CJK/emoji sequence). While renaming it
+                        // appends to the rename buffer, while searching to the query — never the
+                        // pane; otherwise send it as text to the active pane, like typing — snap
+                        // back to live and drop any selection.
                         Ime::Commit(text) => {
                             st.mark_activity();
                             st.preedit = None;
-                            if st.search.is_some() {
+                            if let Some(r) = st.rename.as_mut() {
+                                r.buffer.push_str(&text);
+                                st.window.request_redraw();
+                            } else if st.search.is_some() {
                                 if let Some(s) = st.search.as_mut() {
                                     s.query.push_str(&text);
                                 }
@@ -806,6 +836,24 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
+                    // Right-click pastes into the active pane (Windows Terminal convention) when
+                    // mouse reporting above didn't claim it. Gated on the cursor being inside the
+                    // ACTIVE pane — paste always targets the active shell, so a spatial gate any
+                    // wider would misdirect input (right-click a non-active split pane -> the
+                    // clipboard runs in the pane the user was NOT pointing at). While searching it
+                    // feeds the query instead, matching the keyboard Paste chord.
+                    if pressed
+                        && button == MouseButton::Right
+                        && matches!(st.active_pane_rect(), Some((_, true)))
+                    {
+                        if st.search.is_some() {
+                            st.paste_into_query();
+                        } else {
+                            st.scroll_offset = 0; // pasting sends input; snap back to live
+                            st.paste_clipboard();
+                        }
+                        return;
+                    }
                     // Only the left button drives local selection / focus / divider-resize.
                     if button == MouseButton::Left {
                         if pressed {
@@ -849,6 +897,14 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if let Some(st) = self.state.as_mut() {
                     st.mark_activity();
+                }
+                // Rename mode intercepts every key first (mutually exclusive with search): build
+                // the tab name, commit (Enter), or cancel (Escape).
+                if let Some(st) = self.state.as_mut() {
+                    if st.rename.is_some() {
+                        st.rename_key(&event, self.mods);
+                        return;
+                    }
                 }
                 // Search mode intercepts every key before the keymap/SendKeys: build the query,
                 // navigate matches (Enter/Shift+Enter), edit (Backspace), or exit (Escape).
@@ -1050,37 +1106,7 @@ impl State {
             }
             Action::ScrollPageUp => self.scroll_page(1),
             Action::ScrollPageDown => self.scroll_page(-1),
-            Action::Paste => {
-                if let Some(text) = clipboard::get_text(self.hwnd) {
-                    // Terminals expect a bare CR for Enter; normalize CRLF (Windows) then any
-                    // remaining lone LF (Unix clipboards).
-                    let text = text.replace("\r\n", "\r").replace('\n', "\r");
-                    // When the app enabled bracketed paste (DECSET 2004), wrap the text so the
-                    // shell treats it as one literal paste instead of executing each line.
-                    let text = if self.paste_is_bracketed() {
-                        format!("\x1b[200~{text}\x1b[201~")
-                    } else {
-                        text
-                    };
-                    // The pipe rejects lines over MAX_LINE (1 MiB) and JSON escaping inflates
-                    // further -- chunk huge pastes into multiple SendKeys instead of losing them.
-                    const CHUNK: usize = 64 * 1024;
-                    let mut rest = text.as_str();
-                    while !rest.is_empty() {
-                        let mut cut = rest.len().min(CHUNK);
-                        while !rest.is_char_boundary(cut) {
-                            cut -= 1;
-                        }
-                        let (piece, tail) = rest.split_at(cut);
-                        self.client.control(Call::SendKeys {
-                            pane: self.active_pane,
-                            text: piece.to_string(),
-                            enter: false,
-                        });
-                        rest = tail;
-                    }
-                }
-            }
+            Action::Paste => self.paste_clipboard(),
             Action::OpenSettings => {
                 // First open writes a fully-populated, self-documenting gmux.json; thereafter we
                 // open whatever's there. Then hand it to the OS's default editor for .json.
@@ -1275,6 +1301,14 @@ impl State {
                 self.sync_size();
                 self.window.request_redraw();
             } else if let Some(idx) = self.renderer.sidebar_row_at(cy as f32, self.tab_count) {
+                // A second click on the same row within CLICK_INTERVAL starts renaming that tab.
+                let now = Instant::now();
+                let dbl = sidebar_double_click(self.last_sidebar_click, idx, now);
+                self.last_sidebar_click = Some((idx, now));
+                if dbl {
+                    self.start_rename(idx);
+                    return;
+                }
                 self.scroll_offset = 0;
                 self.client.control(Call::SelectWindow { index: idx });
                 // Arm a tab reorder: a >8px vertical drag before release turns into a MoveWindow.
@@ -1490,7 +1524,51 @@ impl State {
 
     /// Enter search mode: an empty query, no matches yet. Keystrokes now build the query.
     fn enter_search(&mut self) {
+        self.rename = None; // search and rename are mutually exclusive modal input
         self.search = Some(SearchState { query: String::new(), matches: Vec::new(), current: 0 });
+        self.window.request_redraw();
+    }
+
+    /// Start renaming sidebar row `idx`: seed the buffer with the tab's current name (from the last
+    /// layout) and intercept all keyboard input until Enter/Escape. Exits search (mutually
+    /// exclusive). No-op if the row has no stable id yet.
+    fn start_rename(&mut self, idx: usize) {
+        let Some(&id) = self.tab_ids.get(idx) else { return };
+        self.search = None;
+        let buffer = self.tab_names.get(idx).cloned().unwrap_or_default();
+        self.rename = Some(RenameState { id, buffer });
+        self.window.request_redraw();
+    }
+
+    /// A key press while rename mode is active: edit the buffer (chars incl. space, Backspace pops),
+    /// commit (Enter -> `RenameWindow` with the trimmed buffer; empty clears back to the derived
+    /// name), or cancel (Escape). Mirrors `search_key`'s modal text editing.
+    fn rename_key(&mut self, event: &KeyEvent, mods: ModifiersState) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.rename = None,
+            Key::Named(NamedKey::Enter) => {
+                if let Some(r) = self.rename.take() {
+                    self.client.control(Call::RenameWindow { id: r.id, name: r.buffer.trim().to_string() });
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(r) = self.rename.as_mut() {
+                    r.buffer.pop();
+                }
+            }
+            Key::Named(NamedKey::Space) => {
+                if let Some(r) = self.rename.as_mut() {
+                    r.buffer.push(' ');
+                }
+            }
+            // Printable input; reject pure-Ctrl / Super chords like search_key (AltGr = Ctrl+Alt ok).
+            Key::Character(text) if !mods.super_key() && !(mods.control_key() && !mods.alt_key()) => {
+                if let Some(r) = self.rename.as_mut() {
+                    r.buffer.push_str(text.as_str());
+                }
+            }
+            _ => {}
+        }
         self.window.request_redraw();
     }
 
@@ -1502,18 +1580,24 @@ impl State {
         self.window.request_redraw();
     }
 
+    /// Append the clipboard to the search query (the keyboard Paste chord and right-click both
+    /// land here while searching). Control chars (a pasted newline) would corrupt the single-line
+    /// query — printable text only.
+    fn paste_into_query(&mut self) {
+        if let Some(text) = clipboard::get_text(self.hwnd) {
+            if let Some(s) = self.search.as_mut() {
+                s.query.extend(text.chars().filter(|c| !c.is_control()));
+            }
+            self.refresh_search();
+        }
+        self.window.request_redraw();
+    }
+
     /// A key press while search mode is active: edit the query, navigate matches, or exit.
     fn search_key(&mut self, event: &KeyEvent, mods: ModifiersState) {
-        // Paste appends to the query (honors the configured Paste chord). Control chars (a
-        // pasted newline) would corrupt the single-line query — keep printable text only.
+        // Paste appends to the query (honors the configured Paste chord).
         if self.keymap.action(mods, &event.logical_key) == Some(Action::Paste) {
-            if let Some(text) = clipboard::get_text(self.hwnd) {
-                if let Some(s) = self.search.as_mut() {
-                    s.query.extend(text.chars().filter(|c| !c.is_control()));
-                }
-                self.refresh_search();
-            }
-            self.window.request_redraw();
+            self.paste_into_query();
             return;
         }
         match &event.logical_key {
@@ -1623,6 +1707,41 @@ impl State {
                 true
             }
             None => false,
+        }
+    }
+
+
+    /// Paste the clipboard into the active pane: CRLF/LF normalized to a bare CR, wrapped in
+    /// bracketed-paste markers when the app enabled DECSET 2004, and chunked so a huge paste
+    /// doesn't exceed the pipe's per-line cap. Shared by the Paste action and right-click paste.
+    fn paste_clipboard(&mut self) {
+        let Some(text) = clipboard::get_text(self.hwnd) else { return };
+        // Terminals expect a bare CR for Enter; normalize CRLF (Windows) then any remaining lone
+        // LF (Unix clipboards).
+        let text = text.replace("\r\n", "\r").replace('\n', "\r");
+        // When the app enabled bracketed paste (DECSET 2004), wrap the text so the shell treats it
+        // as one literal paste instead of executing each line.
+        let text = if self.paste_is_bracketed() {
+            format!("\x1b[200~{text}\x1b[201~")
+        } else {
+            text
+        };
+        // The pipe rejects lines over MAX_LINE (1 MiB) and JSON escaping inflates further -- chunk
+        // huge pastes into multiple SendKeys instead of losing them.
+        const CHUNK: usize = 64 * 1024;
+        let mut rest = text.as_str();
+        while !rest.is_empty() {
+            let mut cut = rest.len().min(CHUNK);
+            while !rest.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let (piece, tail) = rest.split_at(cut);
+            self.client.control(Call::SendKeys {
+                pane: self.active_pane,
+                text: piece.to_string(),
+                enter: false,
+            });
+            rest = tail;
         }
     }
 
@@ -2016,11 +2135,25 @@ impl State {
             self.last_panes = layout.panes.clone();
             self.tab_count = layout.tabs.len();
             self.tab_ids = layout.tabs.iter().map(|t| t.id).collect();
+            self.tab_names = layout.tabs.iter().map(|t| t.name.clone()).collect();
+            // A tab renamed out of existence (closed elsewhere) can't keep swallowing keystrokes.
+            if let Some(r) = self.rename.as_ref() {
+                if !self.tab_ids.contains(&r.id) {
+                    self.rename = None;
+                }
+            }
 
             rows = layout
                 .tabs
                 .iter()
-                .map(|t| SidebarRow { name: t.name.clone(), branch: t.branch.clone(), attention: t.attention, active: t.active, progress: t.progress, progress_error: t.progress_error, hover: false })
+                .map(|t| {
+                    // While renaming this tab, show the live buffer + '_' caret instead of its name.
+                    let name = match self.rename.as_ref() {
+                        Some(r) if r.id == t.id => format!("{}_", r.buffer),
+                        _ => t.name.clone(),
+                    };
+                    SidebarRow { name, branch: t.branch.clone(), attention: t.attention, active: t.active, progress: t.progress, progress_error: t.progress_error, hover: false }
+                })
                 .collect();
 
             // Update the taskbar attention badge / progress based on overall attention.
@@ -2192,7 +2325,10 @@ fn grid_to_snapshot(g: &GridWire) -> PaneSnapshot {
         }
         cells.push(row);
     }
-    PaneSnapshot { cells, cursor: (g.cursor_col, g.cursor_row), cols: g.cols, rows: g.rows }
+    // cursor_style: the raw DECSCUSR Ps value straight through (agent C adds GridWire.cursor_style,
+    // agent B adds PaneSnapshot.cursor_style). Until both land, gmux-gui won't build — this line is
+    // the only coupling on their fields; nothing to stub, it's correct once they're in.
+    PaneSnapshot { cells, cursor: (g.cursor_col, g.cursor_row), cols: g.cols, rows: g.rows, cursor_style: g.cursor_style }
 }
 
 /// A hash of the layout's geometry (active pane + each pane's id/rect). A change means a tab
@@ -2396,6 +2532,7 @@ mod tests {
             offset: 0,
             bracketed_paste: false,
             mouse_mode: 0,
+            cursor_style: 0,
         }
     }
 
@@ -2546,10 +2683,12 @@ mod tests {
             offset: 0,
             bracketed_paste: false,
             mouse_mode: 0,
+            cursor_style: 5, // bar; must map straight through to the snapshot
         };
         let snap = grid_to_snapshot(&g);
         assert!(snap.cells[0][0].wide, "wide char maps to Cell.wide");
         assert!(!snap.cells[0][1].wide, "the spacer cell is not wide");
+        assert_eq!(snap.cursor_style, 5, "cursor_style maps straight through");
     }
 
     /// SGR (1006) mouse reports: press uses `M`, release `m` (keeping the button number), wheel and
@@ -2638,5 +2777,19 @@ mod tests {
         assert_eq!(clamp_font_px(4.0), 8.0);
         assert_eq!(clamp_font_px(100.0), 40.0);
         assert_eq!(clamp_font_px(18.0), 18.0);
+    }
+
+    /// Sidebar double-click (rename trigger): the same row within CLICK_INTERVAL counts; a
+    /// different row, no prior click, or too-slow second click don't. `t0 + Duration` avoids the
+    /// Instant-underflow of subtracting from `now`.
+    #[test]
+    fn sidebar_double_click_same_row_within_interval() {
+        let t0 = Instant::now();
+        let quick = t0 + Duration::from_millis(100);
+        let slow = t0 + CLICK_INTERVAL * 2;
+        assert!(sidebar_double_click(Some((2, t0)), 2, quick), "same row, quick: double");
+        assert!(!sidebar_double_click(Some((2, t0)), 3, quick), "different row: single");
+        assert!(!sidebar_double_click(None, 2, quick), "no prior click: single");
+        assert!(!sidebar_double_click(Some((2, t0)), 2, slow), "too slow: single");
     }
 }

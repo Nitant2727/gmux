@@ -105,6 +105,15 @@ pub enum Call {
         #[serde(default)]
         index: usize,
     },
+    /// Set a window's custom name by its STABLE id (a sidebar double-click rename). An empty
+    /// `name` clears the override back to the derived workspace name. Resolved like
+    /// `CloseWindow`; a gone id is a harmless no-op.
+    RenameWindow {
+        #[serde(default)]
+        id: u64,
+        #[serde(default)]
+        name: String,
+    },
     /// Focus a specific pane by id, activating its window too (a pane click). Unknown ids are
     /// ignored server-side.
     FocusPaneId {
@@ -262,6 +271,10 @@ pub struct GridWire {
     /// selection/drag behavior; nonzero = forward mouse events to the pane.
     #[serde(default)]
     pub mouse_mode: u8,
+    /// The pane's cursor shape as the RAW DECSCUSR Ps value: 0/1/2 block, 3/4 underline, 5/6 bar
+    /// (see [`gmux_vt::Terminal::cursor_style`]). The renderer draws the shape; blink is ignored.
+    #[serde(default)]
+    pub cursor_style: u8,
 }
 
 /// One pane's rectangle within the content area.
@@ -431,6 +444,7 @@ mod tests {
             Call::SwitchWindow { next: true },
             Call::CloseWindow { id: 2 },
             Call::SelectWindow { index: 2 },
+            Call::RenameWindow { id: 5, name: "backend".into() },
             Call::FocusPaneId { pane: 7 },
             Call::MoveWindow { from: 3, to: 1 },
             Call::SetPalette {
@@ -460,6 +474,7 @@ mod tests {
             offset: 25,
             bracketed_paste: true,
             mouse_mode: MOUSE_CLICKS | MOUSE_SGR,
+            cursor_style: 4,
         });
         let resp = Response::ok(2, grid.clone());
         let mut buf = Vec::new();
@@ -577,6 +592,15 @@ mod tests {
         assert_eq!(req.call, Call::SelectWindow { index: 0 });
         let req: Request = serde_json::from_str(r#"{"id":3,"method":"focus-pane-id","params":{}}"#).unwrap();
         assert_eq!(req.call, Call::FocusPaneId { pane: 0 });
+    }
+
+    #[test]
+    fn rename_window_is_kebab_case_and_fields_default() {
+        let s = serde_json::to_string(&Request { id: 1, call: Call::RenameWindow { id: 5, name: "api".into() } }).unwrap();
+        assert!(s.contains("\"method\":\"rename-window\""), "{s}");
+        // Hand-written JSON omitting the (defaulted) name clears the override; omitting id -> 0.
+        let req: Request = serde_json::from_str(r#"{"id":2,"method":"rename-window","params":{"id":7}}"#).unwrap();
+        assert_eq!(req.call, Call::RenameWindow { id: 7, name: String::new() });
     }
 
     #[test]

@@ -14,7 +14,7 @@ use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::event::VoidListener;
-use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb as AnsiRgb};
+use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Processor, Rgb as AnsiRgb};
 
 use osc::OscState;
 
@@ -290,6 +290,26 @@ impl Terminal {
             | (m.contains(M::MOUSE_DRAG) as u8) << 1
             | (m.contains(M::MOUSE_MOTION) as u8) << 2
             | (m.contains(M::SGR_MOUSE) as u8) << 3
+    }
+
+    /// The application's cursor shape as the RAW DECSCUSR (CSI Ps SP q) Ps value: 0 default, 1/2
+    /// block, 3/4 underline, 5/6 bar. Recovered from alacritty's tracked `CursorStyle` (shape +
+    /// blink) rather than a second parse — it collapses Ps 0 (default) and Ps 2 (steady block) to
+    /// 0, which the renderer treats identically (both block). The blink bit only distinguishes the
+    /// odd/even pair (1 vs 2, 3 vs 4, 5 vs 6); the renderer ignores it (no blink timer — idle CPU
+    /// stays 0). ponytail: exact Ps 2 is lost, but block-is-block downstream, so it never matters.
+    pub fn cursor_style(&self) -> u8 {
+        let cs = self.term.cursor_style();
+        match (cs.shape, cs.blinking) {
+            (CursorShape::Block, true) => 1,
+            (CursorShape::Block, false) => 0,
+            (CursorShape::Underline, true) => 3,
+            (CursorShape::Underline, false) => 4,
+            (CursorShape::Beam, true) => 5,
+            (CursorShape::Beam, false) => 6,
+            // Hidden / HollowBlock never come from DECSCUSR; treat as the default block.
+            _ => 0,
+        }
     }
 
     /// Number of scrollback (history) lines currently retained above the viewport.

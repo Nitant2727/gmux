@@ -118,6 +118,7 @@ mod tests {
             cursor: (99, 99), // off-grid so no cursor override
             cols: 2,
             rows: 1,
+            cursor_style: 0,
         };
         let Some(r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
             eprintln!("no GPU adapter; skipping");
@@ -142,6 +143,7 @@ mod tests {
             cursor: (99, 99),
             cols: 4,
             rows: 2,
+            cursor_style: 0,
         };
         let Some(r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
             return;
@@ -199,7 +201,7 @@ mod tests {
     fn renders_glyph_coverage_over_background() {
         let bg = Rgb { r: 0, g: 0, b: 0 };
         let fg = Rgb { r: 255, g: 255, b: 255 };
-        let snap = PaneSnapshot { cells: vec![vec![cell('M', fg, bg)]], cursor: (99, 99), cols: 1, rows: 1 };
+        let snap = PaneSnapshot { cells: vec![vec![cell('M', fg, bg)]], cursor: (99, 99), cols: 1, rows: 1, cursor_style: 0 };
         let Some(r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
             return;
         };
@@ -218,7 +220,7 @@ mod tests {
         use gmux_mux::Rect;
         let bg = Rgb { r: 20, g: 20, b: 20 };
         let fg = Rgb { r: 210, g: 210, b: 210 };
-        let snap = PaneSnapshot { cells: vec![vec![cell(' ', fg, bg); 3]], cursor: (99, 99), cols: 3, rows: 1 };
+        let snap = PaneSnapshot { cells: vec![vec![cell(' ', fg, bg); 3]], cursor: (99, 99), cols: 3, rows: 1, cursor_style: 0 };
         let Some(r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
             return;
         };
@@ -264,7 +266,7 @@ mod tests {
         use gmux_mux::Rect;
         let bg = Rgb { r: 200, g: 20, b: 20 }; // distinct cell bg (vs the band's dark BG_SIDEBAR)
         let fg = Rgb { r: 0, g: 0, b: 0 };
-        let snap = PaneSnapshot { cells: vec![vec![cell(' ', fg, bg); 8]; 4], cursor: (99, 99), cols: 8, rows: 4 };
+        let snap = PaneSnapshot { cells: vec![vec![cell(' ', fg, bg); 8]; 4], cursor: (99, 99), cols: 8, rows: 4, cursor_style: 0 };
         let Some(r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
             return;
         };
@@ -347,6 +349,7 @@ mod tests {
             cursor: (99, 99),
             cols: 2,
             rows: 1,
+            cursor_style: 0,
         };
         let Some(r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
             return;

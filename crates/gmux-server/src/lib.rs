@@ -414,6 +414,14 @@ impl Server {
                 self.session.select_window(*index);
                 Response::ok(id, ResultBody::Done)
             }
+            Call::RenameWindow { id: win, name } => {
+                // Resolved by stable id like CloseWindow; a gone id is a harmless no-op. An empty
+                // name clears the override back to the derived workspace name.
+                if let Some(w) = self.session.window_mut(WindowId(*win)) {
+                    w.set_name(name.clone());
+                }
+                Response::ok(id, ResultBody::Done)
+            }
             Call::FocusPaneId { pane } => {
                 self.session.focus_pane(PaneId(*pane));
                 Response::ok(id, ResultBody::Done)
@@ -594,6 +602,7 @@ fn window_progress(
 fn grid_wire(p: &Pane, offset: usize) -> GridWire {
     let bracketed_paste = p.bracketed_paste();
     let mouse_mode = p.mouse_mode();
+    let cursor_style = p.cursor_style();
     let (snap, history, offset) = p.snapshot_scrolled(offset);
     let mut cells = Vec::with_capacity(snap.cols as usize * snap.rows as usize);
     for row in &snap.cells {
@@ -632,6 +641,7 @@ fn grid_wire(p: &Pane, offset: usize) -> GridWire {
         offset: offset as u32,
         bracketed_paste,
         mouse_mode,
+        cursor_style,
     }
 }
 
@@ -1390,5 +1400,53 @@ mod tests {
         assert_eq!(grid_wire(&p, 0).mouse_mode, 0, "no mouse reporting by default");
         p.push_output(b"\x1b[?1003h\x1b[?1006h"); // any-motion + SGR encoding
         assert_eq!(grid_wire(&p, 0).mouse_mode, MOUSE_MOTION | MOUSE_SGR);
+    }
+
+    /// End-to-end: DECSCUSR bytes over the remote push path surface as `GridWire::cursor_style` —
+    /// the RAW Ps (0 default, 6 = steady bar).
+    #[test]
+    fn grid_wire_maps_cursor_style() {
+        use gmux_mux::Pane;
+        let p = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        assert_eq!(grid_wire(&p, 0).cursor_style, 0, "default cursor style is block (0)");
+        p.push_output(b"\x1b[6 q"); // steady bar
+        assert_eq!(grid_wire(&p, 0).cursor_style, 6);
+    }
+
+    /// `RenameWindow` sets a window's custom name by stable id and an empty name clears it back to
+    /// the derived workspace name ("shell" for a cwd-less remote pane); a gone id is a no-op Ok.
+    /// Console-free remote pane, so it runs headless.
+    #[test]
+    fn rename_window_sets_and_clears_custom_name() {
+        use gmux_mux::{Pane, Session};
+        let pane = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        let mut server = Server {
+            session: Session::start("t", pane),
+            shell: "pwsh".into(),
+            last_view: (800, 600),
+            notifications: Vec::new(),
+            browse_requests: Vec::new(),
+            ticks: 0,
+            remotes: Vec::new(),
+            progress: HashMap::new(),
+            palette: Palette::default(),
+            persist_screen: true,
+        };
+        let wid = server.session.windows()[0].id.0;
+        assert_eq!(server.layout(800, 600).tabs[0].name, "shell", "derived name before rename");
+
+        // Set a custom name -> it wins in the tab list.
+        let resp = server.handle(&Request { id: 1, call: Call::RenameWindow { id: wid, name: "backend".into() } });
+        assert_eq!(resp.result, Some(ResultBody::Done));
+        assert_eq!(server.layout(800, 600).tabs[0].name, "backend");
+
+        // Empty name clears the override back to the derived name.
+        let resp = server.handle(&Request { id: 2, call: Call::RenameWindow { id: wid, name: String::new() } });
+        assert_eq!(resp.result, Some(ResultBody::Done));
+        assert_eq!(server.layout(800, 600).tabs[0].name, "shell");
+
+        // A gone id is a harmless no-op Ok.
+        let resp = server.handle(&Request { id: 3, call: Call::RenameWindow { id: 999_999, name: "x".into() } });
+        assert_eq!(resp.result, Some(ResultBody::Done));
     }
 }
