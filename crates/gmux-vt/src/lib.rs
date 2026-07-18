@@ -78,6 +78,10 @@ pub enum TermEvent {
     Progress { state: ProgressState, pct: Option<u8> },
     Cwd(String),
     PromptMark(PromptMark),
+    /// OSC 52 clipboard-set: the pane's app asked to put this text on the system clipboard.
+    /// (OSC 52 clipboard *reads* — payload "?" — are never surfaced; answering them would let a
+    /// pane exfiltrate the user's clipboard back out the PTY.)
+    Clipboard(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

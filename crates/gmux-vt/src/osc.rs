@@ -72,6 +72,7 @@ impl Perform for OscPerform<'_> {
             b"9" => self.osc_9(params),
             b"777" => self.osc_777(params),
             b"99" => self.osc_99(params),
+            b"52" => self.osc_52(params),
             b"133" => self.osc_133(params),
             _ => {}
         }
@@ -242,6 +243,26 @@ impl OscPerform<'_> {
         }
     }
 
+    /// OSC 52 — clipboard. `52;<selection>;<data>`: base64 `<data>` SETS the system clipboard (any
+    /// selection string — "c"/"p"/"s"/… — is accepted). A `<data>` of exactly "?" is a clipboard
+    /// READ request, which we IGNORE and never answer — replying would let any pane exfiltrate the
+    /// user's clipboard back out through the PTY. ponytail: read requests dropped, never answered.
+    fn osc_52(&mut self, params: &[&[u8]]) {
+        if params.len() < 3 {
+            return; // no `<data>` field — ignore (don't clobber the clipboard on a malformed set).
+        }
+        // base64 has no `;`, but rejoin params[2..] defensively in case one slips through.
+        let data = join_from(params, 2);
+        if data == "?" {
+            return; // clipboard read request — exfiltration surface, never answered.
+        }
+        if let Some(mut bytes) = decode_base64(&data) {
+            // ponytail: cap the decoded clipboard at 1 MiB, drop beyond — untrusted PTY input.
+            bytes.truncate(1024 * 1024);
+            self.events.push(TermEvent::Clipboard(String::from_utf8_lossy(&bytes).into_owned()));
+        }
+    }
+
     /// OSC 133 — semantic prompt marks (FinalTerm/FTCS).
     fn osc_133(&mut self, params: &[&[u8]]) {
         let mark = match params.get(1).copied().unwrap_or(b"") {
@@ -390,6 +411,18 @@ fn hex_val(b: u8) -> Option<u8> {
 /// output can embed attacker-controlled control bytes). Keeps normal printable text.
 fn sanitize(s: &str) -> String {
     s.chars().filter(|&c| !c.is_control() || c == ' ').collect()
+}
+
+/// RFC 4648 base64 decode of `input` for OSC 52 clipboard payloads: standard alphabet, `=` padding,
+/// ASCII whitespace skipped, `None` on an invalid char or an impossible length (a trailing 1-char
+/// group — no valid encoding produces one). Stricter on length than [`base64_decode`] (kept lenient
+/// for kitty's optional OSC 99 padding); reuses it for the byte decode after the length guard.
+pub(crate) fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    let sig = input.bytes().filter(|b| !b.is_ascii_whitespace() && *b != b'=').count();
+    if sig % 4 == 1 {
+        return None;
+    }
+    base64_decode(input.as_bytes())
 }
 
 /// Minimal RFC 4648 base64 decoder tolerant of missing final padding (kitty allows it). Returns
