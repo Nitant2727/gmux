@@ -55,6 +55,19 @@ fn osc777_over_remote_raises_attention_and_notification() {
 }
 
 #[test]
+fn osc52_over_remote_emits_clipboard() {
+    // A remote agent's OSC 52 flows through the same parser as local PTY bytes, so `push_output`
+    // forwards it as a `PaneEvent::Clipboard` carrying the decoded text.
+    let pane = remote_pane();
+    pane.push_output(b"\x1b]52;c;aGVsbG8=\x07"); // base64 "hello"
+    let evs = pane.drain_events();
+    assert!(
+        evs.iter().any(|e| matches!(e, PaneEvent::Clipboard(t) if t == "hello")),
+        "expected a Clipboard event: {evs:?}"
+    );
+}
+
+#[test]
 fn write_reaches_input_closure() {
     let sent: Arc<Mutex<Vec<u8>>> = Arc::default();
     let s = sent.clone();

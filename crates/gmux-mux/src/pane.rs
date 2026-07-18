@@ -31,6 +31,8 @@ pub enum PaneEvent {
     Cwd(String),
     /// Progress update (OSC 9;4).
     Progress { state: ProgressState, pct: Option<u8> },
+    /// The pane's app set the system clipboard (OSC 52).
+    Clipboard(String),
     /// The child process exited (PTY reached EOF / the transport reported the remote pane gone).
     Exited,
 }
@@ -110,6 +112,9 @@ fn pump_bytes(
             }
             TermEvent::Progress { state, pct } => {
                 let _ = tx.send(PaneEvent::Progress { state, pct });
+            }
+            TermEvent::Clipboard(t) => {
+                let _ = tx.send(PaneEvent::Clipboard(t));
             }
             TermEvent::PromptMark(_) => {}
         }

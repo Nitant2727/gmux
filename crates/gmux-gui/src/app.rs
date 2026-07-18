@@ -371,6 +371,17 @@ fn word_span(chars: &[char], col: usize) -> (usize, usize) {
     (s, e)
 }
 
+/// Quote a filesystem path for the shell if it contains spaces: wrap in double quotes with any
+/// embedded double-quote doubled (PowerShell/cmd convention). Space-free paths pass through as-is.
+/// Pure, so unit-tested.
+fn quote_path(s: &str) -> String {
+    if s.contains(' ') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
 /// Order a selection's two endpoints into reading order (row-major), so `start <= end`. Matches the
 /// renderer's `PaneView.selection` contract.
 fn normalize_selection(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
@@ -468,13 +479,23 @@ struct State {
     notifier: Option<Notifier>,
     taskbar: Option<Taskbar>,
     last_toast: std::collections::HashMap<u64, Instant>,
-    // Scrollback viewport for the active pane (0 = live screen), with the last-seen history
-    // depth and grid rows from the daemon for local clamping / page sizing.
-    scroll_offset: usize,
+    // Scrollback viewport per pane id (`pane_scroll[id]` = lines above the live tail; a missing
+    // entry = 0 = live screen). Only scrolled panes have an entry, so the map doubles as the
+    // "which panes are scrolled" set for the fetch gate; evicted alongside `snap_cache`.
+    pane_scroll: HashMap<u64, usize>,
+    /// Last-seen history depth per pane, to pin a scrolled viewport to CONTENT: when history grows
+    /// under a scrolled pane, the offset is bumped by the growth (see the GetGrid accept block).
+    last_history: HashMap<u64, usize>,
+    // History depth + grid rows of the ACTIVE pane from the last GetGrid, for local wheel clamping
+    // and page sizing. ponytail: active-only — the scrollbar/history chrome is active-pane-only, so
+    // a non-active pane clamps at 0 locally and lets the server clamp its top on the next fetch.
     scroll_history: usize,
     /// True while the scrollback scrollbar thumb is being dragged (mouse-down on the thumb/track):
-    /// cursor motion maps directly to `scroll_offset` and other selection/report paths are skipped.
+    /// cursor motion maps directly to the active pane's `pane_scroll` and other paths are skipped.
     scrollbar_drag: bool,
+    /// Time of the last `DroppedFile`, to space-separate multiple files dropped in one drag (they
+    /// arrive as separate events in quick succession).
+    last_drop: Option<Instant>,
     active_rows: usize,
     /// Whether the active pane's app enabled bracketed paste (from the last GetGrid).
     active_bracketed: bool,
@@ -653,9 +674,11 @@ impl ApplicationHandler for App {
             notifier,
             taskbar,
             last_toast: std::collections::HashMap::new(),
-            scroll_offset: 0,
+            pane_scroll: HashMap::new(),
+            last_history: HashMap::new(),
             scroll_history: 0,
             scrollbar_drag: false,
+            last_drop: None,
             active_rows: 0,
             active_bracketed: false,
             active_mouse_mode: 0,
@@ -743,7 +766,7 @@ impl ApplicationHandler for App {
                                 st.window.request_redraw();
                             } else {
                                 st.clear_selection();
-                                st.scroll_offset = 0;
+                                st.set_scroll(st.active_pane, 0);
                                 st.client.control(Call::SendKeys { pane: st.active_pane, text, enter: false });
                             }
                         }
@@ -849,7 +872,7 @@ impl ApplicationHandler for App {
                         if st.search.is_some() {
                             st.paste_into_query();
                         } else {
-                            st.scroll_offset = 0; // pasting sends input; snap back to live
+                            st.set_scroll(st.active_pane, 0); // pasting sends input; snap back to live
                             st.paste_clipboard();
                         }
                         return;
@@ -886,12 +909,16 @@ impl ApplicationHandler for App {
                     if !shift && st.report_wheel(delta) {
                         return;
                     }
-                    // Wheel up (positive y) scrolls deeper into history.
+                    // Wheel up (positive y) scrolls deeper into history, in the pane under the
+                    // cursor. ponytail: report_wheel above only forwards for the ACTIVE pane, so a
+                    // wheel over a NON-active reporting pane just scrolls it locally rather than
+                    // forwarding to its app — good enough; forwarding to a non-focused app is rare.
                     let lines = match delta {
                         MouseScrollDelta::LineDelta(_, y) => (y * 3.0).round() as i64,
                         MouseScrollDelta::PixelDelta(p) => (p.y / st.cell_dims().1 as f64).round() as i64,
                     };
-                    st.scroll_by(lines);
+                    let target = st.pane_under_cursor();
+                    st.scroll_by(target, lines);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
@@ -917,10 +944,32 @@ impl ApplicationHandler for App {
                 if !self.try_shortcut(&event) {
                     if let Some(bytes) = key_to_bytes(&event, self.mods) {
                         if let Some(st) = self.state.as_mut() {
-                            st.scroll_offset = 0; // typing snaps back to the live screen
+                            st.set_scroll(st.active_pane, 0); // typing snaps back to the live screen
                             let text = String::from_utf8_lossy(&bytes).into_owned();
                             st.client.control(Call::SendKeys { pane: st.active_pane, text, enter: false });
                         }
+                    }
+                }
+            }
+            WindowEvent::DroppedFile(path) => {
+                if let Some(st) = self.state.as_mut() {
+                    st.mark_activity();
+                    // While searching, a drop feeds the query like every other paste-class input
+                    // — drop_file's SendKeys + snap-to-live would silently type into the shell
+                    // behind the overlay and desync the parked match viewport.
+                    if st.search.is_some() {
+                        let text: String = path
+                            .to_string_lossy()
+                            .chars()
+                            .filter(|c| !c.is_control())
+                            .collect();
+                        if let Some(s) = st.search.as_mut() {
+                            s.query.push_str(&text);
+                        }
+                        st.refresh_search();
+                        st.window.request_redraw();
+                    } else {
+                        st.drop_file(&path);
                     }
                 }
             }
@@ -1046,8 +1095,8 @@ impl App {
         // pane never sees it). Escape that only dismissed a selection is likewise consumed, so it
         // isn't also forwarded to the pane.
         if let Key::Named(NamedKey::Escape) = &event.logical_key {
-            if st.scroll_offset > 0 {
-                st.scroll_offset = 0;
+            if st.scroll_of(st.active_pane) > 0 {
+                st.set_scroll(st.active_pane, 0);
                 st.window.request_redraw();
                 return true;
             }
@@ -1062,10 +1111,21 @@ impl App {
 impl State {
     /// Run a keybinding [`Action`] with the same side effects the old hardcoded matches had.
     fn dispatch(&mut self, action: Action) {
-        // Layout/focus actions snap back to the live screen; the scroll actions must NOT (they
-        // move the viewport). scroll_page already requests its own redraw.
-        if !matches!(action, Action::ScrollPageUp | Action::ScrollPageDown) {
-            self.scroll_offset = 0;
+        // Input-ish actions snap the active pane back to the live screen. Scroll actions must NOT
+        // (they move the viewport), and neither must focus/tab navigation — per-pane offsets mean
+        // leaving a pane keeps its place, matching mouse focus (which never snapped).
+        if !matches!(
+            action,
+            Action::ScrollPageUp
+                | Action::ScrollPageDown
+                | Action::FocusLeft
+                | Action::FocusRight
+                | Action::FocusUp
+                | Action::FocusDown
+                | Action::NextWindow
+                | Action::PrevWindow
+        ) {
+            self.set_scroll(self.active_pane, 0);
         }
         match action {
             Action::FocusLeft => self.client.control(Call::FocusPane { dir: "left".into() }),
@@ -1229,6 +1289,12 @@ impl State {
     /// Drain the subscriber channel, toasting the notifications that arrived while unfocused.
     fn drain_toasts(&mut self) {
         while let Ok(n) = self.toast_rx.try_recv() {
+            // Clipboard-set wires (an OSC 52 copy from a pane) apply to the Windows clipboard
+            // regardless of focus and are never toasted (reserved title; cross-agent contract).
+            if n.title == "clipboard-set" {
+                clipboard::set_text(self.hwnd, &n.body);
+                continue;
+            }
             if !self.focused {
                 self.fire_toast(&n);
             }
@@ -1296,7 +1362,7 @@ impl State {
             self.clear_selection();
             // The '+' new-tab row sits after the last workspace row, so test it first.
             if self.renderer.sidebar_new_tab_at(cy as f32, self.tab_count) {
-                self.scroll_offset = 0;
+                self.set_scroll(self.active_pane, 0);
                 self.client.control(Call::NewWindow { command: None });
                 self.sync_size();
                 self.window.request_redraw();
@@ -1309,7 +1375,7 @@ impl State {
                     self.start_rename(idx);
                     return;
                 }
-                self.scroll_offset = 0;
+                self.set_scroll(self.active_pane, 0);
                 self.client.control(Call::SelectWindow { index: idx });
                 // Arm a tab reorder: a >8px vertical drag before release turns into a MoveWindow.
                 self.sidebar_drag = Some(SidebarDrag { from_row: idx, start_y: cy, reordering: false });
@@ -1479,15 +1545,10 @@ impl State {
             self.sel_dragging = false;
             let is_click = self.selection.as_ref().map_or(true, |s| s.start == s.end);
             if is_click {
-                // No movement: a plain focus click (the old press-to-focus behavior). Only a
-                // CROSS-pane click resets the scroll: the release between the first and second
-                // press of a double/triple-click lands here, and resetting on a same-pane click
-                // would yank a scrolled pane to its tail before select_word/select_line run
-                // (selecting/copying tail content instead of the clicked row).
+                // No movement: a plain focus click (the old press-to-focus behavior). ponytail:
+                // per-pane scroll means each pane owns its offset, so focusing one no longer snaps
+                // anything to live (the old global reset compensated for a single shared offset).
                 if let Some(pane) = self.selection.take().map(|s| s.pane) {
-                    if pane != self.active_pane {
-                        self.scroll_offset = 0;
-                    }
                     self.client.control(Call::FocusPaneId { pane });
                 }
                 self.window.request_redraw();
@@ -1505,7 +1566,7 @@ impl State {
             return;
         };
         let (start, end) = normalize_selection(start, end);
-        let offset = if pane == self.active_pane { self.scroll_offset } else { 0 };
+        let offset = self.scroll_of(pane);
         if let Ok(ResultBody::Grid(g)) = self.client.call(Call::GetGrid { pane, offset }) {
             let text = grid_selection_text(&g, start, end);
             if !text.is_empty() {
@@ -1575,7 +1636,7 @@ impl State {
     /// Leave search mode and snap the active pane back to its live screen.
     fn exit_search(&mut self) {
         self.search = None;
-        self.scroll_offset = 0;
+        self.set_scroll(self.active_pane, 0);
         self.force_full = true; // refetch the active pane at the live tail
         self.window.request_redraw();
     }
@@ -1670,7 +1731,7 @@ impl State {
         if let Some(off) = self.search.as_ref().and_then(|s| s.matches.get(s.current).copied()) {
             let ch = self.cell_dims().1;
             let band_rows = (SEARCH_BAR as u32).div_ceil(ch) as usize;
-            self.scroll_offset = (off as usize).saturating_sub(band_rows);
+            self.set_scroll(self.active_pane, (off as usize).saturating_sub(band_rows));
             self.force_full = true;
             self.window.request_redraw();
         }
@@ -1716,6 +1777,14 @@ impl State {
     /// doesn't exceed the pipe's per-line cap. Shared by the Paste action and right-click paste.
     fn paste_clipboard(&mut self) {
         let Some(text) = clipboard::get_text(self.hwnd) else { return };
+        self.paste_text(&text);
+    }
+
+    /// Send `text` to the active pane as a paste: newline-normalized, bracketed-paste wrapped when
+    /// the app asked for it (DECSET 2004), and chunked. The single funnel for clipboard pastes and
+    /// file drops — raw `SendKeys` of pasted text into a full-screen TUI (vim in normal mode)
+    /// would otherwise execute it as commands.
+    fn paste_text(&mut self, text: &str) {
         // Terminals expect a bare CR for Enter; normalize CRLF (Windows) then any remaining lone
         // LF (Unix clipboards).
         let text = text.replace("\r\n", "\r").replace('\n', "\r");
@@ -1743,6 +1812,25 @@ impl State {
             });
             rest = tail;
         }
+    }
+
+    /// Handle a file dropped onto the window: send its (space-quoted) path to the active pane as
+    /// text, like a paste. Multiple files from one drag arrive as separate events in quick
+    /// succession — space-separate them.
+    fn drop_file(&mut self, path: &std::path::Path) {
+        let mut text = quote_path(&path.to_string_lossy());
+        let now = Instant::now();
+        // ponytail: a 1s window treats back-to-back drops as one gesture (winit has no per-gesture
+        // batching), prefixing the second+ file with a space so paths don't run together.
+        if matches!(self.last_drop, Some(t) if now.duration_since(t) < Duration::from_secs(1)) {
+            text.insert(0, ' ');
+        }
+        self.last_drop = Some(now);
+        self.set_scroll(self.active_pane, 0); // dropping sends input; snap the active pane to live
+        // Through the paste funnel, not raw SendKeys: a bracketed-paste-aware TUI (vim) must see
+        // the path as a literal insert, not as normal-mode commands.
+        self.paste_text(&text);
+        self.window.request_redraw();
     }
 
     fn cell_dims(&self) -> (u32, u32) {
@@ -1801,9 +1889,9 @@ impl State {
 
     /// A left press on the scrollbar thumb/track begins a scrollbar drag and jumps the viewport to
     /// the cursor. Returns true (consuming the click) only when the press lands on the bar and there
-    /// is scrollback to scroll (`scroll_offset > 0` and history present).
+    /// is scrollback to scroll (the active pane's offset > 0 and history present).
     fn grab_scrollbar(&mut self) -> bool {
-        if self.scroll_offset == 0 || self.scroll_history == 0 {
+        if self.scroll_of(self.active_pane) == 0 || self.scroll_history == 0 {
             return false;
         }
         let (cx, cy) = self.cursor;
@@ -1827,8 +1915,8 @@ impl State {
         let Some((rect, _)) = self.active_pane_rect() else { return };
         let (_, y0, _, y1) = self.scrollbar_track(rect);
         let off = scrollbar_offset_at(self.cursor.1 as f32, y0, y1 - y0, self.scroll_history);
-        if off != self.scroll_offset {
-            self.scroll_offset = off;
+        if off != self.scroll_of(self.active_pane) {
+            self.set_scroll(self.active_pane, off);
             self.selection = None;
             self.force_full = true;
             self.window.request_redraw();
@@ -1998,10 +2086,48 @@ impl State {
         self.active_bracketed
     }
 
-    fn scroll_by(&mut self, lines: i64) {
-        let next = (self.scroll_offset as i64 + lines).clamp(0, self.scroll_history as i64) as usize;
-        if next != self.scroll_offset {
-            self.scroll_offset = next;
+    /// The scrollback offset of pane `id` (0 = live tail; a missing map entry is 0).
+    fn scroll_of(&self, id: u64) -> usize {
+        self.pane_scroll.get(&id).copied().unwrap_or(0)
+    }
+
+    /// Set pane `id`'s scrollback offset, dropping the entry at 0 so the map holds only scrolled
+    /// panes (keeps the fetch gate and eviction cheap).
+    fn set_scroll(&mut self, id: u64, off: usize) {
+        if off == 0 {
+            self.pane_scroll.remove(&id);
+        } else {
+            self.pane_scroll.insert(id, off);
+        }
+    }
+
+    /// The pane id under the cursor (content-area hit-test), falling back to the active pane when
+    /// the cursor is over the sidebar or empty space. Targets wheel scroll at the pointed-at pane.
+    fn pane_under_cursor(&self) -> u64 {
+        let (cx, cy) = self.cursor;
+        let (sidebar_w, _, _) = self.areas();
+        if cx < 0.0 || cy < 0.0 || (cx as u32) < sidebar_w {
+            return self.active_pane;
+        }
+        let cxp = (cx - sidebar_w as f64) as u32;
+        let py = cy as u32;
+        self.last_panes
+            .iter()
+            .find(|p| cxp >= p.x && cxp < p.x + p.w && py >= p.y && py < p.y + p.h)
+            .map(|p| p.id)
+            .unwrap_or(self.active_pane)
+    }
+
+    /// Scroll `pane`'s viewport by `lines` (positive = deeper into history). The lower bound is 0;
+    /// the upper bound is clamped locally only for the active pane (whose history depth we track).
+    /// ponytail: a non-active pane isn't top-clamped here — the next GetGrid clamps to that pane's
+    /// history server-side and we accept the clamped offset back into `pane_scroll`.
+    fn scroll_by(&mut self, pane: u64, lines: i64) {
+        let cur = self.scroll_of(pane) as i64;
+        let max = if pane == self.active_pane { self.scroll_history as i64 } else { i64::MAX };
+        let next = (cur + lines).clamp(0, max) as usize;
+        if next != cur as usize {
+            self.set_scroll(pane, next);
             // Scrolling moves content under a viewport-anchored selection; clear it rather than
             // let the highlight drift onto unintended text.
             self.selection = None;
@@ -2009,10 +2135,10 @@ impl State {
         }
     }
 
-    /// Scroll by one page (`dir` = +1 up into history, -1 back toward live).
+    /// Scroll the active pane by one page (`dir` = +1 up into history, -1 back toward live).
     fn scroll_page(&mut self, dir: i64) {
         let page = if self.active_rows > 1 { self.active_rows - 1 } else { 24 };
-        self.scroll_by(dir * page as i64);
+        self.scroll_by(self.active_pane, dir * page as i64);
     }
 
     /// Tell the daemon our content geometry so it resizes its panes.
@@ -2120,11 +2246,11 @@ impl State {
         let mut url_spans: HashMap<u64, Vec<UrlSpan>> = HashMap::new();
         if let Ok(ResultBody::Layout(layout)) = self.client.call(Call::GetLayout { w: content_w, h }) {
             if layout.active_pane != self.active_pane {
-                // The active pane changed daemon-side (e.g. the old one exited): the scroll offset
-                // belonged to the previous pane, so snap the new one to its live screen. Any open
-                // search's matches are offsets into the OLD pane's scrollback — drop them so Enter
-                // can't jump the new pane to a meaningless line (typing re-searches the new pane).
-                self.scroll_offset = 0;
+                // The active pane changed daemon-side (e.g. the old one exited). ponytail: with
+                // per-pane scroll the new active pane keeps its own offset (a gone pane's entry is
+                // evicted below), so no global snap here. Any open search's matches are offsets into
+                // the OLD pane's scrollback — drop them so Enter can't jump the new pane to a
+                // meaningless line (typing re-searches the new pane).
                 if let Some(s) = self.search.as_mut() {
                     s.matches.clear();
                     s.current = 0;
@@ -2173,22 +2299,40 @@ impl State {
             let damaged = take_damaged(&self.damaged);
             let live: HashSet<u64> = layout.panes.iter().map(|p| p.id).collect();
             evict_stale(&mut self.snap_cache, &live);
+            evict_stale(&mut self.pane_scroll, &live);
+            evict_stale(&mut self.last_history, &live);
 
             for pr in &layout.panes {
-                // Only the active pane scrolls; the rest always show the live screen.
-                let offset = if pr.active { self.scroll_offset } else { 0 };
-                let active_dyn = pr.active
-                    && (self.scroll_offset > 0
-                        || self.selection.as_ref().is_some_and(|s| s.pane == pr.id));
+                // Per-pane scrollback: each pane fetches at its own offset (missing = 0 = live).
+                let offset = self.scroll_of(pr.id);
+                // Refetch a pane whose viewport is dynamic: scrolled off the live tail, or owning
+                // the selection. Generalized from active-only to any pane with a nonzero offset.
+                let active_dyn = offset > 0
+                    || self.selection.as_ref().is_some_and(|s| s.pane == pr.id);
                 let need = needs_fetch(pr.id, force_full, &damaged, active_dyn, self.snap_cache.contains_key(&pr.id));
                 let snap = if need {
                     match self.client.call(Call::GetGrid { pane: pr.id, offset }) {
                         Ok(ResultBody::Grid(g)) => {
+                            // Accept the server's clamp for every fetched pane (it clamps the offset
+                            // to that pane's history). A SCROLLED pane pins to CONTENT, not to the
+                            // tail: offsets count lines above the live bottom, so new output would
+                            // otherwise slide the viewport toward live (the error being read scrolls
+                            // away). When history grew since the last fetch, bump the offset by the
+                            // growth and refetch — one frame of drift, corrected on the next paint.
+                            let hist = g.history as usize;
+                            let last = self.last_history.insert(pr.id, hist).unwrap_or(hist);
+                            let grown = hist.saturating_sub(last);
+                            if g.offset > 0 && grown > 0 {
+                                self.set_scroll(pr.id, (g.offset as usize + grown).min(hist));
+                                if let Ok(mut d) = self.damaged.lock() {
+                                    d.insert(pr.id); // re-fetch at the pinned offset next frame
+                                }
+                                self.window.request_redraw();
+                            } else {
+                                self.set_scroll(pr.id, g.offset as usize);
+                            }
                             if pr.active {
-                                // Accept the server's clamp and remember the history depth / rows
-                                // for local wheel clamping and page sizing.
-                                self.scroll_offset = g.offset as usize;
-                                self.scroll_history = g.history as usize;
+                                self.scroll_history = hist;
                                 self.active_rows = g.rows as usize;
                                 self.active_bracketed = g.bracketed_paste;
                                 self.active_mouse_mode = g.mouse_mode;
@@ -2215,8 +2359,9 @@ impl State {
                 }
                 let att = if pr.attention { Attention::Pending } else { Attention::Quiet };
                 let rect = Rect { x: pr.x + sidebar_w, y: pr.y, w: pr.w, h: pr.h };
-                // Only the active pane can be scrolled; cached (non-active) panes are always live.
-                let scrolled = if pr.active { self.scroll_offset as u32 } else { 0 };
+                // Per-pane offset (post server-clamp): the renderer draws a '+n' badge for any pane
+                // with scrolled>0 and a scrollbar only for the active one (history below).
+                let scrolled = self.scroll_of(pr.id) as u32;
                 snaps.push((snap, att, pr.active, rect, scrolled, pr.id, pr.title.clone()));
             }
         } else if matches!(self.client, Client::Ready(_)) {
@@ -2350,8 +2495,9 @@ fn take_damaged(set: &Mutex<HashSet<u64>>) -> HashSet<u64> {
     set.lock().map(|mut d| std::mem::take(&mut *d)).unwrap_or_default()
 }
 
-/// Drop cached snapshots for panes no longer present in the layout.
-fn evict_stale(cache: &mut HashMap<u64, PaneSnapshot>, live: &HashSet<u64>) {
+/// Drop map entries for panes no longer present in the layout (used for both the snapshot cache and
+/// the per-pane scroll map).
+fn evict_stale<V>(cache: &mut HashMap<u64, V>, live: &HashSet<u64>) {
     cache.retain(|id, _| live.contains(id));
 }
 
@@ -2777,6 +2923,27 @@ mod tests {
         assert_eq!(clamp_font_px(4.0), 8.0);
         assert_eq!(clamp_font_px(100.0), 40.0);
         assert_eq!(clamp_font_px(18.0), 18.0);
+    }
+
+    /// Path quoting: a space triggers double-quoting with any embedded quote doubled; a plain path
+    /// is untouched.
+    #[test]
+    fn quote_path_quotes_only_when_spaced() {
+        assert_eq!(quote_path(r"C:\tmp\file.txt"), r"C:\tmp\file.txt");
+        assert_eq!(quote_path(r"C:\my docs\a.txt"), "\"C:\\my docs\\a.txt\"");
+        // A spaced path with an embedded quote doubles the quote inside the wrapper.
+        assert_eq!(quote_path(r#"a "b" c"#), r#""a ""b"" c""#);
+    }
+
+    /// Per-pane scroll eviction: the generic `evict_stale` drops offsets for panes gone from the
+    /// layout and keeps the live ones (same helper the snapshot cache uses).
+    #[test]
+    fn evict_stale_prunes_pane_scroll() {
+        let mut scroll: HashMap<u64, usize> = HashMap::from([(1, 5), (2, 3), (3, 9)]);
+        evict_stale(&mut scroll, &HashSet::from([1u64, 3]));
+        let mut kept: Vec<(u64, usize)> = scroll.into_iter().collect();
+        kept.sort();
+        assert_eq!(kept, vec![(1, 5), (3, 9)]);
     }
 
     /// Sidebar double-click (rename trigger): the same row within CLICK_INTERVAL counts; a

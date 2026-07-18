@@ -467,3 +467,56 @@ fn cursor_style_tracks_decscusr() {
     t.advance(b"\x1b[0 q"); // reset to default
     assert_eq!(t.cursor_style(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// OSC 52 clipboard set + the strict decode_base64.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn decode_base64_roundtrip_and_padding() {
+    use crate::osc::decode_base64;
+    // The three padding cases (0/1/2 trailing bytes) plus RFC-tolerant missing padding.
+    assert_eq!(decode_base64("Zm9v"), Some(b"foo".to_vec())); // 3 bytes, no pad
+    assert_eq!(decode_base64("Zm9vYmE="), Some(b"fooba".to_vec())); // 5 bytes, "=" pad
+    assert_eq!(decode_base64("Zm9vYg=="), Some(b"foob".to_vec())); // 4 bytes, "==" pad
+    assert_eq!(decode_base64("aGVsbG8="), Some(b"hello".to_vec()));
+    assert_eq!(decode_base64("aGVsbG8"), Some(b"hello".to_vec())); // missing final padding
+}
+
+#[test]
+fn decode_base64_whitespace_skipped() {
+    use crate::osc::decode_base64;
+    assert_eq!(decode_base64("aGVs bG8=\n"), Some(b"hello".to_vec()));
+}
+
+#[test]
+fn decode_base64_rejects_invalid() {
+    use crate::osc::decode_base64;
+    assert_eq!(decode_base64("****"), None); // bad alphabet char
+    assert_eq!(decode_base64("aGVsbG8=@"), None); // stray invalid char after valid data
+    assert_eq!(decode_base64("aGVsb"), None); // impossible length (5 sig chars, %4 == 1)
+}
+
+#[test]
+fn osc52_sets_clipboard_bel() {
+    let mut t = Terminal::new(80, 24);
+    // \x1b]52;c;aGVsbG8=\x07 — "c" selection, base64 "hello".
+    let evs = non_damage(t.advance(b"\x1b]52;c;aGVsbG8=\x07"));
+    assert!(evs.contains(&TermEvent::Clipboard("hello".to_string())), "evs = {evs:?}");
+}
+
+#[test]
+fn osc52_sets_clipboard_st() {
+    let mut t = Terminal::new(80, 24);
+    // ST (ESC-backslash) terminator, "p" (primary) selection — any selection string is accepted.
+    let evs = non_damage(t.advance(b"\x1b]52;p;aGVsbG8=\x1b\\"));
+    assert!(evs.contains(&TermEvent::Clipboard("hello".to_string())), "evs = {evs:?}");
+}
+
+#[test]
+fn osc52_read_request_ignored() {
+    let mut t = Terminal::new(80, 24);
+    // "?" is a clipboard READ request — must be ignored entirely (never answered, never emitted).
+    let evs = non_damage(t.advance(b"\x1b]52;c;?\x07"));
+    assert!(evs.iter().all(|e| !matches!(e, TermEvent::Clipboard(_))), "read must not emit: {evs:?}");
+}

@@ -126,6 +126,9 @@ impl Server {
         let mut notes = Vec::new();
         let mut exited = Vec::new();
         let mut progress = Vec::new();
+        // OSC 52 clipboard-set wires — push-only (never queued for PollNotifications), delivered to
+        // ALL subscribers (they carry the pane id + the new clipboard text).
+        let mut clipboards = Vec::new();
         // Panes whose grid changed this tick — coalesced (a HashSet) to one damage wire per pane.
         let mut damaged: HashSet<PaneId> = HashSet::new();
         for w in self.session.windows() {
@@ -147,15 +150,18 @@ impl Server {
                         PaneEvent::Output => {
                             damaged.insert(p.id);
                         }
+                        PaneEvent::Clipboard(text) => clipboards.push(clipboard_notify(p.id.0, text)),
                         _ => {}
                     }
                 }
             }
         }
-        // The push batch is the notifications plus a synthetic wire per exit and per damaged pane;
-        // subscribers see all three. `pane-output` wires are push-only (never queued for
-        // PollNotifications) and are filtered back out for subscribers that didn't opt into
-        // `output` — so toasts and plain `gmux subscribe` streams never see damage traffic.
+        // The push batch is the notifications plus a synthetic wire per exit and per damaged pane,
+        // plus any clipboard-set wires; subscribers see them all. `pane-output` wires are push-only
+        // (never queued for PollNotifications) and are filtered back out for subscribers that didn't
+        // opt into `output` — so toasts and plain `gmux subscribe` streams never see damage traffic.
+        // `clipboard-set` wires are likewise push-only, but reach ALL subscribers (not damage
+        // traffic, so `push_to_subscribers` never strips them).
         let mut batch = notes.clone();
         for id in &exited {
             batch.push(exit_notify(id.0));
@@ -163,6 +169,7 @@ impl Server {
         for id in &damaged {
             batch.push(output_notify(id.0));
         }
+        batch.extend(clipboards);
         self.notifications.extend(notes);
         for (id, state, pct) in progress {
             match state {
@@ -679,6 +686,15 @@ fn exit_notify(pane: u64) -> NotifyWire {
 /// non-`output` subscriber streams by [`push_to_subscribers`].
 fn output_notify(pane: u64) -> NotifyWire {
     NotifyWire { pane, title: "pane-output".into(), body: String::new(), urgency: 0 }
+}
+
+/// The wire form of an OSC 52 clipboard-set for push subscribers: a `NotifyWire` with the reserved
+/// `"clipboard-set"` title, the emitting pane's id, and the new clipboard text in `body`. Reserved
+/// title — push-only (never queued for `PollNotifications`, like `pane-output`) but delivered to
+/// ALL subscribers regardless of the `output` flag (it is not damage traffic, so
+/// [`push_to_subscribers`] does not strip it). The GUI applies it to the system clipboard.
+fn clipboard_notify(pane: u64, text: String) -> NotifyWire {
+    NotifyWire { pane, title: "clipboard-set".into(), body: text, urgency: 0 }
 }
 
 /// Push one event `batch` to every subscriber as a `Response{id:0}` line, dropping (via
@@ -1448,5 +1464,74 @@ mod tests {
         // A gone id is a harmless no-op Ok.
         let resp = server.handle(&Request { id: 3, call: Call::RenameWindow { id: 999_999, name: "x".into() } });
         assert_eq!(resp.result, Some(ResultBody::Done));
+    }
+
+    /// CONTRACT test (needs gmux-vt's OSC 52 -> `TermEvent::Clipboard` and gmux-mux's
+    /// `PaneEvent::Clipboard` forwarding to actually produce the event at runtime): a pane emitting
+    /// OSC 52 yields a `clipboard-set` wire in tick()'s push batch, and that wire is push-only —
+    /// PollNotifications stays empty. Console-free remote pane, so it runs headless.
+    #[test]
+    fn osc52_clipboard_pushes_and_leaves_poll_empty() {
+        use gmux_mux::{Pane, Session};
+        let pane = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        let pid = pane.id.0;
+        let mut server = Server {
+            session: Session::start("t", pane),
+            shell: "pwsh".into(),
+            last_view: (800, 600),
+            notifications: Vec::new(),
+            browse_requests: Vec::new(),
+            ticks: 0,
+            remotes: Vec::new(),
+            progress: HashMap::new(),
+            palette: Palette::default(),
+            persist_screen: true,
+        };
+        // OSC 52 set-clipboard: selection "c", base64("hello") == "aGVsbG8=".
+        server.session.pane(PaneId(pid)).unwrap().push_output(b"\x1b]52;c;aGVsbG8=\x07");
+        let batch = server.tick();
+        let clip: Vec<&NotifyWire> = batch.iter().filter(|n| n.title == "clipboard-set").collect();
+        assert_eq!(clip.len(), 1, "one clipboard-set wire in the push batch");
+        assert_eq!(clip[0].pane, pid);
+        assert_eq!(clip[0].body, "hello", "base64 payload decoded to the clipboard text");
+        // Push-only: a clipboard-set is never queued for PollNotifications.
+        let poll = server.handle(&Request { id: 1, call: Call::PollNotifications });
+        assert_eq!(poll.result, Some(ResultBody::Notifications(Vec::new())));
+    }
+
+    /// A `clipboard-set` wire reaches an `output == false` subscriber: it is not damage traffic, so
+    /// `push_to_subscribers` must NOT strip it (contrast `output_flag_gates_pane_output_wires`,
+    /// which proves `pane-output` IS stripped for the same subscriber). In-process pipe pair, no
+    /// console/ConPTY.
+    #[test]
+    fn clipboard_set_reaches_non_output_subscriber() {
+        use gmux_pipe::{client_connect, PipeServer};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::mpsc;
+
+        static N: AtomicU32 = AtomicU32::new(0);
+        let name = format!("gmux-subtest-clip-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
+
+        let (tx, rx) = mpsc::channel();
+        let _server = PipeServer::start(&name, move |stream| {
+            let _ = tx.send(stream);
+        })
+        .unwrap();
+
+        let client = client_connect(&name).unwrap();
+        let server_side = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        // output == false: the subscriber still must receive clipboard-set (unlike pane-output).
+        let mut subs = vec![(server_side, false)];
+
+        let wire = clipboard_notify(4, "hi".into());
+        push_to_subscribers(&mut subs, std::slice::from_ref(&wire));
+        assert_eq!(subs.len(), 1, "a live subscriber is retained");
+
+        let mut reader = BufReader::new(client);
+        let resp: Response = read_msg(&mut reader).unwrap().unwrap();
+        assert_eq!(resp.id, 0, "pushes are unsolicited id:0 envelopes");
+        assert_eq!(resp.result, Some(ResultBody::Notifications(vec![wire])));
+        // Keep subs (holding server_side) alive until after the read.
+        assert_eq!(subs.len(), 1);
     }
 }
