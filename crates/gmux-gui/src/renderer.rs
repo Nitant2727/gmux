@@ -570,8 +570,13 @@ impl Renderer {
                     std::mem::swap(&mut cell_bg, &mut cell_fg);
                     cell_bg = blend(PEACH, cell_bg, 0.6);
                 }
-                // Cursor: pre-blend at ~70% over the cell bg (opaque bg pipeline can't alpha-blend).
-                let bg_color = if is_cursor { blend(CURSOR, cell_bg, 0.7) } else { cell_bg };
+                // Cursor shape (raw DECSCUSR Ps in `cursor_style`). Block (0,1,2 + any unknown) keeps
+                // the old behavior: pre-blend the whole cell bg ~70% toward CURSOR (the opaque bg
+                // pipeline can't alpha-blend). Underline (3,4) / bar (5,6) leave the bg alone and draw
+                // a CURSOR strip after it (below). Blink bits ignored — no timers, idle CPU stays 0.
+                let shape = is_cursor.then(|| cursor_shape(snap.cursor_style));
+                let block_cursor = shape == Some(CursorShape::Block);
+                let bg_color = if block_cursor { blend(CURSOR, cell_bg, 0.7) } else { cell_bg };
                 push_quad(&mut bg, x0, y0, x0 + cw, y0 + ch, rgba(bg_color));
 
                 // Inactive panes dim their text so the focused pane pops.
@@ -587,6 +592,17 @@ impl Renderer {
                 // pushed after them, so it paints over the cell bg and under the glyphs.
                 if cell.underline {
                     push_quad(&mut bg, x0, y0 + ch - 2.0, x0 + cw, y0 + ch - 1.0, fg);
+                }
+
+                // Underline/bar cursor: a 2px CURSOR-colored strip over the cell bg (pushed after it,
+                // like the SGR underline). Bar draws only on the cursor's own column (`hits(c)`) so a
+                // wide-glyph cursor's bar sits at the lead's left edge, not the spacer's; underline
+                // draws on every is_cursor cell, so it spans the full wide-glyph width.
+                // ponytail: cursor reported at a wide glyph's spacer column (rare) puts a bar mid-glyph.
+                if is_cursor && !block_cursor && (hits(c) || shape != Some(CursorShape::Bar)) {
+                    for q in cursor_quads(snap.cursor_style, x0, y0, cw, ch) {
+                        push_quad(&mut bg, q.x0, q.y0, q.x1, q.y1, rgba(CURSOR));
+                    }
                 }
 
                 // Wide (CJK) glyphs span two cells; the daemon sends a ' ' spacer in the next cell
@@ -1203,6 +1219,44 @@ fn mark_matches(row: &[Cell], needle: &[char]) -> Vec<bool> {
     hit
 }
 
+/// A pixel-space rectangle (`x0,y0`..`x1,y1`), used for cursor-shape strips. Pure geometry so the
+/// shape logic is unit-testable without a GPU.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Quad {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+}
+
+/// Cursor shape category for a raw DECSCUSR Ps (`cursor_style`): 0,1,2 (and any unknown >6) → block,
+/// 3,4 → underline, 5,6 → bar. The blink bit is folded away (odd = blink, even = steady share a
+/// shape) — gmux never blinks, so idle CPU stays 0 with no timers. ponytail: fixed table, not math.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CursorShape {
+    Block,
+    Underline,
+    Bar,
+}
+fn cursor_shape(style: u8) -> CursorShape {
+    match style {
+        3 | 4 => CursorShape::Underline,
+        5 | 6 => CursorShape::Bar,
+        _ => CursorShape::Block, // 0,1,2 and anything >6 clamp to block
+    }
+}
+
+/// Cursor strip quad(s) for a cell at pixel `(x0,y0)` sized `cw × ch`, drawn in CURSOR color. A block
+/// cursor emits none (it is rendered by pre-blending the cell bg instead); underline is a 2px strip
+/// at the cell bottom (full width); bar is a 2px vertical strip at the cell's left edge. Pure/tested.
+fn cursor_quads(style: u8, x0: f32, y0: f32, cw: f32, ch: f32) -> Vec<Quad> {
+    match cursor_shape(style) {
+        CursorShape::Block => Vec::new(),
+        CursorShape::Underline => vec![Quad { x0, y0: y0 + ch - 2.0, x1: x0 + cw, y1: y0 + ch }],
+        CursorShape::Bar => vec![Quad { x0, y0, x1: x0 + 2.0, y1: y0 + ch }],
+    }
+}
+
 /// Clamp a pixel rect to a `tw × th` render target, returning `None` when it clamps to empty (origin
 /// off-target or zero-sized). wgpu validates `set_scissor_rect`/`set_viewport` against the
 /// attachment and panics on any rect not contained in it — defense-in-depth for a minimize that
@@ -1292,6 +1346,31 @@ mod tests {
     }
 
     #[test]
+    fn cursor_quads_by_shape() {
+        let (x0, y0, cw, ch) = (10.0, 20.0, 8.0, 16.0);
+        // Block (0,1,2) and any unknown >6: no strip — the block is drawn via the bg blend instead.
+        for s in [0u8, 1, 2, 7, 255] {
+            assert!(cursor_quads(s, x0, y0, cw, ch).is_empty(), "style {s} should be block (no strip)");
+        }
+        // Underline (3,4): one 2px strip pinned to the cell bottom, spanning the full cell width.
+        for s in [3u8, 4] {
+            assert_eq!(
+                cursor_quads(s, x0, y0, cw, ch),
+                vec![Quad { x0: 10.0, y0: 34.0, x1: 18.0, y1: 36.0 }],
+                "style {s} underline strip"
+            );
+        }
+        // Bar (5,6): one 2px vertical strip at the cell's left edge, spanning the full cell height.
+        for s in [5u8, 6] {
+            assert_eq!(
+                cursor_quads(s, x0, y0, cw, ch),
+                vec![Quad { x0: 10.0, y0: 20.0, x1: 12.0, y1: 36.0 }],
+                "style {s} bar strip"
+            );
+        }
+    }
+
+    #[test]
     fn clamp_rect_guards_degenerate() {
         assert_eq!(clamp_rect(0, 0, 10, 10, 20, 20), Some((0, 0, 10, 10))); // fits
         assert_eq!(clamp_rect(5, 5, 100, 100, 20, 20), Some((5, 5, 15, 15))); // overhang clamps
@@ -1341,7 +1420,7 @@ mod tests {
             view_formats: &[],
         });
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let snap = PaneSnapshot { cells: vec![vec![cell('h'), cell('i')]], cursor: (0, 0), cols: 2, rows: 1 };
+        let snap = PaneSnapshot { cells: vec![vec![cell('h'), cell('i')]], cursor: (0, 0), cols: 2, rows: 1, cursor_style: 0 };
         let pv = PaneView {
             snap: &snap,
             attention: Attention::default(),

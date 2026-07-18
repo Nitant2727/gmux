@@ -446,3 +446,24 @@ fn mouse_mode_tracks_decset_and_decrst() {
     t.advance(b"\x1b[?1006l");
     assert_eq!(t.mouse_mode(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// DECSCUSR cursor style (CSI Ps SP q).
+// ---------------------------------------------------------------------------
+
+/// The raw DECSCUSR Ps is recoverable: default 0, `Ps 4` steady underline reads back 4, and `Ps 0`
+/// resets to the default. `Ps 6` steady bar reads back 6.
+#[test]
+fn cursor_style_tracks_decscusr() {
+    let mut t = Terminal::new(80, 24);
+    assert_eq!(t.cursor_style(), 0, "default cursor style is 0 (block)");
+
+    t.advance(b"\x1b[4 q"); // steady underline
+    assert_eq!(t.cursor_style(), 4);
+
+    t.advance(b"\x1b[6 q"); // steady bar
+    assert_eq!(t.cursor_style(), 6);
+
+    t.advance(b"\x1b[0 q"); // reset to default
+    assert_eq!(t.cursor_style(), 0);
+}

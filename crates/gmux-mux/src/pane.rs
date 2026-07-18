@@ -40,6 +40,8 @@ pub enum PaneEvent {
 pub struct PaneSnapshot {
     pub cells: Vec<Vec<Cell>>,
     pub cursor: (u16, u16),
+    /// Raw DECSCUSR Ps value (0 = default block); the renderer maps it to block/underline/bar.
+    pub cursor_style: u8,
     pub cols: u16,
     pub rows: u16,
 }
@@ -279,10 +281,16 @@ impl Pane {
         let snap = PaneSnapshot {
             cells: term.cells_at_offset(offset),
             cursor: term.cursor(),
+            cursor_style: term.cursor_style(),
             cols: term.cols(),
             rows: term.rows(),
         };
         (snap, history, offset)
+    }
+
+    /// Raw DECSCUSR Ps value the pane's application last set (0 = default block).
+    pub fn cursor_style(&self) -> u8 {
+        self.terminal.lock().unwrap().cursor_style()
     }
 
     /// Scrollback + visible content as plain text lines (oldest first). `max_lines == 0` returns all
