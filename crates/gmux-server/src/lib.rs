@@ -19,7 +19,7 @@ use gmux_mux::{
 };
 use gmux_pipe::{PipeServer, PipeStream};
 use gmux_proto::{
-    read_msg, write_msg, Call, CellWire, GridWire, LayoutWire, NotifyWire, PaneInfo, PaneRectWire,
+    read_msg, write_msg, Call, CellWire, GridWire, LayoutWire, LinkWire, NotifyWire, PaneInfo, PaneRectWire,
     Request, Response, ResultBody, TabWire, CELL_BOLD, CELL_INVERSE, CELL_ITALIC, CELL_UNDERLINE,
     CELL_WIDE,
 };
@@ -611,6 +611,15 @@ fn grid_wire(p: &Pane, offset: usize) -> GridWire {
     let mouse_mode = p.mouse_mode();
     let cursor_style = p.cursor_style();
     let (snap, history, offset) = p.snapshot_scrolled(offset);
+    // OSC 8 hyperlink spans for the same (clamped) viewport. ponytail: separate lock acquisition
+    // from the snapshot — a one-tick skew between cells and link spans is invisible; cap bounds
+    // the wire against a hostile app painting the whole screen as links.
+    let links: Vec<LinkWire> = p
+        .links_at_offset(offset)
+        .into_iter()
+        .take(256)
+        .map(|(row, start, end, uri)| LinkWire { row, start, end, uri })
+        .collect();
     let mut cells = Vec::with_capacity(snap.cols as usize * snap.rows as usize);
     for row in &snap.cells {
         for c in row {
@@ -649,6 +658,7 @@ fn grid_wire(p: &Pane, offset: usize) -> GridWire {
         bracketed_paste,
         mouse_mode,
         cursor_style,
+        links,
     }
 }
 

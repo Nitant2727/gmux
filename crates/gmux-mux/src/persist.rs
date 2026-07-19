@@ -31,6 +31,10 @@ pub struct WindowSnapshot {
     pub layout: NodeSnapshot,
     /// Index (into `panes`) of the active pane.
     pub active: usize,
+    /// User-set window name override (a sidebar rename), reapplied on restore. `#[serde(default)]`
+    /// so pre-round-9 snapshots (no field) still load with no override.
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -130,7 +134,12 @@ impl WindowSnapshot {
             })
             .collect();
         let active = index_of.get(&window.active_id()).copied().unwrap_or(0);
-        Some(WindowSnapshot { panes, layout: node_to_snapshot(&root, &index_of), active })
+        Some(WindowSnapshot {
+            panes,
+            layout: node_to_snapshot(&root, &index_of),
+            active,
+            name: window.name().map(str::to_string),
+        })
     }
 
     fn restore<F>(&self, spawn: &mut F) -> io::Result<Window>
@@ -150,7 +159,11 @@ impl WindowSnapshot {
         }
         let root = snapshot_to_node(&self.layout, &ids);
         let active = ids.get(self.active).copied().unwrap_or(ids[0]);
-        Ok(Window::from_parts(map, root, active))
+        let mut window = Window::from_parts(map, root, active);
+        if let Some(name) = &self.name {
+            window.set_name(name.clone());
+        }
+        Ok(window)
     }
 }
 
@@ -213,11 +226,47 @@ mod tests {
                     b: Box::new(NodeSnapshot::Leaf(1)),
                 },
                 active: 1,
+                name: Some("backend".into()),
             }],
         };
         let json = serde_json::to_string(&snap).unwrap();
         let back: SessionSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back, snap);
+
+        // Pre-round-9 snapshots (no `name` field) still load, with no override.
+        let old = r#"{"panes":[{"cwd":null}],"layout":{"Leaf":0},"active":0}"#;
+        let w: WindowSnapshot = serde_json::from_str(old).unwrap();
+        assert_eq!(w.name, None, "absent name defaults to None");
+    }
+
+    /// Contract 6: a renamed window's custom name survives a snapshot round-trip
+    /// (`SessionSnapshot::capture` -> `restore` in-process). A bare local-leaf window (unknown id ->
+    /// empty record) keeps this console-free; restore respawns a remote pane per record.
+    #[test]
+    fn window_name_survives_snapshot_roundtrip() {
+        let id = PaneId::alloc();
+        let mut win = Window::from_parts(HashMap::new(), Node::leaf(id), id);
+        win.set_name("backend".to_string());
+        let session = Session::from_windows("s", vec![win], 0);
+
+        let snap = SessionSnapshot::capture(&session);
+        assert_eq!(snap.windows.len(), 1);
+        assert_eq!(snap.windows[0].name.as_deref(), Some("backend"), "custom name captured");
+
+        let restored = snap
+            .restore("s", |_| Ok(Pane::remote(0, 80, 24, Box::new(|_| {}))))
+            .unwrap();
+        assert_eq!(
+            restored.windows()[0].workspace_info().name,
+            "backend",
+            "custom name reapplied on restore"
+        );
+
+        // A window with no override captures None and restores to the derived name ("shell").
+        let plain = Window::from_parts(HashMap::new(), Node::leaf(PaneId::alloc()), PaneId::alloc());
+        // ponytail: active id above is unused by this bare-leaf window; set_active would be noise.
+        let plain_snap = SessionSnapshot::capture(&Session::from_windows("s", vec![plain], 0));
+        assert_eq!(plain_snap.windows[0].name, None, "no override -> None");
     }
 
     #[test]

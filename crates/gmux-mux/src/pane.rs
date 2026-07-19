@@ -298,6 +298,12 @@ impl Pane {
         self.terminal.lock().unwrap().cursor_style()
     }
 
+    /// OSC 8 hyperlink spans visible at scroll `offset` — `(row, start_col, end_col_inclusive,
+    /// uri)`, same coordinate space as the snapshot at that offset.
+    pub fn links_at_offset(&self, offset: usize) -> Vec<(u16, u16, u16, String)> {
+        self.terminal.lock().unwrap().links_at_offset(offset)
+    }
+
     /// Scrollback + visible content as plain text lines (oldest first). `max_lines == 0` returns all
     /// retained history; otherwise the most-recent `max_lines`. Backs `capture-pane -S` and the
     /// snapshot screen capture used by session restore.

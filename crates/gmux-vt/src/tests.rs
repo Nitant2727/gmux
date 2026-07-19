@@ -520,3 +520,58 @@ fn osc52_read_request_ignored() {
     let evs = non_damage(t.advance(b"\x1b]52;c;?\x07"));
     assert!(evs.iter().all(|e| !matches!(e, TermEvent::Clipboard(_))), "read must not emit: {evs:?}");
 }
+
+// ---------------------------------------------------------------------------
+// OSC 8 hyperlinks -> links_at_offset spans.
+// ---------------------------------------------------------------------------
+
+/// A single OSC 8 link over "LINK" yields one span covering exactly those 4 cells, with the URI;
+/// the trailing plain text carries no link.
+#[test]
+fn osc8_single_link_span() {
+    let mut t = Terminal::new(80, 24);
+    // OSC 8 open (uri=https://example.com) LINK OSC 8 close, then " plain".
+    t.advance(b"\x1b]8;;https://example.com\x1b\\LINK\x1b]8;;\x1b\\ plain");
+    let links = t.links_at_offset(0);
+    assert_eq!(links.len(), 1, "expected exactly one span, got {links:?}");
+    // "LINK" sits at cols 0..=3 on row 0.
+    assert_eq!(links[0], (0, 0, 3, "https://example.com".to_string()));
+    // Sanity: the linked text really is on the grid.
+    assert!(t.visible_text()[0].starts_with("LINK plain"));
+}
+
+/// Two distinct OSC 8 links on one line produce two separate spans (the gap/URI change splits them).
+#[test]
+fn osc8_two_links_one_line() {
+    let mut t = Terminal::new(80, 24);
+    // "AA" -> link a, one plain space, "BBB" -> link b.
+    t.advance(b"\x1b]8;;https://a.test\x1b\\AA\x1b]8;;\x1b\\ \x1b]8;;https://b.test\x1b\\BBB\x1b]8;;\x1b\\");
+    let links = t.links_at_offset(0);
+    assert_eq!(links.len(), 2, "expected two spans, got {links:?}");
+    assert_eq!(links[0], (0, 0, 1, "https://a.test".to_string())); // AA at cols 0..=1
+    assert_eq!(links[1], (0, 3, 5, "https://b.test".to_string())); // BBB at cols 3..=5
+}
+
+/// A link scrolled up into history is still found via `links_at_offset(N)` at the matching offset,
+/// in the same coordinate space as `cells_at_offset`.
+#[test]
+fn osc8_link_survives_into_scrollback() {
+    let mut t = Terminal::new(20, 5); // tiny 5-row viewport
+    // Row of link text, then enough newlines to push it above the viewport.
+    t.advance(b"\x1b]8;;https://scroll.test\x1b\\HREF\x1b]8;;\x1b\\\r\n");
+    let mut filler = String::new();
+    for i in 1..=10 {
+        filler.push_str(&format!("f{i}\r\n"));
+    }
+    t.advance(filler.as_bytes());
+
+    // Not in the live viewport anymore.
+    assert!(t.links_at_offset(0).is_empty(), "link should have scrolled off the live screen");
+
+    // Scan every reachable offset; the link resurfaces at exactly one of them with the right URI.
+    let found = (0..=t.history_len())
+        .flat_map(|off| t.links_at_offset(off))
+        .find(|(_, _, _, uri)| uri == "https://scroll.test");
+    let (_, start, end, _) = found.expect("scrolled-off link must be reachable in scrollback");
+    assert_eq!((start, end), (0, 3), "HREF span is cols 0..=3");
+}

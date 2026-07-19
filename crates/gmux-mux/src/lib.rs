@@ -32,9 +32,8 @@ pub struct Window {
     root: Node,
     active: PaneId,
     zoom: bool,
-    /// User-set name override (a sidebar rename); `None` uses the derived workspace name. ponytail:
-    /// not persisted — SessionSnapshot carries no window name today, so a rename does not survive a
-    /// daemon restart. Add a name field to WindowSnapshot the day that should stick.
+    /// User-set name override (a sidebar rename); `None` uses the derived workspace name. Persisted
+    /// via [`WindowSnapshot::name`], so a rename survives a daemon restart.
     name: Option<String>,
 }
 
@@ -85,6 +84,12 @@ impl Window {
     /// derived workspace name (see [`Window::workspace_info`]).
     pub fn set_name(&mut self, name: String) {
         self.name = if name.is_empty() { None } else { Some(name) };
+    }
+
+    /// This window's custom name override (a sidebar rename), or `None` if it uses the derived
+    /// workspace name. Read by [`WindowSnapshot::capture`] to persist the override across restarts.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 
     /// Replace this window's split tree wholesale (the remote-tmux mirror path, where the remote's
