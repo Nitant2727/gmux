@@ -1180,10 +1180,14 @@ impl State {
                 | Action::NextWindow
                 | Action::PrevWindow
                 | Action::SelectTab(_)
+                | Action::PrevPrompt
+                | Action::NextPrompt
         ) {
             self.set_scroll(self.active_pane, 0);
         }
         match action {
+            Action::PrevPrompt => self.prompt_jump(true),
+            Action::NextPrompt => self.prompt_jump(false),
             Action::SelectTab(n) => {
                 // Alt+1..9: activate sidebar tab N-1 (out-of-range indices are ignored server-side).
                 self.client.control(Call::SelectWindow { index: n.saturating_sub(1) as usize });
@@ -1702,6 +1706,34 @@ impl State {
         self.set_scroll(self.active_pane, 0);
         self.force_full = true; // refetch the active pane at the live tail
         self.window.request_redraw();
+    }
+
+    /// Jump the active pane's viewport to the previous (`up`) / next command prompt (OSC 133
+    /// marks), anchoring the prompt line at the TOP of the view so the command and its output
+    /// read downward. Stateless: each press derives the destination from the current offset —
+    /// prompts already fully visible near the live tail top-anchor to 0 and are skipped upward.
+    fn prompt_jump(&mut self, up: bool) {
+        let Ok(ResultBody::Matches(offs)) =
+            self.client.call(Call::PromptOffsets { pane: self.active_pane })
+        else {
+            return;
+        };
+        let lift = self.active_rows.saturating_sub(1) as u32;
+        let cur = self.scroll_of(self.active_pane) as u32;
+        let targets: Vec<u32> = offs.iter().map(|&o| o.saturating_sub(lift)).collect();
+        let dest = if up {
+            targets.iter().copied().filter(|&t| t > cur).min()
+        } else {
+            // Below the lowest remaining prompt: snap back to the live screen.
+            targets.iter().copied().filter(|&t| t < cur).max().or(Some(0))
+        };
+        if let Some(d) = dest {
+            if d != cur {
+                self.set_scroll(self.active_pane, d as usize);
+                self.force_full = true;
+                self.window.request_redraw();
+            }
+        }
     }
 
     /// Append the clipboard to the search query (the keyboard Paste chord and right-click both

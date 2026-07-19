@@ -177,6 +177,29 @@ impl Dimensions for GridSize {
 // Terminal.
 // ---------------------------------------------------------------------------
 
+/// Byte positions in `bytes` where a prompt-mark introducer (`ESC ] 133;A` / `ESC ] 9;12`, the
+/// shell-integration prompt-start sequences) begins, ascending. Drives the segmented ansi feed in
+/// [`Terminal::advance`] so marks record the cursor position at the mark.
+fn mark_positions(bytes: &[u8]) -> Vec<usize> {
+    const A: &[u8] = b"\x1b]133;A";
+    const B: &[u8] = b"\x1b]9;12";
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i..].windows(2).position(|w| w == b"\x1b]") {
+            Some(rel) => {
+                let p = i + rel;
+                if bytes[p..].starts_with(A) || bytes[p..].starts_with(B) {
+                    out.push(p);
+                }
+                i = p + 2;
+            }
+            None => break,
+        }
+    }
+    out
+}
+
 /// Terminal state: an alacritty `Term` (grid/cursor/SGR) plus a side vte OSC parser (events).
 pub struct Terminal {
     term: Term<VoidListener>,
@@ -188,6 +211,9 @@ pub struct Terminal {
     osc_state: OscState,
     /// Runtime color palette used when resolving grid cells to `Rgb`.
     palette: Palette,
+    /// Absolute line indices (history + viewport row at mark time) of prompt starts, oldest first,
+    /// capped at 500. Consumed by [`Terminal::prompt_offsets`] for prompt-jump navigation.
+    prompt_marks: std::collections::VecDeque<u64>,
     cols: u16,
     rows: u16,
 }
@@ -204,6 +230,7 @@ impl Terminal {
             osc_parser: vte::Parser::new(),
             osc_state: OscState::default(),
             palette: Palette::default(),
+            prompt_marks: std::collections::VecDeque::new(),
             cols,
             rows,
         }
@@ -219,10 +246,22 @@ impl Terminal {
     /// Feed raw PTY bytes; drive both the grid and the side event parser. Returns the events seen
     /// in this chunk (plus a single `Damage` if the chunk was non-empty).
     pub fn advance(&mut self, bytes: &[u8]) -> Vec<TermEvent> {
-        // (a) Drive alacritty's Term for the grid/cursor/SGR state.
-        self.ansi.advance(&mut self.term, bytes);
+        // (a) Drive alacritty's Term for the grid/cursor/SGR state — SEGMENTED at prompt-mark
+        // introducers, so each mark records the cursor position AT the mark instead of wherever
+        // the rest of the chunk left it (a single pty read often carries prompt + output).
+        // ponytail: a mark introducer split across two reads is missed by this scan (the side
+        // parser still emits its event; only the jump anchor is lost) — rare enough to accept.
+        // Once scrollback hits its cap, history_size() stops growing while old lines drop, so
+        // deep marks drift; offsets are clamped downstream, and marks that deep are stale anyway.
+        let mut start = 0;
+        for pos in mark_positions(bytes) {
+            self.ansi.advance(&mut self.term, &bytes[start..pos]);
+            self.record_prompt_mark();
+            start = pos;
+        }
+        self.ansi.advance(&mut self.term, &bytes[start..]);
 
-        // (b) Drive our side parser for OSC/BEL events.
+        // (b) Drive our side parser for OSC/BEL events (whole chunk; it owns event emission).
         let mut events = Vec::new();
         self.osc_state.advance(&mut self.osc_parser, bytes, &mut events);
 
@@ -231,6 +270,40 @@ impl Terminal {
             events.push(TermEvent::Damage);
         }
         events
+    }
+
+    /// Record the current cursor line as a prompt start (absolute index: history + viewport row).
+    fn record_prompt_mark(&mut self) {
+        let abs = (self.term.grid().history_size() + self.cursor().1 as usize) as u64;
+        if self.prompt_marks.back() != Some(&abs) {
+            self.prompt_marks.push_back(abs);
+            if self.prompt_marks.len() > 500 {
+                self.prompt_marks.pop_front();
+            }
+        }
+    }
+
+    /// Scroll offsets (lines above the live bottom, usable directly as a grid fetch offset — the
+    /// same semantics as scrollback search) of recorded prompt starts, nearest-to-bottom first.
+    /// Marks that scrolled out of retained history are dropped.
+    pub fn prompt_offsets(&self) -> Vec<u32> {
+        let history = self.history_len();
+        let live_bottom = (history + self.rows.saturating_sub(1) as usize) as u64;
+        // A line is reachable while its distance above the live bottom fits in history + the
+        // viewport itself; beyond that it scrolled out of retention. The grid fetch clamps the
+        // viewport shift to `history` (same contract as scrollback search offsets).
+        let reachable = history + self.rows.saturating_sub(1) as usize;
+        let mut out: Vec<u32> = self
+            .prompt_marks
+            .iter()
+            .rev()
+            .filter_map(|&abs| {
+                let off = live_bottom.saturating_sub(abs) as usize;
+                (off <= reachable).then_some(off as u32)
+            })
+            .collect();
+        out.dedup();
+        out
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
