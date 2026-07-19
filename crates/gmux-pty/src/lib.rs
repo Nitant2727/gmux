@@ -356,6 +356,42 @@ impl Pty {
         unsafe { WaitForSingleObject(self.process, 0) != WAIT_OBJECT_0 }
     }
 
+    /// Live process count inside the kill-on-close job (the shell counts as 1, so `> 1` means the
+    /// shell has running children — a build, an agent, anything worth a close confirmation).
+    /// 0 when the job handle is unavailable (treated as not-busy by callers).
+    pub fn process_count(&self) -> u32 {
+        if self.job.is_null() {
+            return 0;
+        }
+        #[repr(C)]
+        #[derive(Default)]
+        struct BasicAccounting {
+            total_user_time: i64,
+            total_kernel_time: i64,
+            this_period_total_user_time: i64,
+            this_period_total_kernel_time: i64,
+            total_page_fault_count: u32,
+            total_processes: u32,
+            active_processes: u32,
+            total_terminated_processes: u32,
+        }
+        // windows-sys exposes QueryInformationJobObject; JobObjectBasicAccountingInformation = 1.
+        unsafe {
+            let mut info = BasicAccounting::default();
+            let ok = windows_sys::Win32::System::JobObjects::QueryInformationJobObject(
+                self.job,
+                1, // JobObjectBasicAccountingInformation
+                &mut info as *mut _ as *mut core::ffi::c_void,
+                core::mem::size_of::<BasicAccounting>() as u32,
+                null_mut(),
+            );
+            if ok == 0 {
+                return 0;
+            }
+            info.active_processes
+        }
+    }
+
     /// Block until the child exits and return its exit code.
     pub fn wait(&self) -> u32 {
         unsafe {

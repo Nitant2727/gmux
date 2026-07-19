@@ -49,6 +49,7 @@ fn print_result(body: &ResultBody) {
         ResultBody::Panes(panes) => print_panes(panes),
         ResultBody::Text(t) => println!("{t}"),
         ResultBody::PaneId(id) => println!("%{id}"),
+        ResultBody::Busy(b) => println!("{b}"),
         ResultBody::Layout(_) | ResultBody::Grid(_) | ResultBody::Notifications(_) | ResultBody::Browses(_) | ResultBody::Matches(_) => {} // not for the CLI
         ResultBody::Done => {}
     }

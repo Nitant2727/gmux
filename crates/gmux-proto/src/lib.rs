@@ -46,6 +46,15 @@ pub enum Call {
     /// prompt-jump navigation. Replies [`ResultBody::Matches`] with the same offset semantics as
     /// `search-pane` (nearest-to-bottom first). An unknown pane errors.
     PromptOffsets { pane: u64 },
+    /// Whether a pane's shell has running children (close-confirmation guard). Replies
+    /// [`ResultBody::Busy`]; an unknown pane errors. Remote-mirror panes report `false`.
+    PaneBusy { pane: u64 },
+    /// Whether ANY pane in the window with stable id `id` is busy (middle-click close guard).
+    /// Replies [`ResultBody::Busy`]; a gone id reports `false` (nothing left to protect).
+    WindowBusy {
+        #[serde(default)]
+        id: u64,
+    },
     /// Split the active pane. `dir` is "h" (side-by-side) or "v" (stacked).
     SplitPane { dir: String, #[serde(default)] command: Option<String> },
     /// Open a new window (tab).
@@ -212,6 +221,8 @@ pub enum ResultBody {
     Notifications(Vec<NotifyWire>),
     /// Browser requests drained by `PollBrowse` (M12): a list of urls to open/navigate to.
     Browses(Vec<String>),
+    /// `pane-busy` / `window-busy` verdict (close-confirmation guard).
+    Busy(bool),
     Done,
 }
 
@@ -398,6 +409,8 @@ mod tests {
             Call::CapturePane { pane: 5, scrollback: Some(100) },
             Call::SearchPane { pane: 5, query: "TODO".into() },
             Call::PromptOffsets { pane: 5 },
+            Call::PaneBusy { pane: 5 },
+            Call::WindowBusy { id: 3 },
             Call::SplitPane { dir: "h".into(), command: None },
             Call::NewWindow { command: Some("cmd.exe".into()) },
             Call::Notify { pane: Some(5), title: "T".into(), body: "B".into() },
