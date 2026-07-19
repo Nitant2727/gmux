@@ -116,6 +116,10 @@ pub struct SearchBar {
     pub query: String,
     pub current: usize,
     pub total: usize,
+    /// `true` draws the band OVER the bottom cell row without shrinking the viewport — for
+    /// transient surfaces (hover tooltips, notices) where a per-frame reflow would jitter.
+    /// Search keeps `false` so results are never hidden under the band.
+    pub overlay_only: bool,
 }
 
 #[repr(C)]
@@ -977,7 +981,8 @@ impl Renderer {
             // Cell-area geometry (hoisted so the scrollbar, scroll badge, and search band share this
             // rect). Inset INSET on the sides and bottom, below the title strip on top; the search
             // band (active pane) covers the bottom SEARCH_BAR of the visible height.
-            let search_here = pv.active && search.is_some();
+            // Overlay-only bands (tooltips/notices) draw over the bottom row without reflow.
+            let search_here = pv.active && search.is_some_and(|s| !s.overlay_only);
             let pad = bw + INSET;
             let (ix, iy) = (cx + pad, cy + bw + TITLE_STRIP + INSET);
             let iw = (cw_ - 2.0 * pad).max(1.0);
@@ -1476,7 +1481,7 @@ mod tests {
             title: "t".into(),
             selection: None,
         };
-        let sb = SearchBar { label: "find:".into(), query: "hi".into(), current: 1, total: 1 };
+        let sb = SearchBar { label: "find:".into(), query: "hi".into(), current: 1, total: 1, overlay_only: false };
         r.render_frame(&view, &[], 0, &[pv], 1, 1, "", false, Some(&sb), None, None);
         let _ = r.device.poll(wgpu::PollType::wait_indefinitely());
     }

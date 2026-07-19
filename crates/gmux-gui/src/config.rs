@@ -183,6 +183,8 @@ pub struct Config {
     pub theme: Option<Theme>,
     /// action name -> chord string, e.g. `"split_h": "ctrl+alt+2"`.
     pub keys: Option<HashMap<String, String>>,
+    /// Hovering a pane focuses it without a click (X11-style). Default off.
+    pub focus_follows_mouse: Option<bool>,
 }
 
 impl Config {

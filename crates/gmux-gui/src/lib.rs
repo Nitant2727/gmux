@@ -307,7 +307,7 @@ mod tests {
             }
             n
         };
-        let sb = SearchBar { label: "find:".into(), query: "foo".into(), current: 1, total: 5 };
+        let sb = SearchBar { label: "find:".into(), query: "foo".into(), current: 1, total: 5, overlay_only: false };
         r.render_frame(&view, &[], 0, &[pv()], w, h, "", false, Some(&sb), None, None);
         let with = white_in_band(&read_rgba(&r, &tex, w, h).expect("readback"));
         r.render_frame(&view, &[], 0, &[pv()], w, h, "", false, None, None, None);

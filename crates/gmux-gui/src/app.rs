@@ -662,6 +662,12 @@ struct State {
     /// A transient status line (e.g. "exported to ...") shown in the bottom band until it expires
     /// on a later redraw. Non-modal: it intercepts nothing.
     notice: Option<(String, Instant)>,
+    /// The URL/hyperlink target under the cursor, tooltipped in the bottom band while hovering.
+    hover_link: Option<String>,
+    /// Cached `focus_follows_mouse` config flag (default off; hot-reloaded with the config).
+    focus_follows_mouse: bool,
+    /// Last pane the cursor hovered (focus-follows-mouse edge trigger).
+    hover_pane: Option<u64>,
     /// Detected URL spans per pane (viewport cell coords), rebuilt each render for Ctrl+click.
     url_spans: HashMap<u64, Vec<UrlSpan>>,
     /// Cached OSC-8 hyperlink spans per pane (scheme-filtered), refreshed on each GetGrid fetch and
@@ -822,6 +828,9 @@ impl ApplicationHandler for App {
             confirm_close: None,
             palette: None,
             notice: None,
+            hover_link: None,
+            focus_follows_mouse: user_config.focus_follows_mouse.unwrap_or(false),
+            hover_pane: None,
             url_spans: HashMap::new(),
             link_cache: HashMap::new(),
             #[cfg(feature = "browser")]
@@ -1401,6 +1410,7 @@ impl State {
         self.config_mtime = now;
         let config = Config::load();
         self.keymap = Keymap::build(&config);
+        self.focus_follows_mouse = config.focus_follows_mouse.unwrap_or(false);
         apply_theme(&mut self.renderer, &config);
         self.send_palette(&config); // re-theme the daemon's panes on hot-reload
         // The daemon re-resolves every grid's colors but emits no damage wires for it, so the
@@ -1669,6 +1679,7 @@ impl State {
             self.extend_selection_to_cursor();
             return;
         }
+        self.update_hover();
         let cy = self.cursor.1;
         if let Some(sd) = self.sidebar_drag.as_mut() {
             if !sd.reordering && (cy - sd.start_y).abs() > 8.0 {
@@ -1836,6 +1847,48 @@ impl State {
         self.set_scroll(self.active_pane, 0);
         self.force_full = true; // refetch the active pane at the live tail
         self.window.request_redraw();
+    }
+
+    /// Cursor-motion hover effects: the link tooltip (band shows the REAL target under the
+    /// cursor) and, when enabled, focus-follows-mouse (edge-triggered on pane change; never
+    /// during drags — callers gate that).
+    fn update_hover(&mut self) {
+        let (cx, cy) = self.cursor;
+        let (sidebar_w, _, _) = self.areas();
+        let over = if cx >= 0.0 && cy >= 0.0 && (cx as u32) >= sidebar_w {
+            let cxp = (cx - sidebar_w as f64) as u32;
+            let py = cy as u32;
+            self.last_panes
+                .iter()
+                .find(|p| cxp >= p.x && cxp < p.x + p.w && py >= p.y && py < p.y + p.h)
+                .cloned()
+        } else {
+            None
+        };
+        // Link tooltip: what's under the cursor in the hovered pane's span list.
+        let link = over.as_ref().and_then(|pr| {
+            let (cw, ch) = self.cell_dims();
+            let rect = Rect { x: pr.x + sidebar_w, y: pr.y, w: pr.w, h: pr.h };
+            let (col, row) = pixel_to_cell(
+                cx as f32, cy as f32, rect, sidebar_w, self.config.width, self.config.height, cw, ch,
+            );
+            self.url_spans.get(&pr.id).and_then(|spans| url_at(spans, col, row)).map(str::to_string)
+        });
+        if link != self.hover_link {
+            self.hover_link = link;
+            self.window.request_redraw();
+        }
+        // Focus follows mouse (opt-in): edge-triggered when the hovered pane changes.
+        let hover_id = over.map(|p| p.id);
+        if self.focus_follows_mouse {
+            if let Some(id) = hover_id {
+                if hover_id != self.hover_pane && id != self.active_pane {
+                    self.client.control(Call::FocusPaneId { pane: id });
+                    self.window.request_redraw();
+                }
+            }
+        }
+        self.hover_pane = hover_id;
     }
 
     /// Write the active pane's full scrollback to `Downloads\gmux-<pane>-<stamp>.txt` and flash
@@ -2773,6 +2826,7 @@ impl State {
                 query: s.query.clone(),
                 current: if s.matches.is_empty() { 0 } else { s.current + 1 },
                 total: s.matches.len(),
+                overlay_only: false,
             })
             .or_else(|| {
                 self.confirm_close.as_ref().map(|c| SearchBar {
@@ -2785,6 +2839,18 @@ impl State {
                     query: String::new(),
                     current: 0,
                     total: 0,
+                    overlay_only: true,
+                })
+            })
+            .or_else(|| {
+                // Link hover tooltip: the REAL target under the cursor, before any Ctrl+click —
+                // OSC-8 links carry hidden URIs, and this is the only place they're visible.
+                self.hover_link.as_ref().map(|u| SearchBar {
+                    label: format!("link: {u}"),
+                    query: String::new(),
+                    current: 0,
+                    total: 0,
+                    overlay_only: true,
                 })
             })
             .or_else(|| {
@@ -2796,6 +2862,7 @@ impl State {
                         query: String::new(),
                         current: 0,
                         total: 0,
+                        overlay_only: true,
                     }),
                     Some(_) => {
                         self.notice = None;
