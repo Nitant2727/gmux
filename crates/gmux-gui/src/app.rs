@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use gmux_mux::{Attention, Cell, PaneSnapshot, Rect, Rgb};
 use gmux_notify::{flash_window, Notifier, ProgressState as NProgress, Taskbar, ToastRequest, Urgency as NUrgency};
-use gmux_proto::{Call, GridWire, LayoutWire, NotifyWire, PaneRectWire, ResultBody, CELL_BOLD, CELL_INVERSE, CELL_ITALIC, CELL_UNDERLINE, CELL_WIDE, MOUSE_DRAG, MOUSE_MOTION, MOUSE_SGR};
+use gmux_proto::{Call, GridWire, LayoutWire, LinkWire, NotifyWire, PaneRectWire, ResultBody, CELL_BOLD, CELL_INVERSE, CELL_ITALIC, CELL_UNDERLINE, CELL_WIDE, MOUSE_DRAG, MOUSE_MOTION, MOUSE_SGR};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -205,6 +205,7 @@ fn sidebar_double_click(last: Option<(usize, Instant)>, row: usize, now: Instant
 
 /// A detected http/https URL in a pane's viewport: the inclusive cell column range on `row` and the
 /// URL text. Rebuilt each render for Ctrl+click hit-testing; the cells are also underlined in-place.
+#[derive(Clone)]
 struct UrlSpan {
     row: u16,
     start: u16,
@@ -278,6 +279,55 @@ fn detect_urls(snap: &mut PaneSnapshot) -> Vec<UrlSpan> {
 /// The URL under cell `(col, row)` in a pane's span list, if any. Pure/tested.
 fn url_at(spans: &[UrlSpan], col: u16, row: u16) -> Option<&str> {
     spans.iter().find(|s| s.row == row && col >= s.start && col <= s.end).map(|s| s.url.as_str())
+}
+
+/// Whether an OSC-8 hyperlink URI is safe to open on Ctrl+click: only http/https/mailto
+/// (case-insensitive). A `file://` or custom-scheme URI from untrusted terminal content must NOT
+/// reach explorer.exe, so anything else is dropped at merge time. Pure/tested.
+fn link_scheme_ok(uri: &str) -> bool {
+    let u = uri.to_ascii_lowercase();
+    u.starts_with("http://") || u.starts_with("https://") || u.starts_with("mailto:")
+}
+
+/// Convert wire OSC-8 hyperlink spans to `UrlSpan`s, dropping any whose scheme `link_scheme_ok`
+/// rejects (the sanitize step of the cross-agent contract). `end` is inclusive on both sides.
+fn links_to_spans(links: &[LinkWire]) -> Vec<UrlSpan> {
+    links
+        .iter()
+        .filter(|l| link_scheme_ok(&l.uri))
+        .map(|l| UrlSpan { row: l.row, start: l.start, end: l.end, url: l.uri.clone() })
+        .collect()
+}
+
+/// Underline the cells covered by `spans` in `snap` (OSC-8 hyperlinks get the same always-on
+/// underline affordance as detected URLs). Out-of-range rows/cols are skipped, so a stale or
+/// oversized wire span can't panic the render. Pure/tested.
+fn underline_spans(snap: &mut PaneSnapshot, spans: &[UrlSpan]) {
+    for s in spans {
+        let Some(row) = snap.cells.get_mut(s.row as usize) else { continue };
+        let start = s.start as usize;
+        if start >= row.len() {
+            continue;
+        }
+        let end = (s.end as usize).min(row.len() - 1);
+        for cell in &mut row[start..=end] {
+            cell.underline = true;
+        }
+    }
+}
+
+/// Merge heuristic-detected URL spans with explicit OSC-8 hyperlink spans, OSC-8 winning on
+/// overlap: any detected span that intersects an OSC-8 span (same row, overlapping columns) is
+/// dropped, then the OSC-8 spans are appended. `url_at` returns the first match, so the surviving
+/// detected spans followed by the OSC-8 spans give explicit links precedence. ponytail: a detected
+/// span is dropped whole on any intersection (not split at the boundary) — simplest correct rule.
+fn merge_link_spans(detected: Vec<UrlSpan>, osc8: Vec<UrlSpan>) -> Vec<UrlSpan> {
+    let mut out: Vec<UrlSpan> = detected
+        .into_iter()
+        .filter(|d| !osc8.iter().any(|o| o.row == d.row && d.start <= o.end && o.start <= d.end))
+        .collect();
+    out.extend(osc8);
+    out
 }
 
 /// Wrap-around index step: move `current` by `dir` within `0..len`. `len == 0` stays 0. Pure/tested.
@@ -550,6 +600,10 @@ struct State {
     preedit: Option<String>,
     /// Detected URL spans per pane (viewport cell coords), rebuilt each render for Ctrl+click.
     url_spans: HashMap<u64, Vec<UrlSpan>>,
+    /// Cached OSC-8 hyperlink spans per pane (scheme-filtered), refreshed on each GetGrid fetch and
+    /// reused for undamaged frames so the always-on underline doesn't flicker. Evicted with
+    /// `snap_cache` (same live-pane set).
+    link_cache: HashMap<u64, Vec<UrlSpan>>,
     /// M12: the flag-gated WebView2 browser pane (its own top-level window), opened on the first
     /// `Browse` request drained from the daemon.
     #[cfg(feature = "browser")]
@@ -702,6 +756,7 @@ impl ApplicationHandler for App {
             search: None,
             preedit: None,
             url_spans: HashMap::new(),
+            link_cache: HashMap::new(),
             #[cfg(feature = "browser")]
             browser: None,
         };
@@ -1124,10 +1179,18 @@ impl State {
                 | Action::FocusDown
                 | Action::NextWindow
                 | Action::PrevWindow
+                | Action::SelectTab(_)
         ) {
             self.set_scroll(self.active_pane, 0);
         }
         match action {
+            Action::SelectTab(n) => {
+                // Alt+1..9: activate sidebar tab N-1 (out-of-range indices are ignored server-side).
+                self.client.control(Call::SelectWindow { index: n.saturating_sub(1) as usize });
+                self.sync_size();
+                self.force_full = true;
+                self.window.request_redraw();
+            }
             Action::FocusLeft => self.client.control(Call::FocusPane { dir: "left".into() }),
             Action::FocusRight => self.client.control(Call::FocusPane { dir: "right".into() }),
             Action::FocusUp => self.client.control(Call::FocusPane { dir: "up".into() }),
@@ -2301,6 +2364,7 @@ impl State {
             evict_stale(&mut self.snap_cache, &live);
             evict_stale(&mut self.pane_scroll, &live);
             evict_stale(&mut self.last_history, &live);
+            evict_stale(&mut self.link_cache, &live);
 
             for pr in &layout.panes {
                 // Per-pane scrollback: each pane fetches at its own offset (missing = 0 = live).
@@ -2343,6 +2407,9 @@ impl State {
                                 s.cursor = (g.cols, g.rows);
                             }
                             self.snap_cache.insert(pr.id, s.clone());
+                            // Refresh the pane's OSC-8 spans (scheme-filtered) alongside its
+                            // snapshot; undamaged frames reuse both from cache together.
+                            self.link_cache.insert(pr.id, links_to_spans(&g.links));
                             Some(s)
                         }
                         // Fetch failed this frame: fall back to the cached snapshot if we have one.
@@ -2353,7 +2420,17 @@ impl State {
                 };
                 let Some(mut snap) = snap else { continue };
                 // Underline detected URLs in-place and stash their spans for Ctrl+click hit-testing.
-                let spans = detect_urls(&mut snap);
+                let detected = detect_urls(&mut snap);
+                // Merge cached OSC-8 hyperlink spans (refreshed on fetch, reused for undamaged
+                // frames): explicit beats heuristic — a detected span that intersects a hyperlink
+                // is dropped so Ctrl+click opens the link's real URI, not the visible text.
+                let spans = match self.link_cache.get(&pr.id) {
+                    Some(links) if !links.is_empty() => {
+                        underline_spans(&mut snap, links);
+                        merge_link_spans(detected, links.clone())
+                    }
+                    _ => detected,
+                };
                 if !spans.is_empty() {
                     url_spans.insert(pr.id, spans);
                 }
@@ -2678,6 +2755,7 @@ mod tests {
             offset: 0,
             bracketed_paste: false,
             mouse_mode: 0,
+            links: Vec::new(),
             cursor_style: 0,
         }
     }
@@ -2829,6 +2907,7 @@ mod tests {
             offset: 0,
             bracketed_paste: false,
             mouse_mode: 0,
+            links: Vec::new(),
             cursor_style: 5, // bar; must map straight through to the snapshot
         };
         let snap = grid_to_snapshot(&g);
@@ -2872,6 +2951,52 @@ mod tests {
         assert_eq!(mouse_button_code(MouseButton::Middle), Some(1));
         assert_eq!(mouse_button_code(MouseButton::Right), Some(2));
         assert_eq!(mouse_button_code(MouseButton::Back), None);
+    }
+
+    /// OSC-8 merge: only http/https/mailto survive the scheme filter; a detected span that
+    /// intersects an explicit hyperlink is dropped (explicit beats heuristic); underlining a
+    /// stale/oversized wire span clamps instead of panicking.
+    #[test]
+    fn osc8_spans_filter_merge_and_clamp() {
+        let links = vec![
+            LinkWire { row: 0, start: 2, end: 5, uri: "https://a.test".into() },
+            LinkWire { row: 1, start: 0, end: 3, uri: "file:///etc/passwd".into() },
+            LinkWire { row: 1, start: 5, end: 6, uri: "MAILTO:x@y.z".into() },
+        ];
+        let spans = links_to_spans(&links);
+        let uris: Vec<&str> = spans.iter().map(|s| s.url.as_str()).collect();
+        assert_eq!(uris, vec!["https://a.test", "MAILTO:x@y.z"], "file:// dropped, case-insensitive schemes kept");
+
+        // Overlap: detected (0, 4..=8) intersects the OSC-8 (0, 2..=5) and is dropped whole;
+        // detected (0, 7..=9) does not intersect after the first is gone... it overlaps nothing.
+        let detected = vec![
+            UrlSpan { row: 0, start: 4, end: 8, url: "https://visible.text".into() },
+            UrlSpan { row: 2, start: 0, end: 3, url: "https://keep.me".into() },
+        ];
+        let merged = merge_link_spans(detected, spans);
+        let urls: Vec<&str> = merged.iter().map(|s| s.url.as_str()).collect();
+        assert_eq!(urls, vec!["https://keep.me", "https://a.test", "MAILTO:x@y.z"]);
+
+        // Bounds clamp: a span past the row/col limits underlines what exists, no panic.
+        let mut snap = PaneSnapshot {
+            cells: vec![vec![
+                Cell { ch: 'x', fg: Rgb { r: 0, g: 0, b: 0 }, bg: Rgb { r: 0, g: 0, b: 0 }, bold: false, italic: false, underline: false, inverse: false, wide: false };
+                3
+            ]],
+            cursor: (0, 0),
+            cursor_style: 0,
+            cols: 3,
+            rows: 1,
+        };
+        underline_spans(
+            &mut snap,
+            &[
+                UrlSpan { row: 0, start: 1, end: 99, url: "u".into() },
+                UrlSpan { row: 9, start: 0, end: 1, url: "u".into() },
+            ],
+        );
+        assert!(!snap.cells[0][0].underline);
+        assert!(snap.cells[0][1].underline && snap.cells[0][2].underline);
     }
 
     /// URL spans: scheme + non-space run, trailing sentence punctuation trimmed, and a bare

@@ -275,6 +275,20 @@ pub struct GridWire {
     /// (see [`gmux_vt::Terminal::cursor_style`]). The renderer draws the shape; blink is ignored.
     #[serde(default)]
     pub cursor_style: u8,
+    /// OSC 8 hyperlink spans visible in this grid (`end` inclusive), capped at 256 server-side.
+    /// The GUI merges these into its plain-text-URL underline mechanism, OSC 8 winning on overlap.
+    #[serde(default)]
+    pub links: Vec<LinkWire>,
+}
+
+/// One OSC 8 hyperlink span in a grid: `row`, columns `start..=end` (**`end` inclusive**), and the
+/// target `uri`. Mirrors the GUI's `UrlSpan` so it drops straight into the same underline path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LinkWire {
+    pub row: u16,
+    pub start: u16,
+    pub end: u16,
+    pub uri: String,
 }
 
 /// One pane's rectangle within the content area.
@@ -475,6 +489,7 @@ mod tests {
             bracketed_paste: true,
             mouse_mode: MOUSE_CLICKS | MOUSE_SGR,
             cursor_style: 4,
+            links: vec![LinkWire { row: 0, start: 0, end: 2, uri: "https://example.com".into() }],
         });
         let resp = Response::ok(2, grid.clone());
         let mut buf = Vec::new();
@@ -661,6 +676,37 @@ mod tests {
         assert!(String::from_utf8(buf.clone()).unwrap().contains("\"matches\""));
         let back: Response = read_msg(&mut Cursor::new(buf)).unwrap().unwrap();
         assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn grid_links_roundtrip_and_default() {
+        // A GridWire with OSC 8 links round-trips on the wire.
+        let grid = GridWire {
+            cols: 1,
+            rows: 1,
+            cursor_col: 0,
+            cursor_row: 0,
+            cells: vec![CellWire { ch: 'x', fg: [0, 0, 0], bg: [0, 0, 0], flags: 0 }],
+            history: 0,
+            offset: 0,
+            bracketed_paste: false,
+            mouse_mode: 0,
+            cursor_style: 0,
+            links: vec![
+                LinkWire { row: 0, start: 0, end: 0, uri: "https://a.test".into() },
+                LinkWire { row: 1, start: 3, end: 7, uri: "mailto:x@y.z".into() },
+            ],
+        };
+        let resp = Response::ok(1, ResultBody::Grid(grid.clone()));
+        let mut buf = Vec::new();
+        write_msg(&mut buf, &resp).unwrap();
+        let back: Response = read_msg(&mut Cursor::new(buf)).unwrap().unwrap();
+        assert_eq!(back.result, Some(ResultBody::Grid(grid)));
+
+        // Old daemons / hand-written JSON omitting `links` still parse (serde default -> empty).
+        let line = r#"{"cols":1,"rows":1,"cursor_col":0,"cursor_row":0,"cells":[]}"#;
+        let g: GridWire = serde_json::from_str(line).unwrap();
+        assert!(g.links.is_empty(), "absent links defaults to empty");
     }
 
     #[test]

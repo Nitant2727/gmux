@@ -35,10 +35,18 @@ pub enum Action {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    /// Select the Nth sidebar tab (1-based `n`, from alt+1..alt+9); dispatched as a 0-based
+    /// `SelectWindow { index: n - 1 }`.
+    SelectTab(u8),
 }
 
 impl Action {
     fn from_name(s: &str) -> Option<Action> {
+        // "select_tab_1".."select_tab_9" -> SelectTab(1..=9) (a 1-based tab number).
+        if let Some(n) = s.strip_prefix("select_tab_") {
+            let n: u8 = n.parse().ok()?;
+            return (1..=9).contains(&n).then_some(Action::SelectTab(n));
+        }
         Some(match s {
             "split_h" => Action::SplitH,
             "split_v" => Action::SplitV,
@@ -85,6 +93,15 @@ const DEFAULTS: &[(&str, &str, Action)] = &[
     ("zoom_in", "ctrl+=", Action::ZoomIn),
     ("zoom_out", "ctrl+-", Action::ZoomOut),
     ("zoom_reset", "ctrl+0", Action::ZoomReset),
+    ("select_tab_1", "alt+1", Action::SelectTab(1)),
+    ("select_tab_2", "alt+2", Action::SelectTab(2)),
+    ("select_tab_3", "alt+3", Action::SelectTab(3)),
+    ("select_tab_4", "alt+4", Action::SelectTab(4)),
+    ("select_tab_5", "alt+5", Action::SelectTab(5)),
+    ("select_tab_6", "alt+6", Action::SelectTab(6)),
+    ("select_tab_7", "alt+7", Action::SelectTab(7)),
+    ("select_tab_8", "alt+8", Action::SelectTab(8)),
+    ("select_tab_9", "alt+9", Action::SelectTab(9)),
 ];
 
 #[derive(Debug, Default, Deserialize)]
@@ -516,6 +533,23 @@ mod tests {
         assert_eq!(Action::from_name("zoom_in"), Some(Action::ZoomIn));
         assert_eq!(Action::from_name("zoom_out"), Some(Action::ZoomOut));
         assert_eq!(Action::from_name("zoom_reset"), Some(Action::ZoomReset));
+    }
+
+    #[test]
+    fn select_tab_actions_parse_and_bind() {
+        // Names round-trip to a 1-based SelectTab; alt+digit chords bind them out of the box.
+        assert_eq!(Action::from_name("select_tab_1"), Some(Action::SelectTab(1)));
+        assert_eq!(Action::from_name("select_tab_9"), Some(Action::SelectTab(9)));
+        assert_eq!(Action::from_name("select_tab_0"), None); // out of 1..=9
+        assert_eq!(Action::from_name("select_tab_10"), None);
+        assert_eq!(Action::from_name("select_tab_x"), None);
+        // "alt+1" parses (a digit falls through named_key to Key::Character) — no chord-parser change.
+        assert_eq!(parse_chord("alt+1"), Some((ModifiersState::ALT, Key::Character("1".into()))));
+        let km = Keymap::default();
+        for n in 1..=9u8 {
+            let (m, k) = parse_chord(&format!("alt+{n}")).unwrap();
+            assert_eq!(km.action(m, &k), Some(Action::SelectTab(n)), "alt+{n} binds tab {n}");
+        }
     }
 
     #[test]

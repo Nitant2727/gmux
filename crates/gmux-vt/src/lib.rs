@@ -338,6 +338,48 @@ impl Terminal {
         out
     }
 
+    /// OSC 8 hyperlink spans visible at scroll `offset`, in the SAME coordinate space as
+    /// [`cells_at_offset`]: `(row, start_col, end_col_INCLUSIVE, uri)`. Adjacent cells carrying the
+    /// same URI merge into one span; a gap (unlinked cell) or a different URI breaks it. alacritty
+    /// parses OSC 8 into per-cell `Cell::hyperlink()` on the ansi path we already drive, so this is
+    /// a pure grid read — no reparse, no allocation beyond the output Vec (plus the span URI strings).
+    pub fn links_at_offset(&self, offset: usize) -> Vec<(u16, u16, u16, String)> {
+        let grid = self.term.grid();
+        let rows = self.rows as usize;
+        let cols = self.cols as usize;
+        let offset = offset.min(grid.history_size()) as i32;
+        let mut out = Vec::new();
+        for r in 0..rows {
+            let line = Line(r as i32 - offset);
+            let row = &grid[line];
+            // Running span on this row: (start_col, end_col_inclusive, uri).
+            let mut span: Option<(u16, u16, String)> = None;
+            for c in 0..cols {
+                let link = row[Column(c)].hyperlink();
+                let uri = link.as_ref().map(|h| h.uri());
+                match (span.as_mut(), uri) {
+                    // Same URI as the running span, adjacent column -> extend it.
+                    (Some(s), Some(u)) if s.2 == u => s.1 = c as u16,
+                    // Span ends (unlinked cell) or the URI changed: close it, then reopen if linked.
+                    (Some(_), _) => {
+                        let done = span.take().unwrap();
+                        out.push((r as u16, done.0, done.1, done.2));
+                        if let Some(u) = uri {
+                            span = Some((c as u16, c as u16, u.to_string()));
+                        }
+                    }
+                    // Start a new span.
+                    (None, Some(u)) => span = Some((c as u16, c as u16, u.to_string())),
+                    (None, None) => {}
+                }
+            }
+            if let Some(done) = span {
+                out.push((r as u16, done.0, done.1, done.2));
+            }
+        }
+        out
+    }
+
     /// Resolve one grid line into a row of renderer [`Cell`]s.
     fn row_cells(
         &self,
