@@ -42,6 +42,8 @@ pub enum Action {
     /// the shell-integration snippet).
     PrevPrompt,
     NextPrompt,
+    /// Open the command palette (fuzzy action + tab switcher overlay).
+    CommandPalette,
 }
 
 impl Action {
@@ -73,6 +75,7 @@ impl Action {
             "zoom_reset" => Action::ZoomReset,
             "prev_prompt" => Action::PrevPrompt,
             "next_prompt" => Action::NextPrompt,
+            "command_palette" => Action::CommandPalette,
             _ => return None,
         })
     }
@@ -85,8 +88,10 @@ const DEFAULTS: &[(&str, &str, Action)] = &[
     ("close_pane", "ctrl+shift+w", Action::ClosePane),
     ("toggle_zoom", "ctrl+shift+z", Action::ToggleZoom),
     ("new_window", "ctrl+shift+t", Action::NewWindow),
-    ("next_window", "ctrl+shift+n", Action::NextWindow),
-    ("prev_window", "ctrl+shift+p", Action::PrevWindow),
+    // Browser-style tab cycling: ctrl+pageup/pagedown (freed ctrl+shift+n/p — N opens a new
+    // window in most apps' muscle memory, and P is the command palette's industry-wide chord).
+    ("next_window", "ctrl+pagedown", Action::NextWindow),
+    ("prev_window", "ctrl+pageup", Action::PrevWindow),
     ("focus_left", "alt+left", Action::FocusLeft),
     ("focus_right", "alt+right", Action::FocusRight),
     ("focus_up", "alt+up", Action::FocusUp),
@@ -110,6 +115,7 @@ const DEFAULTS: &[(&str, &str, Action)] = &[
     ("select_tab_9", "alt+9", Action::SelectTab(9)),
     ("prev_prompt", "ctrl+up", Action::PrevPrompt),
     ("next_prompt", "ctrl+down", Action::NextPrompt),
+    ("command_palette", "ctrl+shift+p", Action::CommandPalette),
 ];
 
 #[derive(Debug, Default, Deserialize)]
@@ -374,6 +380,13 @@ impl ChordKey {
             _ => None,
         }
     }
+}
+
+/// The compiled-in default bindings — `(action_name, chord, action)` — for the command palette's
+/// action list. ponytail: the palette shows DEFAULT chords even when a user rebound one (the
+/// action still runs; only the hint could be stale).
+pub fn default_bindings() -> &'static [(&'static str, &'static str, Action)] {
+    DEFAULTS
 }
 
 impl Keymap {

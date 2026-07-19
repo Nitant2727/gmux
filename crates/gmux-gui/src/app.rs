@@ -20,7 +20,7 @@ use winit::window::{Window, WindowId};
 
 use crate::config::{config_path, default_template, Action, Config, Keymap};
 use crate::daemon_client::{spawn_output_subscriber, DaemonClient};
-use crate::renderer::{PaneView, SearchBar, SidebarRow};
+use crate::renderer::{PaletteView, PaneView, SearchBar, SidebarRow};
 use crate::Renderer;
 
 // The Windows clipboard helper lives in its own file but is declared here (a child of `app`) so the
@@ -179,6 +179,54 @@ struct SidebarDrag {
     from_row: usize,
     start_y: f64,
     reordering: bool,
+}
+
+/// The open command palette: a typed filter and the highlighted row. The item list itself is
+/// rebuilt from the query on every keystroke/render (stateless — tabs can change under it).
+struct PaletteState {
+    query: String,
+    selected: usize,
+}
+
+/// One palette entry's payload.
+#[derive(Clone)]
+enum PaletteCmd {
+    Act(Action),
+    Tab(usize),
+}
+
+/// Case-insensitive subsequence match ("spl h" chars all appear in order in "split horizontal").
+/// Pure/tested.
+fn fuzzy_match(hay: &str, needle: &str) -> bool {
+    let mut h = hay.chars().flat_map(char::to_lowercase);
+    needle
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|c| !c.is_whitespace())
+        .all(|n| h.any(|c| c == n))
+}
+
+/// Build the palette's filtered item list: every default-bound action ("split h" style labels,
+/// chord hints) plus a "tab: NAME" entry per sidebar tab. Pure/tested.
+fn palette_items(tab_names: &[String], query: &str) -> Vec<(String, String, PaletteCmd)> {
+    let mut out: Vec<(String, String, PaletteCmd)> = Vec::new();
+    for (i, name) in tab_names.iter().enumerate() {
+        let label = format!("tab: {name}");
+        if fuzzy_match(&label, query) {
+            out.push((label, format!("alt+{}", i + 1), PaletteCmd::Tab(i)));
+        }
+    }
+    for (name, chord, action) in crate::config::default_bindings() {
+        // The palette itself is noise in its own list.
+        if matches!(action, Action::CommandPalette) {
+            continue;
+        }
+        let label = name.replace('_', " ");
+        if fuzzy_match(&label, query) {
+            out.push((label, chord.to_string(), PaletteCmd::Act(*action)));
+        }
+    }
+    out
 }
 
 /// A close gesture waiting on confirmation because the target has running child processes
@@ -609,6 +657,8 @@ struct State {
     preedit: Option<String>,
     /// A close gesture awaiting confirmation (the target has running children).
     confirm_close: Option<ConfirmClose>,
+    /// The command palette overlay (Ctrl+Shift+P), or `None`.
+    palette: Option<PaletteState>,
     /// Detected URL spans per pane (viewport cell coords), rebuilt each render for Ctrl+click.
     url_spans: HashMap<u64, Vec<UrlSpan>>,
     /// Cached OSC-8 hyperlink spans per pane (scheme-filtered), refreshed on each GetGrid fetch and
@@ -767,6 +817,7 @@ impl ApplicationHandler for App {
             search: None,
             preedit: None,
             confirm_close: None,
+            palette: None,
             url_spans: HashMap::new(),
             link_cache: HashMap::new(),
             #[cfg(feature = "browser")]
@@ -822,7 +873,11 @@ impl ApplicationHandler for App {
                         Ime::Commit(text) => {
                             st.mark_activity();
                             st.preedit = None;
-                            if let Some(r) = st.rename.as_mut() {
+                            if let Some(p) = st.palette.as_mut() {
+                                p.query.push_str(&text);
+                                p.selected = 0;
+                                st.window.request_redraw();
+                            } else if let Some(r) = st.rename.as_mut() {
                                 r.buffer.push_str(&text);
                                 st.window.request_redraw();
                             } else if st.search.is_some() {
@@ -991,6 +1046,14 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if let Some(st) = self.state.as_mut() {
                     st.mark_activity();
+                }
+                // The command palette intercepts every key while open: edit the filter, move the
+                // selection (Up/Down), run (Enter), or close (Escape).
+                if let Some(st) = self.state.as_mut() {
+                    if st.palette.is_some() {
+                        st.palette_key(&event, self.mods);
+                        return;
+                    }
                 }
                 // A pending close confirmation intercepts first: Enter proceeds with the close,
                 // ANY other key (incl. Escape) cancels — safe-by-default for a destructive act.
@@ -1217,6 +1280,14 @@ impl State {
             self.set_scroll(self.active_pane, 0);
         }
         match action {
+            Action::CommandPalette => {
+                // Opening the palette closes every other modal surface.
+                self.search = None;
+                self.rename = None;
+                self.confirm_close = None;
+                self.palette = Some(PaletteState { query: String::new(), selected: 0 });
+                self.window.request_redraw();
+            }
             Action::PrevPrompt => self.prompt_jump(true),
             Action::NextPrompt => self.prompt_jump(false),
             Action::SelectTab(n) => {
@@ -1747,6 +1818,47 @@ impl State {
         self.search = None;
         self.set_scroll(self.active_pane, 0);
         self.force_full = true; // refetch the active pane at the live tail
+        self.window.request_redraw();
+    }
+
+    /// A key press while the command palette is open: edit the filter, navigate, run, or close.
+    fn palette_key(&mut self, event: &KeyEvent, mods: ModifiersState) {
+        let Some(p) = self.palette.as_mut() else { return };
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.palette = None,
+            Key::Named(NamedKey::ArrowUp) => p.selected = p.selected.saturating_sub(1),
+            Key::Named(NamedKey::ArrowDown) => p.selected = p.selected.saturating_add(1),
+            Key::Named(NamedKey::Backspace) => {
+                p.query.pop();
+                p.selected = 0;
+            }
+            Key::Named(NamedKey::Space) => {
+                p.query.push(' ');
+                p.selected = 0;
+            }
+            Key::Named(NamedKey::Enter) => {
+                let p = self.palette.take().unwrap();
+                // Same top-10 slice the renderer shows, so Enter always runs the highlighted row.
+                let items: Vec<_> =
+                    palette_items(&self.tab_names, &p.query).into_iter().take(10).collect();
+                if let Some((_, _, cmd)) = items.get(p.selected.min(items.len().saturating_sub(1)))
+                {
+                    match cmd.clone() {
+                        PaletteCmd::Act(a) => self.dispatch(a),
+                        PaletteCmd::Tab(i) => {
+                            self.client.control(Call::SelectWindow { index: i });
+                            self.sync_size();
+                            self.force_full = true;
+                        }
+                    }
+                }
+            }
+            Key::Character(text) if !mods.super_key() && !(mods.control_key() && !mods.alt_key()) => {
+                p.query.push_str(text.as_str());
+                p.selected = 0;
+            }
+            _ => {}
+        }
         self.window.request_redraw();
     }
 
@@ -2611,6 +2723,18 @@ impl State {
                     total: 0,
                 })
             });
+        // Palette overlay: rebuild the filtered rows from the live query (top 10; the selection
+        // clamps to what's visible — no list scrolling in v1, ponytail).
+        let palette_view = self.palette.as_ref().map(|p| {
+            let items = palette_items(&self.tab_names, &p.query);
+            let visible: Vec<(String, String)> =
+                items.into_iter().take(10).map(|(l, h, _)| (l, h)).collect();
+            PaletteView {
+                query: p.query.clone(),
+                selected: p.selected.min(visible.len().saturating_sub(1)),
+                items: visible,
+            }
+        });
         self.renderer.render_frame(
             &view,
             &rows,
@@ -2622,6 +2746,7 @@ impl State {
             plus_hover,
             search_bar.as_ref(),
             self.preedit.as_deref(),
+            palette_view.as_ref(),
         );
         // Present explicitly: dropping a SurfaceTexture does NOT present it — unpresented frames
         // exhaust the swapchain and every later acquire times out (window stays white/stale).
@@ -3068,6 +3193,25 @@ mod tests {
         assert_eq!(mouse_button_code(MouseButton::Middle), Some(1));
         assert_eq!(mouse_button_code(MouseButton::Right), Some(2));
         assert_eq!(mouse_button_code(MouseButton::Back), None);
+    }
+
+    /// Fuzzy filter: case-insensitive subsequence, whitespace in the needle ignored; palette items
+    /// cover tabs (with alt+N hints) and all default-bound actions except the palette itself.
+    #[test]
+    fn palette_fuzzy_filter_and_items() {
+        assert!(fuzzy_match("split horizontal", "spl h"));
+        assert!(fuzzy_match("Split Horizontal", "SPLIT"));
+        assert!(!fuzzy_match("split", "splx"));
+        assert!(fuzzy_match("anything", ""));
+
+        let tabs = vec!["backend".to_string(), "web".to_string()];
+        let all = palette_items(&tabs, "");
+        assert!(all.iter().any(|(l, h, _)| l == "tab: backend" && h == "alt+1"));
+        assert!(all.iter().any(|(l, _, c)| l == "split h" && matches!(c, PaletteCmd::Act(Action::SplitH))));
+        assert!(!all.iter().any(|(l, _, _)| l == "command palette"), "palette excludes itself");
+
+        let filtered = palette_items(&tabs, "back");
+        assert_eq!(filtered.len(), 1, "only the backend tab matches 'back': {:?}", filtered.iter().map(|(l, _, _)| l).collect::<Vec<_>>());
     }
 
     /// OSC-8 merge: only http/https/mailto survive the scheme filter; a detected span that

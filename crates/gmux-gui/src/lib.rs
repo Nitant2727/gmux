@@ -188,7 +188,7 @@ mod tests {
             progress: None,
             progress_error: false,
         }];
-        r.render_frame(&view, &rows, sw, &[], w, h, "", false, None, None);
+        r.render_frame(&view, &rows, sw, &[], w, h, "", false, None, None, None);
         let px = read_rgba(&r, &tex, w, h).expect("readback");
         // Panel bg is #181825 (r≈24); active fill is #313244 (r≈49). Threshold 40 splits them.
         let corner = pixel(&px, w, 1, rows_y0 + 1);
@@ -308,9 +308,9 @@ mod tests {
             n
         };
         let sb = SearchBar { label: "find:".into(), query: "foo".into(), current: 1, total: 5 };
-        r.render_frame(&view, &[], 0, &[pv()], w, h, "", false, Some(&sb), None);
+        r.render_frame(&view, &[], 0, &[pv()], w, h, "", false, Some(&sb), None, None);
         let with = white_in_band(&read_rgba(&r, &tex, w, h).expect("readback"));
-        r.render_frame(&view, &[], 0, &[pv()], w, h, "", false, None, None);
+        r.render_frame(&view, &[], 0, &[pv()], w, h, "", false, None, None, None);
         let without = white_in_band(&read_rgba(&r, &tex, w, h).expect("readback"));
         assert!(with > 3, "search band should draw the query text ({with} white px)");
         assert_eq!(without, 0, "no search bar → no band text ({without} white px)");

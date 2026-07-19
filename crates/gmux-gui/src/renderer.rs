@@ -97,6 +97,15 @@ pub struct SidebarRow {
     pub progress_error: bool,
 }
 
+/// The command palette overlay: a centered panel with a query line and filtered rows.
+pub struct PaletteView {
+    pub query: String,
+    /// Visible rows: `(label, right-aligned hint)` — the app pre-filters and pre-truncates.
+    pub items: Vec<(String, String)>,
+    /// Index into `items` of the highlighted row.
+    pub selected: usize,
+}
+
 /// The active pane's search overlay: a band drawn at the pane bottom. `current`/`total` are shown
 /// as-is (app.rs owns their semantics); `total == 0` with a non-empty `query` renders "no matches".
 /// Also reused as a generic prompt band (close confirmation): a custom `label`, empty query, and
@@ -900,6 +909,7 @@ impl Renderer {
         plus_hover: bool,
         search: Option<&SearchBar>,
         preedit: Option<&str>,
+        palette: Option<&PaletteView>,
     ) {
         let (fw, fh) = (surf_w.max(1) as f32, surf_h.max(1) as f32);
         // `sbg` is the opaque sidebar panel; `srd` is the rounded chrome (sidebar rows + pane
@@ -1080,6 +1090,32 @@ impl Renderer {
             let x = sidebar_w as f32 + ((content_w - tw) / 2.0).max(0.0);
             let y = (fh - self.atlas.cell_h as f32) / 2.0;
             self.text_run(msg, x, y, rgba(TEXT_DIM), fw, fh, &mut sgl);
+        }
+
+        // Command palette: a centered top panel in the overlay buffers (above everything). Query
+        // line first ("> query_"), then the pre-filtered rows — selected row gets the accent fill,
+        // hints (chords / "tab") sit right-aligned and dim. Geometry clamps to the surface via the
+        // overlay pass's full-surface viewport, so a tiny window just crops it.
+        if let Some(pal) = palette {
+            const PAL_W: f32 = 520.0;
+            const PAD: f32 = 12.0;
+            let row_h = ch_cell + 8.0;
+            let pw = PAL_W.min(fw - 16.0).max(120.0);
+            let ph = PAD * 2.0 + row_h * (pal.items.len() as f32 + 1.0);
+            let px = ((fw - pw) / 2.0).max(0.0);
+            let py = 48.0_f32.min(fh * 0.1);
+            push_rounded(&mut obg, px, py, px + pw, py + ph, RADIUS, rgba(BG_SIDEBAR), fw, fh);
+            let q = format!("> {}_", pal.query);
+            self.text_run(&q, px + PAD, py + PAD + 4.0, rgba(TEXT), fw, fh, &mut ogl);
+            for (i, (label, hint)) in pal.items.iter().enumerate() {
+                let ry = py + PAD + row_h * (i as f32 + 1.0);
+                if i == pal.selected {
+                    push_rounded(&mut obg, px + 4.0, ry, px + pw - 4.0, ry + row_h, RADIUS - 2.0, rgba(SIDEBAR_ROW_ACTIVE), fw, fh);
+                }
+                self.text_run(label, px + PAD, ry + 4.0, rgba(TEXT), fw, fh, &mut ogl);
+                let hw = hint.chars().count() as f32 * cw_cell;
+                self.text_run(hint, (px + pw - PAD - hw).max(px + PAD), ry + 4.0, rgba(TEXT_DIM), fw, fh, &mut ogl);
+            }
         }
 
         let sbg_buf = vb(bytemuck::cast_slice(&sbg));
@@ -1441,7 +1477,7 @@ mod tests {
             selection: None,
         };
         let sb = SearchBar { label: "find:".into(), query: "hi".into(), current: 1, total: 1 };
-        r.render_frame(&view, &[], 0, &[pv], 1, 1, "", false, Some(&sb), None);
+        r.render_frame(&view, &[], 0, &[pv], 1, 1, "", false, Some(&sb), None, None);
         let _ = r.device.poll(wgpu::PollType::wait_indefinitely());
     }
 }
