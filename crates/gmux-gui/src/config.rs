@@ -38,6 +38,10 @@ pub enum Action {
     /// Select the Nth sidebar tab (1-based `n`, from alt+1..alt+9); dispatched as a 0-based
     /// `SelectWindow { index: n - 1 }`.
     SelectTab(u8),
+    /// Jump the active pane's viewport to the previous / next command prompt (OSC 133 marks from
+    /// the shell-integration snippet).
+    PrevPrompt,
+    NextPrompt,
 }
 
 impl Action {
@@ -67,6 +71,8 @@ impl Action {
             "zoom_in" => Action::ZoomIn,
             "zoom_out" => Action::ZoomOut,
             "zoom_reset" => Action::ZoomReset,
+            "prev_prompt" => Action::PrevPrompt,
+            "next_prompt" => Action::NextPrompt,
             _ => return None,
         })
     }
@@ -102,6 +108,8 @@ const DEFAULTS: &[(&str, &str, Action)] = &[
     ("select_tab_7", "alt+7", Action::SelectTab(7)),
     ("select_tab_8", "alt+8", Action::SelectTab(8)),
     ("select_tab_9", "alt+9", Action::SelectTab(9)),
+    ("prev_prompt", "ctrl+up", Action::PrevPrompt),
+    ("next_prompt", "ctrl+down", Action::NextPrompt),
 ];
 
 #[derive(Debug, Default, Deserialize)]

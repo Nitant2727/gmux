@@ -575,3 +575,25 @@ fn osc8_link_survives_into_scrollback() {
     let (_, start, end, _) = found.expect("scrolled-off link must be reachable in scrollback");
     assert_eq!((start, end), (0, 3), "HREF span is cols 0..=3");
 }
+
+// ---------------------------------------------------------------------------
+// Prompt-jump: OSC 133;A marks are recorded and reported as scroll offsets.
+// ---------------------------------------------------------------------------
+#[test]
+fn prompt_offsets_track_marks_through_scrollback() {
+    let mut t = Terminal::new(80, 5);
+    // Prompt 1 on the initial screen, then a command whose output scrolls 8 lines.
+    t.advance(b"\x1b]133;A\x07p1> cmd\r\n");
+    for i in 0..8 {
+        t.advance(format!("out-{i}\r\n").as_bytes());
+    }
+    // Prompt 2 at the (now scrolled) live position.
+    t.advance(b"\x1b]133;A\x07p2> ");
+    let offs = t.prompt_offsets();
+    assert_eq!(offs.len(), 2, "both marks retained: {offs:?}");
+    // Nearest-to-bottom first: prompt 2 is on the live screen (small offset); prompt 1 is 8+ up.
+    assert!(offs[0] < offs[1], "nearest-first ordering: {offs:?}");
+    assert!(offs[1] >= 8, "the older prompt sits above the scrolled output: {offs:?}");
+    let reachable = t.history_len() + 4; // history + rows-1
+    assert!(offs[1] as usize <= reachable, "offsets stay within reach: {offs:?}");
+}

@@ -304,6 +304,12 @@ impl Pane {
         self.terminal.lock().unwrap().links_at_offset(offset)
     }
 
+    /// Scroll offsets of recorded prompt starts (OSC 133;A / 9;12), nearest-to-bottom first —
+    /// the same offset semantics as [`Pane::search`]. Backs prompt-jump navigation.
+    pub fn prompt_offsets(&self) -> Vec<u32> {
+        self.terminal.lock().unwrap().prompt_offsets()
+    }
+
     /// Scrollback + visible content as plain text lines (oldest first). `max_lines == 0` returns all
     /// retained history; otherwise the most-recent `max_lines`. Backs `capture-pane -S` and the
     /// snapshot screen capture used by session restore.

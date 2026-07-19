@@ -170,6 +170,7 @@ fn idempotent(call: &Call) -> bool {
             | Call::PollNotifications
             | Call::SetPalette { .. }
             | Call::SearchPane { .. }
+            | Call::PromptOffsets { .. }
     )
 }
 

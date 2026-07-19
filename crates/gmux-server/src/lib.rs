@@ -250,6 +250,10 @@ impl Server {
                 Some(p) => Response::ok(id, ResultBody::Matches(p.search(query))),
                 None => Response::err(id, format!("no pane %{pane}")),
             },
+            Call::PromptOffsets { pane } => match self.find(*pane) {
+                Some(p) => Response::ok(id, ResultBody::Matches(p.prompt_offsets())),
+                None => Response::err(id, format!("no pane %{pane}")),
+            },
             Call::SplitPane { dir, command } => {
                 let sd = match dir.as_str() {
                     "h" => SplitDir::Horizontal,
@@ -1020,6 +1024,39 @@ mod tests {
         assert_eq!(resp.result, Some(ResultBody::Done));
         assert_eq!(server.session.windows().len(), 1, "last window survives a close request");
         assert!(server.session.pane(idb).is_some());
+    }
+
+    /// `PromptOffsets` surfaces a pane's OSC 133 prompt marks as scroll offsets (search-pane
+    /// semantics); an unknown pane errors. Headless remote pane.
+    #[test]
+    fn prompt_offsets_route_through_pane() {
+        use gmux_mux::{Pane, Session};
+        let pane = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        let pid = pane.id.0;
+        let mut server = Server {
+            session: Session::start("t", pane),
+            shell: "pwsh".into(),
+            last_view: (800, 600),
+            notifications: Vec::new(),
+            browse_requests: Vec::new(),
+            ticks: 0,
+            remotes: Vec::new(),
+            progress: HashMap::new(),
+            palette: Palette::default(),
+            persist_screen: true,
+        };
+        let p = server.session.pane(PaneId(pid)).unwrap();
+        p.push_output(b"\x1b]133;A\x07p1> build\r\nok\r\n\x1b]133;A\x07p2> ");
+        let resp = server.handle(&Request { id: 1, call: Call::PromptOffsets { pane: pid } });
+        match resp.result {
+            Some(ResultBody::Matches(offs)) => {
+                assert_eq!(offs.len(), 2, "both prompt marks reported: {offs:?}");
+                assert!(offs[0] < offs[1], "nearest-to-bottom first: {offs:?}");
+            }
+            other => panic!("expected Matches, got {other:?}"),
+        }
+        let miss = server.handle(&Request { id: 2, call: Call::PromptOffsets { pane: 999 } });
+        assert!(miss.error.is_some());
     }
 
     /// `SetPalette` re-themes existing (console-free remote) panes: after it, SGR 31 red resolves

@@ -42,6 +42,10 @@ pub enum Call {
     /// directly as [`Call::GetGrid`]'s `offset`) of matching lines, nearest-to-bottom first, capped
     /// at 500. An empty `query` yields no matches; an unknown pane errors.
     SearchPane { pane: u64, #[serde(default)] query: String },
+    /// Scroll offsets of a pane's recorded prompt starts (OSC 133;A / ConEmu 9;12), for
+    /// prompt-jump navigation. Replies [`ResultBody::Matches`] with the same offset semantics as
+    /// `search-pane` (nearest-to-bottom first). An unknown pane errors.
+    PromptOffsets { pane: u64 },
     /// Split the active pane. `dir` is "h" (side-by-side) or "v" (stacked).
     SplitPane { dir: String, #[serde(default)] command: Option<String> },
     /// Open a new window (tab).
@@ -393,6 +397,7 @@ mod tests {
             Call::SendKeys { pane: 5, text: "ls".into(), enter: true },
             Call::CapturePane { pane: 5, scrollback: Some(100) },
             Call::SearchPane { pane: 5, query: "TODO".into() },
+            Call::PromptOffsets { pane: 5 },
             Call::SplitPane { dir: "h".into(), command: None },
             Call::NewWindow { command: Some("cmd.exe".into()) },
             Call::Notify { pane: Some(5), title: "T".into(), body: "B".into() },
