@@ -350,6 +350,10 @@ pub struct LayoutWire {
     pub active_pane: u64,
     pub tabs: Vec<TabWire>,
     pub panes: Vec<PaneRectWire>,
+    /// The active window is zoomed (one pane temporarily maximized) — the GUI badges it so a
+    /// "missing panes" layout reads as deliberate. `#[serde(default)]` for old daemons.
+    #[serde(default)]
+    pub zoomed: bool,
 }
 
 /// One pane's metadata (for `list-panes`).
@@ -518,7 +522,7 @@ mod tests {
 
     #[test]
     fn tab_wire_progress_roundtrips_and_defaults() {
-        let layout = LayoutWire {
+        let layout = LayoutWire { zoomed: false,
             active_pane: 1,
             tabs: vec![
                 TabWire { index: 0, id: 10, name: "a".into(), branch: Some("main".into()), attention: false, active: true, progress: Some(42), progress_error: false },
@@ -661,7 +665,7 @@ mod tests {
 
     #[test]
     fn pane_rect_title_roundtrips_and_defaults() {
-        let layout = LayoutWire {
+        let layout = LayoutWire { zoomed: false,
             active_pane: 1,
             tabs: Vec::new(),
             panes: vec![PaneRectWire {

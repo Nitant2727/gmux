@@ -507,6 +507,7 @@ impl Server {
 
     fn layout(&self, w: u32, h: u32) -> LayoutWire {
         let active_idx = self.session.active_index();
+        let zoomed = self.session.windows().get(active_idx).is_some_and(|w| w.zoomed());
         let tabs = self
             .session
             .windows()
@@ -550,7 +551,7 @@ impl Server {
             }
             None => (0, Vec::new()),
         };
-        LayoutWire { active_pane, tabs, panes }
+        LayoutWire { active_pane, tabs, panes, zoomed }
     }
 
     fn list_panes(&self) -> Vec<PaneInfo> {

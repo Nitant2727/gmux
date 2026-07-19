@@ -7,8 +7,12 @@ API — and, above all, **notification hooks that actually work**: any agent tha
 escape (Claude Code, Codex CLI, Aider, Gemini CLI, …) lights up its pane and fires a real Windows toast
 the moment it needs you.
 
-> **Status: architecture proposed, awaiting review. No feature code yet.**
-> The project is in its docs-first phase per the agreed working method.
+> **Status: working application.** All roadmap milestones (M0–M12) are implemented, plus 16 GUI
+> iteration rounds: scrollback search with match highlighting, clickable URLs and OSC 8 hyperlinks
+> (with hover tooltips showing the real target), IME input, mouse reporting, per-pane scrollback
+> with a draggable scrollbar, font zoom, a command palette, prompt-jump navigation, OSC 52
+> clipboard, busy-pane close protection, session-surviving tab renames, and more. `cargo build
+> --release -p gmux` and run `gmux.exe`.
 
 ## What makes gmux different
 
@@ -40,6 +44,32 @@ No open-source, Windows-native, non-Electron terminal today does all of this at 
 2. **Notification hooks** — the killer feature, front-loaded and non-negotiable.
 3. **Native tmux-style multiplexing** — sessions, splits, detach/reattach, restore.
 4. **Programmability** — CLI + named-pipe API for agents and scripts.
+
+## Default keybindings
+
+Rebindable in `%APPDATA%\gmux\gmux.json` (`Ctrl+,` opens it; see the generated template for names).
+
+| Chord | Action |
+|---|---|
+| `Ctrl+Shift+T` / middle-click tab | New tab / close tab (busy tabs ask first) |
+| `Ctrl+Shift+D` / `Ctrl+Shift+E` | Split side-by-side / stacked |
+| `Ctrl+Shift+W` | Close pane (busy panes ask first) |
+| `Ctrl+Shift+Z` | Zoom pane (tmux-style maximize; title strip shows the state) |
+| `Alt+arrows` / `Alt+Shift+arrows` | Focus pane / resize split |
+| `Alt+1..9`, `Ctrl+PageUp/PageDown` | Jump to tab N / cycle tabs |
+| `Ctrl+Shift+P` | Command palette (fuzzy actions + tab switcher) |
+| `Ctrl+Shift+F` | Scrollback search (Enter/Shift+Enter cycle matches) |
+| `Ctrl+Up` / `Ctrl+Down` | Jump to previous / next command prompt (needs shell integration) |
+| `Ctrl+=` / `Ctrl+-` / `Ctrl+0`, `Ctrl+wheel` | Font zoom |
+| `Ctrl+Shift+S` | Export the pane's scrollback to Downloads |
+| `Ctrl+Shift+C` / `Ctrl+Shift+V`, right-click | Copy selection / paste |
+| Double-click / triple-click | Select word / line |
+| `Ctrl+click` | Open the underlined URL/hyperlink (hover shows the real target) |
+| Double-click a tab | Rename it (persists across restarts) |
+
+`"focus_follows_mouse": true` in the config enables hover focus. Drag files onto a pane to paste
+their quoted paths. Wheel scrolls the pane under the cursor; the viewport is content-pinned while
+a background pane keeps producing output.
 
 ## Platform
 

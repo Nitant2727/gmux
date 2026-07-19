@@ -2766,7 +2766,14 @@ impl State {
                 // Per-pane offset (post server-clamp): the renderer draws a '+n' badge for any pane
                 // with scrolled>0 and a scrollbar only for the active one (history below).
                 let scrolled = self.scroll_of(pr.id) as u32;
-                snaps.push((snap, att, pr.active, rect, scrolled, pr.id, pr.title.clone()));
+                // Zoom badge: a zoomed window shows one pane where several live — say so in the
+                // title strip, or the layout reads as "my other panes vanished".
+                let title = if layout.zoomed && pr.active {
+                    format!("{} · zoomed (ctrl+shift+z restores)", pr.title)
+                } else {
+                    pr.title.clone()
+                };
+                snaps.push((snap, att, pr.active, rect, scrolled, pr.id, title));
             }
         } else if matches!(self.client, Client::Ready(_)) {
             // A Ready client that can't answer GetLayout has lost the daemon (reconnect+respawn
@@ -3270,16 +3277,16 @@ mod tests {
     #[test]
     fn layout_fetch_hash_tracks_geometry_only() {
         let panes = || vec![rect(1, 0, 0, 80, 40), rect(2, 80, 0, 80, 40)];
-        let base = LayoutWire { active_pane: 1, tabs: vec![], panes: panes() };
+        let base = LayoutWire { zoomed: false, active_pane: 1, tabs: vec![], panes: panes() };
         let tab = gmux_proto::TabWire {
             index: 0, id: 7, name: "changed".into(), branch: None, attention: true, active: true,
             progress: Some(50), progress_error: false,
         };
-        let same = LayoutWire { active_pane: 1, tabs: vec![tab], panes: panes() };
+        let same = LayoutWire { zoomed: false, active_pane: 1, tabs: vec![tab], panes: panes() };
         assert_eq!(layout_fetch_hash(&base), layout_fetch_hash(&same), "tab metadata is ignored");
-        let resized = LayoutWire { active_pane: 1, tabs: vec![], panes: vec![rect(1, 0, 0, 100, 40), rect(2, 100, 0, 60, 40)] };
+        let resized = LayoutWire { zoomed: false, active_pane: 1, tabs: vec![], panes: vec![rect(1, 0, 0, 100, 40), rect(2, 100, 0, 60, 40)] };
         assert_ne!(layout_fetch_hash(&base), layout_fetch_hash(&resized), "a resize changes the hash");
-        let refocused = LayoutWire { active_pane: 2, tabs: vec![], panes: panes() };
+        let refocused = LayoutWire { zoomed: false, active_pane: 2, tabs: vec![], panes: panes() };
         assert_ne!(layout_fetch_hash(&base), layout_fetch_hash(&refocused), "a focus change changes the hash");
     }
 
