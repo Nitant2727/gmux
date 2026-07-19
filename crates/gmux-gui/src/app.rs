@@ -181,6 +181,15 @@ struct SidebarDrag {
     reordering: bool,
 }
 
+/// A close gesture waiting on confirmation because the target has running child processes
+/// (a build, an agent). Enter proceeds; Escape or any other key cancels.
+enum ConfirmClose {
+    /// Ctrl+Shift+W on the active pane.
+    Pane,
+    /// Middle-click on the sidebar tab with this stable window id.
+    Window(u64),
+}
+
 /// Active in-terminal search (Ctrl+Shift+F). `matches` are scroll offsets from `Call::SearchPane`
 /// (nearest-to-bottom first, directly usable as `GetGrid.offset`); `current` indexes into them.
 struct SearchState {
@@ -598,6 +607,8 @@ struct State {
     /// Current IME preedit (composition) string, drawn at the active pane's cursor; cleared on
     /// Commit/Disabled.
     preedit: Option<String>,
+    /// A close gesture awaiting confirmation (the target has running children).
+    confirm_close: Option<ConfirmClose>,
     /// Detected URL spans per pane (viewport cell coords), rebuilt each render for Ctrl+click.
     url_spans: HashMap<u64, Vec<UrlSpan>>,
     /// Cached OSC-8 hyperlink spans per pane (scheme-filtered), refreshed on each GetGrid fetch and
@@ -755,6 +766,7 @@ impl ApplicationHandler for App {
             config_mtime,
             search: None,
             preedit: None,
+            confirm_close: None,
             url_spans: HashMap::new(),
             link_cache: HashMap::new(),
             #[cfg(feature = "browser")]
@@ -979,6 +991,25 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 if let Some(st) = self.state.as_mut() {
                     st.mark_activity();
+                }
+                // A pending close confirmation intercepts first: Enter proceeds with the close,
+                // ANY other key (incl. Escape) cancels — safe-by-default for a destructive act.
+                if let Some(st) = self.state.as_mut() {
+                    if st.confirm_close.is_some() {
+                        // Bare modifier presses (the Ctrl of a chord) neither confirm nor cancel.
+                        if !matches!(
+                            &event.logical_key,
+                            Key::Named(
+                                NamedKey::Control | NamedKey::Shift | NamedKey::Alt | NamedKey::Super
+                            )
+                        ) {
+                            st.confirm_close_key(matches!(
+                                &event.logical_key,
+                                Key::Named(NamedKey::Enter)
+                            ));
+                        }
+                        return;
+                    }
                 }
                 // Rename mode intercepts every key first (mutually exclusive with search): build
                 // the tab name, commit (Enter), or cancel (Escape).
@@ -1208,8 +1239,19 @@ impl State {
                 self.sync_size();
             }
             Action::ClosePane => {
-                self.client.control(Call::ClosePane);
-                self.sync_size();
+                // Guard: a pane whose shell has running children (a build, an agent) asks for
+                // confirmation instead of dying to one stray chord. Query failure = not busy.
+                let busy = matches!(
+                    self.client.call(Call::PaneBusy { pane: self.active_pane }),
+                    Ok(ResultBody::Busy(true))
+                );
+                if busy {
+                    self.confirm_close = Some(ConfirmClose::Pane);
+                    self.window.request_redraw();
+                } else {
+                    self.client.control(Call::ClosePane);
+                    self.sync_size();
+                }
             }
             Action::ToggleZoom => {
                 self.client.control(Call::ToggleZoom);
@@ -1708,6 +1750,21 @@ impl State {
         self.window.request_redraw();
     }
 
+    /// Resolve a pending close confirmation: `confirm` (Enter) executes the guarded close, any
+    /// other key cancels it. Either way the band disappears.
+    fn confirm_close_key(&mut self, confirm: bool) {
+        let Some(target) = self.confirm_close.take() else { return };
+        if confirm {
+            match target {
+                ConfirmClose::Pane => self.client.control(Call::ClosePane),
+                ConfirmClose::Window(id) => self.client.control(Call::CloseWindow { id }),
+            }
+            self.sync_size();
+            self.force_full = true;
+        }
+        self.window.request_redraw();
+    }
+
     /// Jump the active pane's viewport to the previous (`up`) / next command prompt (OSC 133
     /// marks), anchoring the prompt line at the TOP of the view so the command and its output
     /// read downward. Stateless: each press derives the destination from the current offset —
@@ -2034,9 +2091,18 @@ impl State {
             Some(&win) => {
                 // By stable id: a window removed daemon-side since the last render shifts the
                 // indices, but never re-targets an id (ids are never reused — a stale id no-ops).
-                self.client.control(Call::CloseWindow { id: win });
-                self.sync_size();
-                self.force_full = true;
+                // A tab with busy panes (running builds/agents) asks for confirmation first.
+                let busy = matches!(
+                    self.client.call(Call::WindowBusy { id: win }),
+                    Ok(ResultBody::Busy(true))
+                );
+                if busy {
+                    self.confirm_close = Some(ConfirmClose::Window(win));
+                } else {
+                    self.client.control(Call::CloseWindow { id: win });
+                    self.sync_size();
+                    self.force_full = true;
+                }
                 self.window.request_redraw();
                 true
             }
@@ -2520,12 +2586,31 @@ impl State {
             }
             plus_hover = self.renderer.sidebar_new_tab_at(cy as f32, self.tab_count);
         }
-        // Search bar shows a 1-based "current/total" (renderer renders the numbers as-is).
-        let search_bar = self.search.as_ref().map(|s| SearchBar {
-            query: s.query.clone(),
-            current: if s.matches.is_empty() { 0 } else { s.current + 1 },
-            total: s.matches.len(),
-        });
+        // Search bar shows a 1-based "current/total" (renderer renders the numbers as-is). A
+        // pending close confirmation reuses the same band as a pure prompt (label only) — search
+        // wins if both are somehow active.
+        let search_bar = self
+            .search
+            .as_ref()
+            .map(|s| SearchBar {
+                label: "find:".into(),
+                query: s.query.clone(),
+                current: if s.matches.is_empty() { 0 } else { s.current + 1 },
+                total: s.matches.len(),
+            })
+            .or_else(|| {
+                self.confirm_close.as_ref().map(|c| SearchBar {
+                    label: match c {
+                        ConfirmClose::Pane => "pane is busy — Enter closes it, Esc keeps it".into(),
+                        ConfirmClose::Window(_) => {
+                            "tab has busy panes — Enter closes it, Esc keeps it".into()
+                        }
+                    },
+                    query: String::new(),
+                    current: 0,
+                    total: 0,
+                })
+            });
         self.renderer.render_frame(
             &view,
             &rows,

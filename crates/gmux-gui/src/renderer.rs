@@ -99,7 +99,11 @@ pub struct SidebarRow {
 
 /// The active pane's search overlay: a band drawn at the pane bottom. `current`/`total` are shown
 /// as-is (app.rs owns their semantics); `total == 0` with a non-empty `query` renders "no matches".
+/// Also reused as a generic prompt band (close confirmation): a custom `label`, empty query, and
+/// `total == 0` renders just the label with no caret/counter.
 pub struct SearchBar {
+    /// Dim prefix label — "find:" for search, a full sentence for confirmations.
+    pub label: String,
     pub query: String,
     pub current: usize,
     pub total: usize,
@@ -1008,16 +1012,21 @@ impl Renderer {
                 push_rounded(&mut srd, bx0, by0, bx1, by1 - sr, 0.0, rgba(BG_SIDEBAR), fw, fh);
                 let ty = (by0 + (SEARCH_BAR - ch_cell) / 2.0).max(by0);
                 let lx = bx0 + 12.0;
-                self.text_run("find:", lx, ty, rgba(TEXT_DIM), fw, fh, &mut sgl);
-                let q = format!("{}_", sb.query);
-                self.text_run(&q, lx + 6.0 * cw_cell, ty, rgba(TEXT), fw, fh, &mut sgl); // +1 cell = space
-                let (counter, col) = if sb.total == 0 && !sb.query.is_empty() {
-                    ("no matches".to_string(), ERROR)
-                } else {
-                    (format!("{}/{}", sb.current, sb.total), ACCENT)
-                };
-                let cwn = counter.chars().count() as f32 * cw_cell;
-                self.text_run(&counter, (bx1 - 12.0 - cwn).max(lx), ty, rgba(col), fw, fh, &mut sgl);
+                self.text_run(&sb.label, lx, ty, rgba(TEXT_DIM), fw, fh, &mut sgl);
+                let label_cells = sb.label.chars().count() as f32 + 1.0; // +1 cell = space
+                // A pure prompt band (empty query, no matches) shows just the label: no caret,
+                // no counter — the close-confirmation reuse.
+                if !(sb.query.is_empty() && sb.total == 0) {
+                    let q = format!("{}_", sb.query);
+                    self.text_run(&q, lx + label_cells * cw_cell, ty, rgba(TEXT), fw, fh, &mut sgl);
+                    let (counter, col) = if sb.total == 0 && !sb.query.is_empty() {
+                        ("no matches".to_string(), ERROR)
+                    } else {
+                        (format!("{}/{}", sb.current, sb.total), ACCENT)
+                    };
+                    let cwn = counter.chars().count() as f32 * cw_cell;
+                    self.text_run(&counter, (bx1 - 12.0 - cwn).max(lx), ty, rgba(col), fw, fh, &mut sgl);
+                }
             }
 
             // Cells draw at fixed size from the cell-area top-left (`ix`,`iy`; computed above); the
@@ -1431,7 +1440,7 @@ mod tests {
             title: "t".into(),
             selection: None,
         };
-        let sb = SearchBar { query: "hi".into(), current: 1, total: 1 };
+        let sb = SearchBar { label: "find:".into(), query: "hi".into(), current: 1, total: 1 };
         r.render_frame(&view, &[], 0, &[pv], 1, 1, "", false, Some(&sb), None);
         let _ = r.device.poll(wgpu::PollType::wait_indefinitely());
     }

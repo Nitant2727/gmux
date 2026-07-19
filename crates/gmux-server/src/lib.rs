@@ -254,6 +254,22 @@ impl Server {
                 Some(p) => Response::ok(id, ResultBody::Matches(p.prompt_offsets())),
                 None => Response::err(id, format!("no pane %{pane}")),
             },
+            Call::PaneBusy { pane } => match self.find(*pane) {
+                Some(p) => Response::ok(id, ResultBody::Busy(p.is_busy())),
+                None => Response::err(id, format!("no pane %{pane}")),
+            },
+            Call::WindowBusy { id: win } => {
+                // A gone id has nothing left to protect — report not-busy rather than erroring
+                // (the close it guards is itself a no-op for gone ids).
+                let wid = WindowId(*win);
+                let busy = self
+                    .session
+                    .windows()
+                    .iter()
+                    .find(|w| w.id == wid)
+                    .is_some_and(|w| w.panes().any(|p| p.is_busy()));
+                Response::ok(id, ResultBody::Busy(busy))
+            }
             Call::SplitPane { dir, command } => {
                 let sd = match dir.as_str() {
                     "h" => SplitDir::Horizontal,
@@ -1057,6 +1073,36 @@ mod tests {
         }
         let miss = server.handle(&Request { id: 2, call: Call::PromptOffsets { pane: 999 } });
         assert!(miss.error.is_some());
+    }
+
+    /// Busy queries route and default sanely headless: a remote-mirror pane is never busy, an
+    /// unknown pane errors, and a gone window id reports not-busy (its close is a no-op anyway).
+    #[test]
+    fn busy_queries_route_and_default_false() {
+        use gmux_mux::{Pane, Session};
+        let pane = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        let pid = pane.id.0;
+        let mut server = Server {
+            session: Session::start("t", pane),
+            shell: "pwsh".into(),
+            last_view: (800, 600),
+            notifications: Vec::new(),
+            browse_requests: Vec::new(),
+            ticks: 0,
+            remotes: Vec::new(),
+            progress: HashMap::new(),
+            palette: Palette::default(),
+            persist_screen: true,
+        };
+        let resp = server.handle(&Request { id: 1, call: Call::PaneBusy { pane: pid } });
+        assert_eq!(resp.result, Some(ResultBody::Busy(false)), "remote panes are never busy");
+        let miss = server.handle(&Request { id: 2, call: Call::PaneBusy { pane: 999 } });
+        assert!(miss.error.is_some());
+        let wid = server.session.windows()[0].id.0;
+        let resp = server.handle(&Request { id: 3, call: Call::WindowBusy { id: wid } });
+        assert_eq!(resp.result, Some(ResultBody::Busy(false)));
+        let gone = server.handle(&Request { id: 4, call: Call::WindowBusy { id: 12345 } });
+        assert_eq!(gone.result, Some(ResultBody::Busy(false)), "gone window id = nothing to protect");
     }
 
     /// `SetPalette` re-themes existing (console-free remote) panes: after it, SGR 31 red resolves

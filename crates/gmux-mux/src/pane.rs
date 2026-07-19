@@ -217,6 +217,16 @@ impl Pane {
         }
     }
 
+    /// Whether the pane's shell has running children (a build, an agent — anything worth a close
+    /// confirmation). Local panes count live processes in the kill-on-close job (shell alone = 1).
+    /// ponytail: remote panes report false — the mirror can't see the remote process tree.
+    pub fn is_busy(&self) -> bool {
+        match &self.backend {
+            Backend::Local { pty } => pty.process_count() > 1,
+            Backend::Remote { .. } => false,
+        }
+    }
+
     /// The remote tmux pane id (the `N` of `%N`) backing this pane; `None` for local panes.
     pub fn remote_id(&self) -> Option<u64> {
         match &self.backend {
