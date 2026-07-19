@@ -659,6 +659,9 @@ struct State {
     confirm_close: Option<ConfirmClose>,
     /// The command palette overlay (Ctrl+Shift+P), or `None`.
     palette: Option<PaletteState>,
+    /// A transient status line (e.g. "exported to ...") shown in the bottom band until it expires
+    /// on a later redraw. Non-modal: it intercepts nothing.
+    notice: Option<(String, Instant)>,
     /// Detected URL spans per pane (viewport cell coords), rebuilt each render for Ctrl+click.
     url_spans: HashMap<u64, Vec<UrlSpan>>,
     /// Cached OSC-8 hyperlink spans per pane (scheme-filtered), refreshed on each GetGrid fetch and
@@ -818,6 +821,7 @@ impl ApplicationHandler for App {
             preedit: None,
             confirm_close: None,
             palette: None,
+            notice: None,
             url_spans: HashMap::new(),
             link_cache: HashMap::new(),
             #[cfg(feature = "browser")]
@@ -1276,6 +1280,11 @@ impl State {
                 | Action::SelectTab(_)
                 | Action::PrevPrompt
                 | Action::NextPrompt
+                | Action::ExportScrollback
+                | Action::ResizeLeft
+                | Action::ResizeRight
+                | Action::ResizeUp
+                | Action::ResizeDown
         ) {
             self.set_scroll(self.active_pane, 0);
         }
@@ -1290,6 +1299,14 @@ impl State {
             }
             Action::PrevPrompt => self.prompt_jump(true),
             Action::NextPrompt => self.prompt_jump(false),
+            Action::ExportScrollback => self.export_scrollback(),
+            // Keyboard split nudges: grow/shrink the active pane's divider fraction. ResizeSplit
+            // adjusts the split whose top/left pane is `pane` — from the keyboard the active pane
+            // stands in for "the divider I mean"; edge panes without that divider no-op.
+            Action::ResizeLeft => self.nudge_split(-0.03, 0.0),
+            Action::ResizeRight => self.nudge_split(0.03, 0.0),
+            Action::ResizeUp => self.nudge_split(0.0, -0.03),
+            Action::ResizeDown => self.nudge_split(0.0, 0.03),
             Action::SelectTab(n) => {
                 // Alt+1..9: activate sidebar tab N-1 (out-of-range indices are ignored server-side).
                 self.client.control(Call::SelectWindow { index: n.saturating_sub(1) as usize });
@@ -1821,13 +1838,60 @@ impl State {
         self.window.request_redraw();
     }
 
+    /// Write the active pane's full scrollback to `Downloads\gmux-<pane>-<stamp>.txt` and flash
+    /// the result in the bottom notice band. Failures land in the band too — no silent drops.
+    fn export_scrollback(&mut self) {
+        let text = match self.client.call(Call::CapturePane { pane: self.active_pane, scrollback: Some(0) }) {
+            Ok(ResultBody::Text(t)) => t,
+            _ => {
+                self.notice = Some(("export failed: could not capture pane".into(), Instant::now()));
+                self.window.request_redraw();
+                return;
+            }
+        };
+        let dir = std::env::var("USERPROFILE")
+            .map(|u| std::path::PathBuf::from(u).join("Downloads"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let stamp = {
+            // Seconds since epoch — good enough for a unique, sortable name without a time dep.
+            let d = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            d
+        };
+        let path = dir.join(format!("gmux-pane{}-{stamp}.txt", self.active_pane));
+        let msg = match std::fs::write(&path, text) {
+            Ok(()) => format!("scrollback exported to {}", path.display()),
+            Err(e) => format!("export failed: {e}"),
+        };
+        self.notice = Some((msg, Instant::now()));
+        self.window.request_redraw();
+    }
+
+    /// Nudge the active pane's split divider by a fractional delta (keyboard resize).
+    fn nudge_split(&mut self, dx: f32, dy: f32) {
+        self.client.control(Call::ResizeSplit { pane: self.active_pane, dx, dy });
+        self.sync_size();
+        self.force_full = true;
+        self.window.request_redraw();
+    }
+
     /// A key press while the command palette is open: edit the filter, navigate, run, or close.
     fn palette_key(&mut self, event: &KeyEvent, mods: ModifiersState) {
+        // Current filtered length (ArrowDown clamp), computed before the mutable borrow below.
+        let filtered_len = self
+            .palette
+            .as_ref()
+            .map(|p| palette_items(&self.tab_names, &p.query).len())
+            .unwrap_or(0);
         let Some(p) = self.palette.as_mut() else { return };
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => self.palette = None,
             Key::Named(NamedKey::ArrowUp) => p.selected = p.selected.saturating_sub(1),
-            Key::Named(NamedKey::ArrowDown) => p.selected = p.selected.saturating_add(1),
+            Key::Named(NamedKey::ArrowDown) => {
+                p.selected = (p.selected + 1).min(filtered_len.saturating_sub(1));
+            }
             Key::Named(NamedKey::Backspace) => {
                 p.query.pop();
                 p.selected = 0;
@@ -1838,9 +1902,9 @@ impl State {
             }
             Key::Named(NamedKey::Enter) => {
                 let p = self.palette.take().unwrap();
-                // Same top-10 slice the renderer shows, so Enter always runs the highlighted row.
-                let items: Vec<_> =
-                    palette_items(&self.tab_names, &p.query).into_iter().take(10).collect();
+                // `selected` is an index into the FULL filtered list; the renderer windows the
+                // same list around it, so Enter always runs the highlighted row.
+                let items = palette_items(&self.tab_names, &p.query);
                 if let Some((_, _, cmd)) = items.get(p.selected.min(items.len().saturating_sub(1)))
                 {
                     match cmd.clone() {
@@ -2722,16 +2786,35 @@ impl State {
                     current: 0,
                     total: 0,
                 })
+            })
+            .or_else(|| {
+                // Transient notice ("exported to ..."), expiring lazily on the first redraw after
+                // 4s — non-modal, lowest band priority.
+                match &self.notice {
+                    Some((msg, at)) if at.elapsed() < Duration::from_secs(4) => Some(SearchBar {
+                        label: msg.clone(),
+                        query: String::new(),
+                        current: 0,
+                        total: 0,
+                    }),
+                    Some(_) => {
+                        self.notice = None;
+                        None
+                    }
+                    None => None,
+                }
             });
-        // Palette overlay: rebuild the filtered rows from the live query (top 10; the selection
-        // clamps to what's visible — no list scrolling in v1, ponytail).
+        // Palette overlay: rebuild the filtered rows from the live query and window 10 rows
+        // around the selection (the list scrolls with ArrowDown past the bottom).
         let palette_view = self.palette.as_ref().map(|p| {
             let items = palette_items(&self.tab_names, &p.query);
+            let sel = p.selected.min(items.len().saturating_sub(1));
+            let start = sel.saturating_sub(9);
             let visible: Vec<(String, String)> =
-                items.into_iter().take(10).map(|(l, h, _)| (l, h)).collect();
+                items.into_iter().skip(start).take(10).map(|(l, h, _)| (l, h)).collect();
             PaletteView {
                 query: p.query.clone(),
-                selected: p.selected.min(visible.len().saturating_sub(1)),
+                selected: sel - start,
                 items: visible,
             }
         });
@@ -3210,8 +3293,10 @@ mod tests {
         assert!(all.iter().any(|(l, _, c)| l == "split h" && matches!(c, PaletteCmd::Act(Action::SplitH))));
         assert!(!all.iter().any(|(l, _, _)| l == "command palette"), "palette excludes itself");
 
-        let filtered = palette_items(&tabs, "back");
-        assert_eq!(filtered.len(), 1, "only the backend tab matches 'back': {:?}", filtered.iter().map(|(l, _, _)| l).collect::<Vec<_>>());
+        // "back" also subsequence-matches "export scrollBACK" — tabs list first regardless.
+        let filtered = palette_items(&tabs, "backe");
+        assert_eq!(filtered.len(), 1, "only the backend tab matches 'backe': {:?}", filtered.iter().map(|(l, _, _)| l).collect::<Vec<_>>());
+        assert_eq!(filtered[0].0, "tab: backend");
     }
 
     /// OSC-8 merge: only http/https/mailto survive the scheme filter; a detected span that

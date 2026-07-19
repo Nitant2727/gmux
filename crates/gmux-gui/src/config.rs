@@ -44,6 +44,13 @@ pub enum Action {
     NextPrompt,
     /// Open the command palette (fuzzy action + tab switcher overlay).
     CommandPalette,
+    /// Write the active pane's full scrollback to a timestamped file in Downloads.
+    ExportScrollback,
+    /// Nudge the active pane's split divider by a small fraction (keyboard resize).
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
 }
 
 impl Action {
@@ -76,6 +83,11 @@ impl Action {
             "prev_prompt" => Action::PrevPrompt,
             "next_prompt" => Action::NextPrompt,
             "command_palette" => Action::CommandPalette,
+            "export_scrollback" => Action::ExportScrollback,
+            "resize_left" => Action::ResizeLeft,
+            "resize_right" => Action::ResizeRight,
+            "resize_up" => Action::ResizeUp,
+            "resize_down" => Action::ResizeDown,
             _ => return None,
         })
     }
@@ -116,6 +128,11 @@ const DEFAULTS: &[(&str, &str, Action)] = &[
     ("prev_prompt", "ctrl+up", Action::PrevPrompt),
     ("next_prompt", "ctrl+down", Action::NextPrompt),
     ("command_palette", "ctrl+shift+p", Action::CommandPalette),
+    ("export_scrollback", "ctrl+shift+s", Action::ExportScrollback),
+    ("resize_left", "alt+shift+left", Action::ResizeLeft),
+    ("resize_right", "alt+shift+right", Action::ResizeRight),
+    ("resize_up", "alt+shift+up", Action::ResizeUp),
+    ("resize_down", "alt+shift+down", Action::ResizeDown),
 ];
 
 #[derive(Debug, Default, Deserialize)]
