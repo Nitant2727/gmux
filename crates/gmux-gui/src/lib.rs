@@ -12,8 +12,10 @@ pub mod renderer;
 
 pub use app::run;
 pub use renderer::Renderer;
+// Attention is re-exported for the CLI's `gmux screenshot` (render_offscreen takes one).
+pub use gmux_mux::Attention;
 
-use gmux_mux::{Attention, PaneSnapshot};
+use gmux_mux::PaneSnapshot;
 
 fn align_up(v: u32, align: u32) -> u32 {
     v.div_ceil(align) * align

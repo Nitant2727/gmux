@@ -3145,8 +3145,9 @@ impl State {
     }
 }
 
-/// Reconstruct a [`PaneSnapshot`] from a wire grid.
-fn grid_to_snapshot(g: &GridWire) -> PaneSnapshot {
+/// Reconstruct a [`PaneSnapshot`] from a wire grid. `pub` for the CLI's `gmux screenshot`
+/// (grid fetch -> offscreen render -> image file).
+pub fn grid_to_snapshot(g: &GridWire) -> PaneSnapshot {
     let cols = g.cols as usize;
     let rows = g.rows as usize;
     let blank = Cell {
