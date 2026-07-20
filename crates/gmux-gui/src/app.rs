@@ -181,6 +181,12 @@ struct SidebarDrag {
     reordering: bool,
 }
 
+/// The pane id from a toast launch arg ("pane=5" -> 5); `None` for non-pane args ("welcome").
+/// Pure/tested.
+fn parse_activation_pane(arg: &str) -> Option<u64> {
+    arg.strip_prefix("pane=").and_then(|n| n.parse().ok())
+}
+
 /// Keyboard copy mode: a cell cursor the user drives with arrows/hjkl, an optional selection
 /// anchor (v), copy on y/Enter, exit on Escape. Coordinates are viewport cells of the active pane
 /// at its current scroll offset; scrolling shifts both so the marked CONTENT stays selected.
@@ -1221,12 +1227,18 @@ impl ApplicationHandler for App {
         // Toasts now ride the subscriber channel; fire the ones seen while unfocused.
         st.drain_toasts();
 
-        // A clicked toast focuses the window.
-        if let Some(nf) = &st.notifier {
-            if !nf.poll_activations().is_empty() {
-                st.window.focus_window();
-                st.clear_active_toast();
-                flash_window(st.hwnd, false);
+        // A clicked toast focuses the window AND lands on the pane that notified (its launch arg
+        // carries "pane=N"; FocusPaneId activates that pane's tab too). Most recent click wins.
+        let acts = st.notifier.as_ref().map(|nf| nf.poll_activations()).unwrap_or_default();
+        if !acts.is_empty() {
+            st.window.focus_window();
+            st.clear_active_toast();
+            flash_window(st.hwnd, false);
+            if let Some(pane) = acts.iter().rev().find_map(|a| parse_activation_pane(a)) {
+                st.client.control(Call::FocusPaneId { pane });
+                st.sync_size();
+                st.force_full = true;
+                st.window.request_redraw();
             }
         }
 
@@ -3572,6 +3584,14 @@ mod tests {
         assert_eq!(mouse_button_code(MouseButton::Middle), Some(1));
         assert_eq!(mouse_button_code(MouseButton::Right), Some(2));
         assert_eq!(mouse_button_code(MouseButton::Back), None);
+    }
+
+    /// Toast launch args: "pane=N" parses, anything else (the welcome toast) is None.
+    #[test]
+    fn activation_pane_parses() {
+        assert_eq!(parse_activation_pane("pane=5"), Some(5));
+        assert_eq!(parse_activation_pane("pane=x"), None);
+        assert_eq!(parse_activation_pane("welcome"), None);
     }
 
     /// Fuzzy filter: case-insensitive subsequence, whitespace in the needle ignored; palette items
