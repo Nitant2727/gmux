@@ -38,7 +38,7 @@ jobs:
           $stage = "gmux-${{ github.ref_name }}-windows-${{ matrix.label }}"
           New-Item -ItemType Directory $stage | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/gmux.exe" $stage/
-          Copy-Item README.md $stage/
+          Copy-Item README.md, LICENSE $stage/
           Compress-Archive -Path $stage -DestinationPath "$stage.zip"
       - name: Upload to release
         uses: softprops/action-gh-release@v2
