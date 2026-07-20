@@ -237,12 +237,38 @@ pub struct NotifyWire {
 
 /// A cell on the wire (compact; `flags` bit0 bold, bit1 italic, bit2 underline, bit3 inverse,
 /// bit4 wide).
+///
+/// Wire-size elision: `fg`/`bg`/`flags` are omitted when they equal the CANONICAL wire defaults
+/// below and restored by serde on decode — lossless for every value (a themed cell whose colors
+/// differ from the canonical constants simply serializes in full). On a default-palette text
+/// grid this cuts the per-cell JSON from ~55 to ~10 bytes (~80% of the 30fps grid traffic).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CellWire {
     pub ch: char,
+    #[serde(default = "wire_default_fg", skip_serializing_if = "is_wire_default_fg")]
     pub fg: [u8; 3],
+    #[serde(default = "wire_default_bg", skip_serializing_if = "is_wire_default_bg")]
     pub bg: [u8; 3],
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
     pub flags: u8,
+}
+
+/// Canonical wire default foreground (the built-in palette's fg) — the elision baseline.
+pub fn wire_default_fg() -> [u8; 3] {
+    [0xcc, 0xcc, 0xcc]
+}
+/// Canonical wire default background (the built-in palette's bg) — the elision baseline.
+pub fn wire_default_bg() -> [u8; 3] {
+    [0x11, 0x11, 0x11]
+}
+fn is_wire_default_fg(v: &[u8; 3]) -> bool {
+    *v == wire_default_fg()
+}
+fn is_wire_default_bg(v: &[u8; 3]) -> bool {
+    *v == wire_default_bg()
+}
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
 }
 
 pub const CELL_BOLD: u8 = 1;
@@ -698,6 +724,22 @@ mod tests {
         assert!(String::from_utf8(buf.clone()).unwrap().contains("\"matches\""));
         let back: Response = read_msg(&mut Cursor::new(buf)).unwrap().unwrap();
         assert_eq!(back, resp);
+    }
+
+    /// Cell elision: default-palette cells shed fg/bg/flags on the wire and restore losslessly;
+    /// non-default cells roundtrip in full; the default-cell encoding stays under 15 bytes
+    /// (~4x smaller than the un-elided ~55 — the 30fps grid traffic win).
+    #[test]
+    fn cell_elision_is_lossless_and_small() {
+        let plain = CellWire { ch: 'x', fg: wire_default_fg(), bg: wire_default_bg(), flags: 0 };
+        let s = serde_json::to_string(&plain).unwrap();
+        assert!(s.len() <= 15, "default cell should elide fg/bg/flags: {s}");
+        assert_eq!(serde_json::from_str::<CellWire>(&s).unwrap(), plain, "lossless restore");
+
+        let themed = CellWire { ch: 'y', fg: [1, 2, 3], bg: [4, 5, 6], flags: CELL_BOLD };
+        let s = serde_json::to_string(&themed).unwrap();
+        assert!(s.contains("fg") && s.contains("bg") && s.contains("flags"), "non-default serializes fully: {s}");
+        assert_eq!(serde_json::from_str::<CellWire>(&s).unwrap(), themed);
     }
 
     #[test]
