@@ -214,9 +214,10 @@ fn fuzzy_match(hay: &str, needle: &str) -> bool {
         .all(|n| h.any(|c| c == n))
 }
 
-/// Build the palette's filtered item list: every default-bound action ("split h" style labels,
-/// chord hints) plus a "tab: NAME" entry per sidebar tab. Pure/tested.
-fn palette_items(tab_names: &[String], query: &str) -> Vec<(String, String, PaletteCmd)> {
+/// Build the palette's filtered item list: recently-run actions first, then every "tab: NAME"
+/// entry, then the remaining default-bound actions ("split h" style labels, chord hints).
+/// Pure/tested.
+fn palette_items(tab_names: &[String], query: &str, recents: &[String]) -> Vec<(String, String, PaletteCmd)> {
     let mut out: Vec<(String, String, PaletteCmd)> = Vec::new();
     for (i, name) in tab_names.iter().enumerate() {
         let label = format!("tab: {name}");
@@ -234,6 +235,8 @@ fn palette_items(tab_names: &[String], query: &str) -> Vec<(String, String, Pale
             out.push((label, chord.to_string(), PaletteCmd::Act(*action)));
         }
     }
+    // Recency-first, stable: a label's position in `recents` (most-recent first) wins.
+    out.sort_by_key(|(label, _, _)| recents.iter().position(|r| r == label).unwrap_or(usize::MAX));
     out
 }
 
@@ -669,6 +672,10 @@ struct State {
     palette: Option<PaletteState>,
     /// Keyboard copy mode (Ctrl+Shift+M), or `None`.
     copy_mode: Option<CopyModeState>,
+    /// Last divider press `(pane, when)` — a second press within `CLICK_INTERVAL` equalizes.
+    last_divider_click: Option<(u64, Instant)>,
+    /// Recently-run palette action labels, most-recent first (cap 5) — ordered first in the list.
+    palette_recent: Vec<String>,
     /// A transient status line (e.g. "exported to ...") shown in the bottom band until it expires
     /// on a later redraw. Non-modal: it intercepts nothing.
     notice: Option<(String, Instant)>,
@@ -838,6 +845,8 @@ impl ApplicationHandler for App {
             confirm_close: None,
             palette: None,
             copy_mode: None,
+            last_divider_click: None,
+            palette_recent: Vec::new(),
             notice: None,
             hover_link: None,
             focus_follows_mouse: user_config.focus_follows_mouse.unwrap_or(false),
@@ -1629,9 +1638,27 @@ impl State {
         }
         // Content area: cached rects are in content-area coords, so shift the click by the sidebar.
         let content_x = cx - sidebar_w as f64;
-        // A split gap starts a drag-resize instead of a selection/focus.
+        // A split gap starts a drag-resize instead of a selection/focus. A DOUBLE-click on the
+        // same divider equalizes it to 50/50: clamp(r+10)=0.9 then -0.4 lands exactly 0.5 from
+        // any starting ratio — two existing resize-split calls, no new protocol (ponytail; the
+        // intermediate 0.9 is never rendered, both apply before the next layout fetch).
         if let Some(d) = divider_at(&self.last_panes, content_x as f32, cy as f32, GAP + 2.0) {
             self.clear_selection();
+            let now = Instant::now();
+            if matches!(self.last_divider_click, Some((p, at)) if p == d.pane && now.duration_since(at) < CLICK_INTERVAL)
+            {
+                self.last_divider_click = None;
+                self.drag = None;
+                let (bx, sx) = if d.vertical { (10.0, -0.4) } else { (0.0, 0.0) };
+                let (by, sy) = if d.vertical { (0.0, 0.0) } else { (10.0, -0.4) };
+                self.client.control(Call::ResizeSplit { pane: d.pane, dx: bx, dy: by });
+                self.client.control(Call::ResizeSplit { pane: d.pane, dx: sx, dy: sy });
+                self.sync_size();
+                self.force_full = true;
+                self.window.request_redraw();
+                return;
+            }
+            self.last_divider_click = Some((d.pane, now));
             self.drag = Some(Drag {
                 pane: d.pane,
                 vertical: d.vertical,
@@ -2055,7 +2082,7 @@ impl State {
         let filtered_len = self
             .palette
             .as_ref()
-            .map(|p| palette_items(&self.tab_names, &p.query).len())
+            .map(|p| palette_items(&self.tab_names, &p.query, &self.palette_recent).len())
             .unwrap_or(0);
         let Some(p) = self.palette.as_mut() else { return };
         match &event.logical_key {
@@ -2076,11 +2103,19 @@ impl State {
                 let p = self.palette.take().unwrap();
                 // `selected` is an index into the FULL filtered list; the renderer windows the
                 // same list around it, so Enter always runs the highlighted row.
-                let items = palette_items(&self.tab_names, &p.query);
-                if let Some((_, _, cmd)) = items.get(p.selected.min(items.len().saturating_sub(1)))
+                let items = palette_items(&self.tab_names, &p.query, &self.palette_recent);
+                if let Some((label, _, cmd)) =
+                    items.get(p.selected.min(items.len().saturating_sub(1)))
                 {
-                    match cmd.clone() {
-                        PaletteCmd::Act(a) => self.dispatch(a),
+                    let (label, cmd) = (label.clone(), cmd.clone());
+                    match cmd {
+                        PaletteCmd::Act(a) => {
+                            // Remember action runs (not tabs — those churn) for recency ordering.
+                            self.palette_recent.retain(|r| *r != label);
+                            self.palette_recent.insert(0, label);
+                            self.palette_recent.truncate(5);
+                            self.dispatch(a);
+                        }
                         PaletteCmd::Tab(i) => {
                             self.client.control(Call::SelectWindow { index: i });
                             self.sync_size();
@@ -3013,7 +3048,7 @@ impl State {
         // Palette overlay: rebuild the filtered rows from the live query and window 10 rows
         // around the selection (the list scrolls with ArrowDown past the bottom).
         let palette_view = self.palette.as_ref().map(|p| {
-            let items = palette_items(&self.tab_names, &p.query);
+            let items = palette_items(&self.tab_names, &p.query, &self.palette_recent);
             let sel = p.selected.min(items.len().saturating_sub(1));
             let start = sel.saturating_sub(9);
             let visible: Vec<(String, String)> =
@@ -3494,13 +3529,13 @@ mod tests {
         assert!(fuzzy_match("anything", ""));
 
         let tabs = vec!["backend".to_string(), "web".to_string()];
-        let all = palette_items(&tabs, "");
+        let all = palette_items(&tabs, "", &[]);
         assert!(all.iter().any(|(l, h, _)| l == "tab: backend" && h == "alt+1"));
         assert!(all.iter().any(|(l, _, c)| l == "split h" && matches!(c, PaletteCmd::Act(Action::SplitH))));
         assert!(!all.iter().any(|(l, _, _)| l == "command palette"), "palette excludes itself");
 
         // "back" also subsequence-matches "export scrollBACK" — tabs list first regardless.
-        let filtered = palette_items(&tabs, "backe");
+        let filtered = palette_items(&tabs, "backe", &[]);
         assert_eq!(filtered.len(), 1, "only the backend tab matches 'backe': {:?}", filtered.iter().map(|(l, _, _)| l).collect::<Vec<_>>());
         assert_eq!(filtered[0].0, "tab: backend");
     }
