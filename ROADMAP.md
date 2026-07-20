@@ -1,5 +1,12 @@
 # gmux — Roadmap
 
+> **Status (2026-07-21): all milestones M0–M12 complete; v0.1.0 released** (portable x64 + ARM64
+> zips via the tag-driven release workflow). Post-milestone development ran as 27 iteration
+> rounds — search, hyperlinks, IME, mouse reporting, per-pane scrollback, zoom, palette, copy
+> mode, prompt jump, OSC 52, busy-close guard, `wait-for`/`screenshot` CLI, an 80% wire-traffic
+> cut, and the two deepest bug fixes (the Subscribe push deadlock; ConPTY zombie panes). Open
+> items live in [PARKED.md](PARKED.md).
+
 > Milestones build vertically: each ends with a runnable build, a demo script, and tests.
 > Numbers are sequencing, not calendar promises. The notification hooks are front-loaded by design —
 > M0 proves them end-to-end before any product code, and M2 productizes them right after the terminal
