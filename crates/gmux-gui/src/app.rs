@@ -676,6 +676,9 @@ struct State {
     last_divider_click: Option<(u64, Instant)>,
     /// Recently-run palette action labels, most-recent first (cap 5) — ordered first in the list.
     palette_recent: Vec<String>,
+    /// First visible sidebar row (tab overflow scrolling; wheel over the sidebar adjusts it).
+    /// Clamped each render to the tab count and the rows that fit.
+    sidebar_scroll: usize,
     /// A transient status line (e.g. "exported to ...") shown in the bottom band until it expires
     /// on a later redraw. Non-modal: it intercepts nothing.
     notice: Option<(String, Instant)>,
@@ -847,6 +850,7 @@ impl ApplicationHandler for App {
             copy_mode: None,
             last_divider_click: None,
             palette_recent: Vec::new(),
+            sidebar_scroll: 0,
             notice: None,
             hover_link: None,
             focus_follows_mouse: user_config.focus_follows_mouse.unwrap_or(false),
@@ -1072,6 +1076,19 @@ impl ApplicationHandler for App {
                         MouseScrollDelta::LineDelta(_, y) => (y * 3.0).round() as i64,
                         MouseScrollDelta::PixelDelta(p) => (p.y / st.cell_dims().1 as f64).round() as i64,
                     };
+                    // Wheel over the sidebar scrolls the tab list (overflow), not a pane.
+                    let (cx, _) = st.cursor;
+                    let (sidebar_w, _, _) = st.areas();
+                    if cx >= 0.0 && (cx as u32) < sidebar_w {
+                        let step = lines.unsigned_abs() as usize;
+                        st.sidebar_scroll = if lines > 0 {
+                            st.sidebar_scroll.saturating_sub(step)
+                        } else {
+                            st.sidebar_scroll.saturating_add(step) // clamped next render
+                        };
+                        st.window.request_redraw();
+                        return;
+                    }
                     let target = st.pane_under_cursor();
                     st.scroll_by(target, lines);
                 }
@@ -1614,12 +1631,14 @@ impl State {
         if px < sidebar_w {
             self.clear_selection();
             // The '+' new-tab row sits after the last workspace row, so test it first.
-            if self.renderer.sidebar_new_tab_at(cy as f32, self.tab_count) {
+            let visible = self.sidebar_window().1;
+            if self.renderer.sidebar_new_tab_at(cy as f32, visible) {
                 self.set_scroll(self.active_pane, 0);
                 self.client.control(Call::NewWindow { command: None });
                 self.sync_size();
                 self.window.request_redraw();
-            } else if let Some(idx) = self.renderer.sidebar_row_at(cy as f32, self.tab_count) {
+            } else if let Some(vi) = self.renderer.sidebar_row_at(cy as f32, visible) {
+                let idx = self.real_tab(vi);
                 // A second click on the same row within CLICK_INTERVAL starts renaming that tab.
                 let now = Instant::now();
                 let dbl = sidebar_double_click(self.last_sidebar_click, idx, now);
@@ -1803,7 +1822,11 @@ impl State {
         self.scrollbar_drag = false;
         if let Some(sd) = self.sidebar_drag.take() {
             if sd.reordering {
-                let target = self.renderer.sidebar_row_at(self.cursor.1 as f32, self.tab_count);
+                let visible = self.sidebar_window().1;
+                let target = self
+                    .renderer
+                    .sidebar_row_at(self.cursor.1 as f32, visible)
+                    .map(|vi| self.real_tab(vi));
                 if let Some(to) = target {
                     if to != sd.from_row {
                         self.client.control(Call::MoveWindow { from: sd.from_row, to });
@@ -2372,6 +2395,24 @@ impl State {
         (self.renderer.cell_w().max(1), self.renderer.cell_h().max(1))
     }
 
+    /// Sidebar overflow window: `(first_visible_row, visible_count)`, clamped to the tab count
+    /// and the rows that fit. ponytail: mirrors the renderer's sidebar metrics (16px pad +
+    /// label row, 48px rows + 4px gaps = 52 stride, one slot reserved for '+ new tab') — the
+    /// same deliberate constant duplication the row hit-test already documents.
+    fn sidebar_window(&self) -> (usize, usize) {
+        let stride = 52.0_f32;
+        let top = 24.0 + self.renderer.cell_h() as f32;
+        let usable = (self.config.height as f32 - top - stride).max(stride);
+        let cap = ((usable / stride) as usize).max(1);
+        let max_off = self.tab_count.saturating_sub(cap);
+        (self.sidebar_scroll.min(max_off), cap.min(self.tab_count.saturating_sub(self.sidebar_scroll.min(max_off))))
+    }
+
+    /// Map a VISIBLE sidebar row index (renderer hit-test) to the real tab index.
+    fn real_tab(&self, visible_idx: usize) -> usize {
+        visible_idx + self.sidebar_window().0
+    }
+
     /// Whether the cursor sits on the active pane's search band (the bottom `SEARCH_BAR` strip the
     /// renderer draws while searching, plus the margin/border sliver below it — clicks there hit
     /// nothing anyway).
@@ -2470,7 +2511,13 @@ impl State {
         if (cx as u32) >= sidebar_w {
             return false;
         }
-        match self.renderer.sidebar_row_at(cy as f32, self.tab_count).and_then(|i| self.tab_ids.get(i)) {
+        let visible = self.sidebar_window().1;
+        match self
+            .renderer
+            .sidebar_row_at(cy as f32, visible)
+            .map(|vi| self.real_tab(vi))
+            .and_then(|i| self.tab_ids.get(i))
+        {
             Some(&win) => {
                 // By stable id: a window removed daemon-side since the last render shifts the
                 // indices, but never re-targets an id (ids are never reused — a stale id no-ops).
@@ -2825,6 +2872,13 @@ impl State {
                     SidebarRow { name, branch: t.branch.clone(), attention: t.attention, active: t.active, progress: t.progress, progress_error: t.progress_error, hover: false }
                 })
                 .collect();
+            // Tab overflow: window the rows to what fits (wheel over the sidebar scrolls). The
+            // clamp also heals a stale offset after tabs close.
+            let (off, cap) = self.sidebar_window();
+            self.sidebar_scroll = off;
+            if off > 0 || rows.len() > cap {
+                rows = rows.into_iter().skip(off).take(cap).collect();
+            }
 
             // Update the taskbar attention badge / progress based on overall attention.
             if let Some(tb) = &self.taskbar {
@@ -2969,12 +3023,13 @@ impl State {
         let (cx, cy) = self.cursor;
         let mut plus_hover = false;
         if cx >= 0.0 && (cx as u32) < sidebar_w {
-            if let Some(hi) = self.renderer.sidebar_row_at(cy as f32, self.tab_count) {
+            // Rows are already windowed, so the hit-test's visual index maps 1:1.
+            if let Some(hi) = self.renderer.sidebar_row_at(cy as f32, rows.len()) {
                 if let Some(row) = rows.get_mut(hi) {
                     row.hover = true;
                 }
             }
-            plus_hover = self.renderer.sidebar_new_tab_at(cy as f32, self.tab_count);
+            plus_hover = self.renderer.sidebar_new_tab_at(cy as f32, rows.len());
         }
         // Search bar shows a 1-based "current/total" (renderer renders the numbers as-is). A
         // pending close confirmation reuses the same band as a pure prompt (label only) — search
