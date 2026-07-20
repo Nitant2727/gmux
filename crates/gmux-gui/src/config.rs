@@ -46,6 +46,8 @@ pub enum Action {
     CommandPalette,
     /// Write the active pane's full scrollback to a timestamped file in Downloads.
     ExportScrollback,
+    /// Enter keyboard copy mode (move with arrows/hjkl, mark with v, copy with y/Enter).
+    CopyMode,
     /// Nudge the active pane's split divider by a small fraction (keyboard resize).
     ResizeLeft,
     ResizeRight,
@@ -84,6 +86,7 @@ impl Action {
             "next_prompt" => Action::NextPrompt,
             "command_palette" => Action::CommandPalette,
             "export_scrollback" => Action::ExportScrollback,
+            "copy_mode" => Action::CopyMode,
             "resize_left" => Action::ResizeLeft,
             "resize_right" => Action::ResizeRight,
             "resize_up" => Action::ResizeUp,
@@ -129,6 +132,7 @@ const DEFAULTS: &[(&str, &str, Action)] = &[
     ("next_prompt", "ctrl+down", Action::NextPrompt),
     ("command_palette", "ctrl+shift+p", Action::CommandPalette),
     ("export_scrollback", "ctrl+shift+s", Action::ExportScrollback),
+    ("copy_mode", "ctrl+shift+m", Action::CopyMode),
     ("resize_left", "alt+shift+left", Action::ResizeLeft),
     ("resize_right", "alt+shift+right", Action::ResizeRight),
     ("resize_up", "alt+shift+up", Action::ResizeUp),

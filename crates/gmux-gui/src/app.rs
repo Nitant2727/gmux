@@ -181,6 +181,14 @@ struct SidebarDrag {
     reordering: bool,
 }
 
+/// Keyboard copy mode: a cell cursor the user drives with arrows/hjkl, an optional selection
+/// anchor (v), copy on y/Enter, exit on Escape. Coordinates are viewport cells of the active pane
+/// at its current scroll offset; scrolling shifts both so the marked CONTENT stays selected.
+struct CopyModeState {
+    cursor: (u16, u16),
+    anchor: Option<(u16, u16)>,
+}
+
 /// The open command palette: a typed filter and the highlighted row. The item list itself is
 /// rebuilt from the query on every keystroke/render (stateless — tabs can change under it).
 struct PaletteState {
@@ -659,6 +667,8 @@ struct State {
     confirm_close: Option<ConfirmClose>,
     /// The command palette overlay (Ctrl+Shift+P), or `None`.
     palette: Option<PaletteState>,
+    /// Keyboard copy mode (Ctrl+Shift+M), or `None`.
+    copy_mode: Option<CopyModeState>,
     /// A transient status line (e.g. "exported to ...") shown in the bottom band until it expires
     /// on a later redraw. Non-modal: it intercepts nothing.
     notice: Option<(String, Instant)>,
@@ -827,6 +837,7 @@ impl ApplicationHandler for App {
             preedit: None,
             confirm_close: None,
             palette: None,
+            copy_mode: None,
             notice: None,
             hover_link: None,
             focus_follows_mouse: user_config.focus_follows_mouse.unwrap_or(false),
@@ -1068,6 +1079,14 @@ impl ApplicationHandler for App {
                         return;
                     }
                 }
+                // Copy mode intercepts every key: arrows/hjkl move, v marks, y/Enter copies,
+                // Escape exits.
+                if let Some(st) = self.state.as_mut() {
+                    if st.copy_mode.is_some() {
+                        st.copy_mode_key(&event);
+                        return;
+                    }
+                }
                 // A pending close confirmation intercepts first: Enter proceeds with the close,
                 // ANY other key (incl. Escape) cancels — safe-by-default for a destructive act.
                 if let Some(st) = self.state.as_mut() {
@@ -1303,7 +1322,25 @@ impl State {
                 self.search = None;
                 self.rename = None;
                 self.confirm_close = None;
+                self.copy_mode = None;
                 self.palette = Some(PaletteState { query: String::new(), selected: 0 });
+                self.window.request_redraw();
+            }
+            Action::CopyMode => {
+                self.search = None;
+                self.rename = None;
+                self.confirm_close = None;
+                self.palette = None;
+                // Start at the active pane's live cursor (fall back to origin).
+                let cur = self
+                    .snap_cache
+                    .get(&self.active_pane)
+                    .map(|s| (s.cursor.0.min(s.cols.saturating_sub(1)), s.cursor.1.min(s.rows.saturating_sub(1))))
+                    .unwrap_or((0, 0));
+                self.copy_mode = Some(CopyModeState { cursor: cur, anchor: None });
+                // The existing selection highlight doubles as the mode's cell cursor.
+                self.selection =
+                    Some(Selection { pane: self.active_pane, start: cur, end: cur });
                 self.window.request_redraw();
             }
             Action::PrevPrompt => self.prompt_jump(true),
@@ -1846,6 +1883,88 @@ impl State {
         self.search = None;
         self.set_scroll(self.active_pane, 0);
         self.force_full = true; // refetch the active pane at the live tail
+        self.window.request_redraw();
+    }
+
+    /// A key press in copy mode. Movement clamps to the active pane's grid; PageUp/PageDown
+    /// scroll the viewport while shifting the marks so the selected CONTENT stays put.
+    fn copy_mode_key(&mut self, event: &KeyEvent) {
+        let (cols, rows) = self
+            .snap_cache
+            .get(&self.active_pane)
+            .map(|s| (s.cols.max(1), s.rows.max(1)))
+            .unwrap_or((1, 1));
+        let Some(cm) = self.copy_mode.as_mut() else { return };
+        let step = |c: &mut (u16, u16), dx: i32, dy: i32| {
+            c.0 = (c.0 as i32 + dx).clamp(0, cols as i32 - 1) as u16;
+            c.1 = (c.1 as i32 + dy).clamp(0, rows as i32 - 1) as u16;
+        };
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                self.copy_mode = None;
+                self.clear_selection();
+                return;
+            }
+            Key::Named(NamedKey::Enter) => {
+                self.copy_selection();
+                self.copy_mode = None;
+                self.clear_selection();
+                self.notice = Some(("copied".into(), Instant::now()));
+                self.window.request_redraw();
+                return;
+            }
+            Key::Named(NamedKey::ArrowLeft) => step(&mut cm.cursor, -1, 0),
+            Key::Named(NamedKey::ArrowRight) => step(&mut cm.cursor, 1, 0),
+            Key::Named(NamedKey::ArrowUp) => step(&mut cm.cursor, 0, -1),
+            Key::Named(NamedKey::ArrowDown) => step(&mut cm.cursor, 0, 1),
+            Key::Named(NamedKey::Home) => cm.cursor.0 = 0,
+            Key::Named(NamedKey::End) => cm.cursor.0 = cols - 1,
+            Key::Named(NamedKey::PageUp | NamedKey::PageDown) => {
+                // Scroll a page and shift the marks by the ACTUAL offset delta so the marked
+                // content stays selected (viewport-relative coords, content-stable semantics).
+                let up = matches!(&event.logical_key, Key::Named(NamedKey::PageUp));
+                let page = rows.saturating_sub(1) as i64;
+                let before = self.scroll_of(self.active_pane) as i64;
+                let pane = self.active_pane;
+                self.scroll_by(pane, if up { page } else { -page });
+                let delta = (self.scroll_of(pane) as i64 - before) as i32; // + = scrolled up
+                let Some(cm) = self.copy_mode.as_mut() else { return };
+                let shift = |c: &mut (u16, u16)| {
+                    c.1 = (c.1 as i32 + delta).clamp(0, rows as i32 - 1) as u16;
+                };
+                shift(&mut cm.cursor);
+                if let Some(a) = cm.anchor.as_mut() {
+                    shift(a);
+                }
+            }
+            Key::Character(t) => match t.as_str() {
+                "h" => step(&mut cm.cursor, -1, 0),
+                "l" => step(&mut cm.cursor, 1, 0),
+                "k" => step(&mut cm.cursor, 0, -1),
+                "j" => step(&mut cm.cursor, 0, 1),
+                "v" => cm.anchor = if cm.anchor.is_some() { None } else { Some(cm.cursor) },
+                "y" => {
+                    self.copy_selection();
+                    self.copy_mode = None;
+                    self.clear_selection();
+                    self.notice = Some(("copied".into(), Instant::now()));
+                    self.window.request_redraw();
+                    return;
+                }
+                _ => {}
+            },
+            _ => return, // bare modifiers etc.: no state change, no redraw
+        }
+        // Mirror the mode's cursor/anchor into the selection highlight (single cell = the cursor).
+        let (cursor, anchor) = {
+            let cm = self.copy_mode.as_ref().unwrap();
+            (cm.cursor, cm.anchor)
+        };
+        self.selection = Some(Selection {
+            pane: self.active_pane,
+            start: anchor.unwrap_or(cursor),
+            end: cursor,
+        });
         self.window.request_redraw();
     }
 
@@ -2842,6 +2961,19 @@ impl State {
                         ConfirmClose::Window(_) => {
                             "tab has busy panes — Enter closes it, Esc keeps it".into()
                         }
+                    },
+                    query: String::new(),
+                    current: 0,
+                    total: 0,
+                    overlay_only: true,
+                })
+            })
+            .or_else(|| {
+                self.copy_mode.as_ref().map(|cm| SearchBar {
+                    label: if cm.anchor.is_some() {
+                        "copy mode — y/Enter copies the selection · Esc exits".into()
+                    } else {
+                        "copy mode — arrows/hjkl move · v marks · Esc exits".into()
                     },
                     query: String::new(),
                     current: 0,
