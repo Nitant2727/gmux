@@ -168,10 +168,74 @@ fn subscribe(output: bool) -> i32 {
     }
 }
 
+/// `gmux wait-for -t <pane> (--text <substr> | --exit | --idle <secs>) [--timeout <secs>]` —
+/// block until the condition holds. The orchestrator primitive: gate a script on an agent's
+/// output appearing, its pane closing, or its screen going quiet. Polls the existing API every
+/// 400ms (search-pane / capture-pane) — no daemon support needed. Exit codes: 0 condition met,
+/// 1 timeout or daemon unreachable, 2 usage.
+fn wait_for(args: &[String]) -> i32 {
+    use std::time::{Duration, Instant};
+    let get = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1));
+    let pane = get("-t").and_then(|s| parse_pane(s));
+    let text = get("--text").cloned();
+    let idle = get("--idle").and_then(|s| s.parse::<f64>().ok());
+    let wants_exit = args.iter().any(|a| a == "--exit");
+    let timeout = get("--timeout").and_then(|s| s.parse::<f64>().ok());
+    let modes = [text.is_some(), wants_exit, idle.is_some()].iter().filter(|b| **b).count();
+    let (Some(pane), 1) = (pane, modes) else {
+        eprintln!("usage: gmux wait-for -t <pane> (--text <substr> | --exit | --idle <secs>) [--timeout <secs>]");
+        return 2;
+    };
+    let deadline = timeout.map(|s| Instant::now() + Duration::from_secs_f64(s));
+    // Idle detection: the visible screen text unchanged for the requested window. ponytail:
+    // screen-content compare, not an output-event stream — survives daemon reconnects and needs
+    // no protocol; a repainting-but-static TUI reads as idle, which is the useful answer anyway.
+    let mut last_screen: Option<String> = None;
+    let mut quiet_since = Instant::now();
+    loop {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return 1;
+        }
+        if let Some(q) = &text {
+            match call(Call::SearchPane { pane, query: q.clone() }) {
+                Ok(r) if matches!(r.result, Some(ResultBody::Matches(ref m)) if !m.is_empty()) => {
+                    return 0;
+                }
+                Ok(r) if r.error.is_some() => return 1, // pane gone
+                Ok(_) => {}
+                Err(_) => return 1,
+            }
+        } else if wants_exit {
+            match call(Call::CapturePane { pane, scrollback: None }) {
+                Ok(r) if r.error.is_some() => return 0, // no such pane: it exited
+                Ok(_) => {}
+                Err(_) => return 0, // daemon gone entirely counts as exited
+            }
+        } else {
+            match call(Call::CapturePane { pane, scrollback: None }) {
+                Ok(r) => match r.result {
+                    Some(ResultBody::Text(t)) => {
+                        if last_screen.as_deref() != Some(t.as_str()) {
+                            last_screen = Some(t);
+                            quiet_since = Instant::now();
+                        } else if quiet_since.elapsed() >= Duration::from_secs_f64(idle.unwrap()) {
+                            return 0;
+                        }
+                    }
+                    _ => return 1, // pane gone while waiting for idle
+                },
+                Err(_) => return 1,
+            }
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    }
+}
+
 /// Entry: dispatch `gmux <subcommand> ...` API calls. Returns an exit code.
 pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
     match cmd {
         "list-panes" => Some(run(Call::ListPanes)),
+        "wait-for" => Some(wait_for(args)),
         "subscribe" => Some(subscribe(args.iter().any(|a| a == "--output"))),
         "hello" => Some(run(Call::Hello { client_version: env!("CARGO_PKG_VERSION").into() })),
         "send-keys" => {

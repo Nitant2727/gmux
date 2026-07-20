@@ -51,6 +51,37 @@ fn injects_gmux_pane_env() {
 
 #[test]
 #[ignore = "requires a real console; run via scripts/console-tests.ps1 gmux-mux pane"]
+fn typed_command_executes_in_first_and_later_panes() {
+    // Regression (round 23): interactive input — a written command line must EXECUTE (CR
+    // submits), and it must work for panes spawned at any point, not just the process's first
+    // (the daemon bug hid because every probe targeted pane %0).
+    let run = |pane: &Pane, marker: &str| {
+        // Wait for an interactive prompt, then type an echo and press Enter.
+        assert!(
+            wait_until(Duration::from_secs(8), || {
+                snapshot_text(pane).iter().any(|l| l.ends_with('>'))
+            }),
+            "no cmd prompt appeared: {:?}",
+            snapshot_text(pane)
+        );
+        pane.write(format!("echo {marker}\r").as_bytes()).unwrap();
+        // The OUTPUT line is the marker alone; the echoed input line contains "echo ".
+        assert!(
+            wait_until(Duration::from_secs(8), || {
+                snapshot_text(pane).iter().any(|l| l.trim() == marker)
+            }),
+            "typed command did not execute: {:?}",
+            snapshot_text(pane)
+        );
+    };
+    let first = Pane::spawn("cmd.exe", PtySize { cols: 120, rows: 30 }).unwrap();
+    run(&first, "typed-exec-first");
+    let later = Pane::spawn("cmd.exe", PtySize { cols: 120, rows: 30 }).unwrap();
+    run(&later, "typed-exec-later");
+}
+
+#[test]
+#[ignore = "requires a real console; run via scripts/console-tests.ps1 gmux-mux pane"]
 fn osc9_sets_attention_and_emits_event() {
     let cmd = r#"powershell -NoProfile -Command "[Console]::Out.Write([char]27 + ']9;agent needs input' + [char]7); Start-Sleep -Milliseconds 500""#;
     let pane = Pane::spawn(cmd, PtySize { cols: 120, rows: 30 }).unwrap();

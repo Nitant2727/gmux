@@ -156,6 +156,18 @@ impl Server {
                 }
             }
         }
+        // Liveness sweep: ConPTY never EOFs its output pipe when the child exits (conhost holds
+        // it until ClosePseudoConsole), so a typed `exit` produces no pump-EOF Exited event — the
+        // pane would zombie (frozen screen, input acked into a dead console). Poll the process
+        // handle and fold dead panes into the same exit path.
+        for w in self.session.windows() {
+            for p in w.panes() {
+                if !p.is_alive() && !exited.contains(&p.id) {
+                    exited.push(p.id);
+                }
+            }
+        }
+
         // The push batch is the notifications plus a synthetic wire per exit and per damaged pane,
         // plus any clipboard-set wires; subscribers see them all. `pane-output` wires are push-only
         // (never queued for PollNotifications) and are filtered back out for subscribers that didn't
