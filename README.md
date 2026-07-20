@@ -63,6 +63,8 @@ Rebindable in `%APPDATA%\gmux\gmux.json` (`Ctrl+,` opens it; see the generated t
 | `Ctrl+=` / `Ctrl+-` / `Ctrl+0`, `Ctrl+wheel` | Font zoom |
 | `Ctrl+Shift+S` | Export the pane's scrollback to Downloads |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V`, right-click | Copy selection / paste |
+| `Ctrl+Shift+M` | Copy mode (arrows/hjkl move, `v` marks, `y` copies, Esc exits) |
+| Double-click a divider | Equalize the split to 50/50 |
 | Double-click / triple-click | Select word / line |
 | `Ctrl+click` | Open the underlined URL/hyperlink (hover shows the real target) |
 | Double-click a tab | Rename it (persists across restarts) |
