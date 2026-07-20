@@ -45,6 +45,12 @@ No open-source, Windows-native, non-Electron terminal today does all of this at 
 3. **Native tmux-style multiplexing** — sessions, splits, detach/reattach, restore.
 4. **Programmability** — CLI + named-pipe API for agents and scripts.
 
+## Install / build
+
+Portable, no installer: `scripts/package.ps1` builds `dist\gmux-<version>-x64.zip` (gmux.exe +
+docs) — unzip anywhere and run `gmux.exe`. Or build from source: `cargo build --release -p gmux`.
+The binary is currently unsigned (SmartScreen may prompt on first run of a downloaded copy).
+
 ## Default keybindings
 
 Rebindable in `%APPDATA%\gmux\gmux.json` (`Ctrl+,` opens it; see the generated template for names).
@@ -80,4 +86,4 @@ GPU glyph rendering, no Electron in the terminal grid.
 
 ## License
 
-MIT (planned). gmux studies cmux's behavior only — cmux is GPL-3.0 and no code is copied.
+MIT (see [LICENSE](LICENSE)). gmux studies cmux's behavior only — cmux is GPL-3.0 and no code is copied.
