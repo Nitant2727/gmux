@@ -231,11 +231,92 @@ fn wait_for(args: &[String]) -> i32 {
     }
 }
 
+/// `gmux screenshot -t <pane> [-o <file.bmp>]` — fetch the pane's live grid and render it to a
+/// BMP via the GUI crate's headless offscreen renderer (same GPU path the windowed app uses).
+/// ponytail: BMP, not PNG — zero dependencies, opens everywhere; swap in a PNG encoder the day a
+/// dep is worth it. Exit codes: 0 written, 1 daemon/render failure, 2 usage.
+fn screenshot(args: &[String]) -> i32 {
+    let get = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1));
+    let Some(pane) = get("-t").and_then(|s| parse_pane(s)) else {
+        eprintln!("usage: gmux screenshot -t <pane> [-o <file.bmp>]");
+        return 2;
+    };
+    let out = get("-o").cloned().unwrap_or_else(|| format!("gmux-pane{pane}.bmp"));
+    let grid = match call(Call::GetGrid { pane, offset: 0 }) {
+        Ok(r) => match r.result {
+            Some(ResultBody::Grid(g)) => g,
+            _ => {
+                eprintln!("gmux: {}", r.error.unwrap_or_else(|| "no grid".into()));
+                return 1;
+            }
+        },
+        Err(e) => {
+            eprintln!("gmux: {e}");
+            return 1;
+        }
+    };
+    let snap = gmux_gui::app::grid_to_snapshot(&grid);
+    // ponytail: 12x24 is a safe upper bound on the 18px-font cell — the render fills cells from
+    // the top-left and any excess is background margin, which beats clipping.
+    let (px_w, px_h) = (snap.cols as u32 * 12, snap.rows as u32 * 24);
+    let Some((w, h, rgba)) = gmux_gui::render_offscreen(
+        &snap,
+        gmux_gui::Attention::Quiet,
+        px_w.max(1),
+        px_h.max(1),
+    ) else {
+        eprintln!("gmux: no GPU adapter available for offscreen rendering");
+        return 1;
+    };
+    match write_bmp(&out, w, h, &rgba) {
+        Ok(()) => {
+            println!("{out}");
+            0
+        }
+        Err(e) => {
+            eprintln!("gmux: write failed: {e}");
+            1
+        }
+    }
+}
+
+/// Write RGBA8 pixels as a bottom-up 24-bit BMP (BGR). Dependency-free.
+fn write_bmp(path: &str, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
+    let row_bytes = (w * 3 + 3) & !3; // rows padded to 4 bytes
+    let pixel_bytes = row_bytes * h;
+    let file_size = 54 + pixel_bytes;
+    let mut out = Vec::with_capacity(file_size as usize);
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&file_size.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&54u32.to_le_bytes());
+    out.extend_from_slice(&40u32.to_le_bytes()); // BITMAPINFOHEADER
+    out.extend_from_slice(&w.to_le_bytes());
+    out.extend_from_slice(&h.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&[0u8; 24]); // no compression, default ppm/palette fields
+    for y in (0..h).rev() {
+        let mut written = 0;
+        for x in 0..w {
+            let o = ((y * w + x) * 4) as usize;
+            out.extend_from_slice(&[rgba[o + 2], rgba[o + 1], rgba[o]]);
+            written += 3;
+        }
+        while written % 4 != 0 {
+            out.push(0);
+            written += 1;
+        }
+    }
+    std::fs::write(path, out)
+}
+
 /// Entry: dispatch `gmux <subcommand> ...` API calls. Returns an exit code.
 pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
     match cmd {
         "list-panes" => Some(run(Call::ListPanes)),
         "wait-for" => Some(wait_for(args)),
+        "screenshot" => Some(screenshot(args)),
         "subscribe" => Some(subscribe(args.iter().any(|a| a == "--output"))),
         "hello" => Some(run(Call::Hello { client_version: env!("CARGO_PKG_VERSION").into() })),
         "send-keys" => {

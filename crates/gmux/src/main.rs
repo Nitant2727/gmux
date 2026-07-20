@@ -170,6 +170,7 @@ USAGE:
                                        --features browser; queued in the daemon otherwise)
   gmux wait-for -t <pane> ...          block until --text <substr> appears, the pane --exit s,
                                        or its screen is --idle <secs>; [--timeout <secs>]
+  gmux screenshot -t <pane> [-o F.bmp] render the pane's live grid to an image (headless GPU)
   gmux hooks setup <agent>             configure claude-code | codex | gemini | aider | all
   gmux shell-integration [--install]   print (or install into $PROFILE) the PowerShell snippet
   gmux --help                          show this help
