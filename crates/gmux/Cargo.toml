@@ -16,3 +16,9 @@ gmux-proto = { path = "../gmux-proto" }
 gmux-server = { path = "../gmux-server" }
 serde_json = "1"
 toml_edit = "0.22"
+
+[features]
+# Forward to the GUI's WebView2 browser pane; enabled in release packaging since v0.2 so
+# `gmux browse` works out of the box (needs the WebView2 Evergreen runtime, preinstalled on
+# Win11 / most updated Win10).
+browser = ["gmux-gui/browser"]

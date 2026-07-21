@@ -10,7 +10,7 @@ try {
     # cargo writes progress to stderr, which PS 5.1 would promote to a terminating error under
     # EAP Stop — relax around the build and gate on the exit code instead.
     $ErrorActionPreference = 'Continue'
-    & cargo build --release -p gmux 2>&1 | ForEach-Object { "$_" } | Write-Host
+    & cargo build --release -p gmux --features browser 2>&1 | ForEach-Object { "$_" } | Write-Host
     $ErrorActionPreference = 'Stop'
     if ($LASTEXITCODE -ne 0) { Write-Host "build failed ($LASTEXITCODE)"; exit $LASTEXITCODE }
 
