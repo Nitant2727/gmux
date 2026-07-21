@@ -79,6 +79,10 @@ Rebindable in `%APPDATA%\gmux\gmux.json` (`Ctrl+,` opens it; see the generated t
 their quoted paths. Wheel scrolls the pane under the cursor; the viewport is content-pinned while
 a background pane keeps producing output.
 
+The chrome follows your Windows accent color (active pane border, focus glow, highlights). Pin a
+different one with `"theme": { "accent": "#60cdff" }`; terminal cell colors are separate and come
+from `theme.scheme` / `theme.ansi`.
+
 ## Platform
 
 Windows 10 21H2+ and Windows 11, x64 and ARM64. ConPTY (`CreatePseudoConsole`) for the PTY layer,

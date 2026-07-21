@@ -8,14 +8,15 @@ use wgpu::util::DeviceExt;
 
 use crate::atlas::{Atlas, GlyphLookup};
 
-// Design tokens (single source of truth). Colors are Catppuccin-Mocha-derived; see the spec.
+// Design tokens (single source of truth).
 // Fluent dark (WinUI layer/accent tokens): neutral gray layers, cyan accent, semantic status hues.
+// The accent is a runtime value ([`accent`]) — WinUI apps follow the user's Windows accent color.
 const BG_APP: Rgb = Rgb { r: 0x1a, g: 0x1a, b: 0x1a }; // window / between-pane background
 const BG_SIDEBAR: Rgb = Rgb { r: 0x20, g: 0x20, b: 0x20 };
 const BG_PANE: Rgb = Rgb { r: 0x27, g: 0x27, b: 0x27 }; // pane fill + letterbox
 const SIDEBAR_ROW_ACTIVE: Rgb = Rgb { r: 0x33, g: 0x33, b: 0x33 };
 const SIDEBAR_ROW_HOVER: Rgb = Rgb { r: 0x2a, g: 0x2a, b: 0x2a }; // between BG_SIDEBAR and active
-const ACCENT: Rgb = Rgb { r: 0x60, g: 0xcd, b: 0xff }; // active borders / highlights
+const ACCENT_FALLBACK: Rgb = Rgb { r: 0x60, g: 0xcd, b: 0xff }; // Fluent default accent (light-2)
 const TEXT: Rgb = Rgb { r: 0xff, g: 0xff, b: 0xff };
 const TEXT_DIM: Rgb = Rgb { r: 0x9d, g: 0x9d, b: 0x9d };
 const ATTENTION: Rgb = Rgb { r: 0xff, g: 0x99, b: 0xa4 }; // attention dot / ring
@@ -39,6 +40,7 @@ const ROW_PAD_H: f32 = 12.0; // horizontal padding inside a sidebar row
 const ACCENT_BAR_W: f32 = 3.0; // active-row left-edge bar
 const ATTN_DOT: f32 = 8.0;
 const RADIUS: f32 = 6.0; // rounded corner radius for sidebar rows + pane chrome
+const GLOW_W: f32 = 4.0; // accent focus glow around the active pane (must stay < MARGIN)
 const BADGE_RADIUS: f32 = 4.0; // scroll badge chip
 const TITLE_STRIP: f32 = 22.0; // pane title band inside the border, above the cells
 const SEARCH_BAR: f32 = 22.0; // search band inside the border, below the cells (active pane only)
@@ -62,12 +64,100 @@ fn darker(c: Rgb, a: f32) -> Rgb {
     blend(BLACK, c, a)
 }
 
+/// The live accent color, packed `0x01_RR_GG_BB` (bit 24 marks "resolved"; 0 means "not yet").
+/// Read on every frame build, so it stays an atomic rather than a lock.
+static ACCENT_RGB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The accent used for active borders, highlights and chips. Resolves once from the user's Windows
+/// accent color (what every WinUI app does), unless [`set_accent`] pinned one from the config.
+pub fn accent() -> Rgb {
+    use std::sync::atomic::Ordering;
+    let packed = ACCENT_RGB.load(Ordering::Relaxed);
+    if packed != 0 {
+        return unpack_accent(packed);
+    }
+    let c = system_accent().map(ensure_legible).unwrap_or(ACCENT_FALLBACK);
+    set_accent(Some(c));
+    c
+}
+
+/// Pin the accent (config `theme.accent`), or clear the pin so the next [`accent`] re-reads the
+/// system color. Called at startup and on config hot-reload.
+pub fn set_accent(c: Option<Rgb>) {
+    use std::sync::atomic::Ordering;
+    let packed = match c {
+        Some(c) => 1 << 24 | (c.r as u32) << 16 | (c.g as u32) << 8 | c.b as u32,
+        None => 0,
+    };
+    ACCENT_RGB.store(packed, Ordering::Relaxed);
+}
+
+fn unpack_accent(p: u32) -> Rgb {
+    Rgb { r: (p >> 16) as u8, g: (p >> 8) as u8, b: p as u8 }
+}
+
+/// Windows stores eight accent shades in `HKCU\...\Explorer\Accent\AccentPalette` as RGBA quads,
+/// dark to light. Entry 4 is `SystemAccentColorLight2` — the shade WinUI uses on dark surfaces.
+fn accent_from_palette(bytes: &[u8]) -> Option<Rgb> {
+    let q = bytes.get(16..19)?;
+    Some(Rgb { r: q[0], g: q[1], b: q[2] })
+}
+
+/// A user's accent can be near-black (some themes), which would erase every focus cue on our dark
+/// chrome. Lift it toward white until it clears a relative-luminance floor.
+fn ensure_legible(c: Rgb) -> Rgb {
+    let lum = |c: Rgb| {
+        (0.2126 * c.r as f32 + 0.7152 * c.g as f32 + 0.0722 * c.b as f32) / 255.0
+    };
+    let mut out = c;
+    // Each step is a fixed blend toward white; 6 steps take even #000000 past the floor.
+    for _ in 0..6 {
+        if lum(out) >= 0.45 {
+            break;
+        }
+        out = blend(TEXT, out, 0.2);
+    }
+    out
+}
+
+/// Read the accent palette out of the registry. `None` on any failure (no key, wrong type, short
+/// buffer) — the caller falls back to the built-in accent.
+#[cfg(windows)]
+fn system_accent() -> Option<Rgb> {
+    use windows::core::w;
+    use windows::Win32::System::Registry::{
+        RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_BINARY,
+    };
+    let mut buf = [0u8; 32];
+    let mut len = buf.len() as u32;
+    let rc = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Accent"),
+            w!("AccentPalette"),
+            RRF_RT_REG_BINARY,
+            None,
+            Some(buf.as_mut_ptr() as *mut _),
+            Some(&mut len),
+        )
+    };
+    if rc.is_err() {
+        return None;
+    }
+    accent_from_palette(&buf[..len as usize])
+}
+
+#[cfg(not(windows))]
+fn system_accent() -> Option<Rgb> {
+    None
+}
+
 /// Border width + color for a pane: attention ring overrides the active/inactive border.
 fn border_style(active: bool, attention: Attention) -> (f32, Rgb) {
     if attention.is_pending() {
         (ATTN_BORDER, ATTENTION)
     } else if active {
-        (BORDER, ACCENT)
+        (BORDER, accent())
     } else {
         (BORDER, PANE_BORDER_INACTIVE)
     }
@@ -147,6 +237,12 @@ struct GlyphVertex {
 
 fn rgba(c: Rgb) -> [f32; 4] {
     [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0, 1.0]
+}
+
+/// Same, with an explicit alpha — the rounded pipeline blends, so this is how the focus glow and
+/// other translucent chrome are expressed.
+fn rgba_a(c: Rgb, a: f32) -> [f32; 4] {
+    [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0, a]
 }
 
 /// A rounded-rect quad for the SDF chrome pipeline. `local` is the fragment's pixel offset from
@@ -596,7 +692,7 @@ impl Renderer {
                 let (mut cell_bg, mut cell_fg) = (cell.bg, cell.fg);
                 if selected {
                     std::mem::swap(&mut cell_bg, &mut cell_fg);
-                    cell_bg = blend(ACCENT, cell_bg, 0.3);
+                    cell_bg = blend(accent(), cell_bg, 0.3);
                 } else if matched {
                     std::mem::swap(&mut cell_bg, &mut cell_fg);
                     cell_bg = blend(PEACH, cell_bg, 0.6);
@@ -879,7 +975,7 @@ impl Renderer {
             if r.active {
                 let f = rgba(SIDEBAR_ROW_ACTIVE);
                 push_rounded_grad(&mut rd, 0.0, top, sw, top + ROW_H, RADIUS, f, rgba(darker(SIDEBAR_ROW_ACTIVE, 0.22)), fw, fh);
-                push_rounded(&mut rd, 0.0, top + RADIUS, ACCENT_BAR_W, top + ROW_H - RADIUS, 0.0, rgba(ACCENT), fw, fh);
+                push_rounded(&mut rd, 0.0, top + RADIUS, ACCENT_BAR_W, top + ROW_H - RADIUS, 0.0, rgba(accent()), fw, fh);
             } else if r.hover {
                 let f = rgba(SIDEBAR_ROW_HOVER);
                 push_rounded_grad(&mut rd, 0.0, top, sw, top + ROW_H, RADIUS, f, rgba(darker(SIDEBAR_ROW_HOVER, 0.20)), fw, fh);
@@ -973,6 +1069,24 @@ impl Renderer {
             // Pane chrome: a rounded border ring (outer) with the BG_PANE fill (inner, inset by the
             // border width) drawn on top. The fill also letterboxes the cell-grid remainder.
             let (bw, bc) = border_style(pv.active, pv.attention);
+            // Focus glow: two faint accent-tinted rings just outside the active pane's border,
+            // fading with distance. Costs 12 vertices and sits inside the MARGIN, so no layout
+            // moves; inactive panes draw nothing (the glow IS the focus cue).
+            if pv.active && !pv.attention.is_pending() {
+                for (i, alpha) in [(GLOW_W, 0.10f32), (GLOW_W / 2.0, 0.16)] {
+                    push_rounded(
+                        &mut srd,
+                        cx - i,
+                        cy - i,
+                        cx + cw_ + i,
+                        cy + ch_ + i,
+                        RADIUS + i,
+                        rgba_a(bc, alpha),
+                        fw,
+                        fh,
+                    );
+                }
+            }
             // The inactive stroke fades toward the bottom (Fluent's lit-from-above control stroke);
             // active/attention rings stay flat so focus reads as one uniform color.
             let bc_bot = if pv.active { bc } else { darker(bc, 0.35) };
@@ -995,7 +1109,7 @@ impl Renderer {
             if pv.active {
                 let dot = 6.0;
                 let dy = sy0 + (TITLE_STRIP - dot) / 2.0;
-                push_rounded(&mut srd, tx, dy, tx + dot, dy + dot, dot / 2.0, rgba(ACCENT), fw, fh);
+                push_rounded(&mut srd, tx, dy, tx + dot, dy + dot, dot / 2.0, rgba(accent()), fw, fh);
                 tx += dot + 5.0;
             }
             let max_chars = ((sx1 - 8.0 - tx).max(0.0) / cw_cell) as usize;
@@ -1024,7 +1138,7 @@ impl Renderer {
                 let sbx1 = ix + iw;
                 let sbx0 = sbx1 - SCROLLBAR_W;
                 push_rounded(&mut obg, sbx0, iy, sbx1, iy + ih, 0.0, rgba(BG_SIDEBAR), fw, fh); // track
-                push_rounded(&mut obg, sbx0, iy + t0, sbx1, iy + t1, 0.0, rgba(ACCENT), fw, fh); // thumb
+                push_rounded(&mut obg, sbx0, iy + t0, sbx1, iy + t1, 0.0, rgba(accent()), fw, fh); // thumb
             }
 
             // Scroll badge: '+{n}' chip top-right inside the pane, below the title strip (drawn
@@ -1037,7 +1151,7 @@ impl Renderer {
                 let br = cx + cw_ - bw - 4.0;
                 let bt = cy + bw + TITLE_STRIP + 4.0;
                 push_rounded(&mut obg, br - bw_chip, bt, br, bt + bh_chip, BADGE_RADIUS, rgba(BG_SIDEBAR), fw, fh);
-                self.text_run(&label, br - bw_chip + bpx, bt + bpy, rgba(ACCENT), fw, fh, &mut ogl);
+                self.text_run(&label, br - bw_chip + bpx, bt + bpy, rgba(accent()), fw, fh, &mut ogl);
             }
 
             // Search band: a SEARCH_BAR-tall BG_SIDEBAR band at the active pane's bottom, inside the
@@ -1064,7 +1178,7 @@ impl Renderer {
                     let (counter, col) = if sb.total == 0 && !sb.query.is_empty() {
                         ("no matches".to_string(), ERROR)
                     } else {
-                        (format!("{}/{}", sb.current, sb.total), ACCENT)
+                        (format!("{}/{}", sb.current, sb.total), accent())
                     };
                     let cwn = counter.chars().count() as f32 * cw_cell;
                     self.text_run(&counter, (bx1 - 12.0 - cwn).max(lx), ty, rgba(col), fw, fh, &mut sgl);
@@ -1397,6 +1511,39 @@ mod tests {
     fn cell(ch: char) -> Cell {
         let c = Rgb { r: 0, g: 0, b: 0 };
         Cell { ch, fg: c, bg: c, bold: false, italic: false, underline: false, inverse: false, wide: false }
+    }
+
+    #[test]
+    fn accent_palette_picks_the_dark_surface_shade() {
+        // 8 RGBA quads, dark to light; entry 4 (bytes 16..20) is SystemAccentColorLight2.
+        let mut bytes = [0u8; 32];
+        bytes[16..20].copy_from_slice(&[0x99, 0xeb, 0xff, 0xff]);
+        assert_eq!(accent_from_palette(&bytes), Some(Rgb { r: 0x99, g: 0xeb, b: 0xff }));
+        // A truncated / empty buffer yields None rather than reading past the end.
+        assert_eq!(accent_from_palette(&bytes[..8]), None);
+        assert_eq!(accent_from_palette(&[]), None);
+    }
+
+    #[test]
+    fn near_black_accent_is_lifted_but_bright_one_is_kept() {
+        let lum = |c: Rgb| (0.2126 * c.r as f32 + 0.7152 * c.g as f32 + 0.0722 * c.b as f32) / 255.0;
+        let black = ensure_legible(Rgb { r: 0, g: 0, b: 0 });
+        assert!(lum(black) >= 0.45, "black accent must be lifted, got {black:?}");
+        let bright = Rgb { r: 0x60, g: 0xcd, b: 0xff };
+        assert_eq!(ensure_legible(bright), bright, "a legible accent is untouched");
+    }
+
+    #[test]
+    fn set_accent_pins_and_clears() {
+        let pinned = Rgb { r: 0x12, g: 0xc4, b: 0x9a };
+        set_accent(Some(pinned));
+        assert_eq!(accent(), pinned);
+        // Clearing un-pins: the next read re-resolves (system or fallback), and either way it is a
+        // legible color, not the zero sentinel.
+        set_accent(None);
+        let resolved = accent();
+        assert!(resolved.r as u16 + resolved.g as u16 + resolved.b as u16 > 0);
+        set_accent(None);
     }
 
     #[test]
