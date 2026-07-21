@@ -1625,12 +1625,16 @@ impl State {
     fn poll_browse(&mut self) {
         if let Ok(ResultBody::Browses(urls)) = self.client.call(Call::PollBrowse) {
             for url in urls {
-                match &self.browser {
-                    Some(b) => b.navigate(&url),
-                    None => match gmux_browser::BrowserPane::open(&url) {
+                // A pane whose window the user closed can't navigate (the post would be a silent
+                // no-op), so drop the stale handle and open a fresh pane instead.
+                if self.browser.as_ref().is_some_and(|b| !b.navigate(&url)) {
+                    self.browser = None;
+                }
+                if self.browser.is_none() {
+                    match gmux_browser::BrowserPane::open(&url) {
                         Ok(b) => self.browser = Some(b),
                         Err(e) => eprintln!("gmux: browser pane failed: {e}"),
-                    },
+                    }
                 }
             }
         }
