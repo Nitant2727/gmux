@@ -393,12 +393,28 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
         "browse" => {
             // All non-flag args form the input: a URL passes through, a bare domain gets https://,
             // and anything else becomes a web search — `gmux browse rust wgpu present` just works.
+            // Default target is the SYSTEM browser (explorer.exe hands the url to the protocol
+            // handler with no shell parsing — the same hardened path Ctrl+click uses). `--pane`
+            // routes to the in-app WebView2 pane instead (currently unreliable; see PARKED.md).
             let words: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).map(|s| s.as_str()).collect();
             if words.is_empty() {
-                eprintln!("usage: gmux browse <url | search terms...>");
+                eprintln!("usage: gmux browse [--pane] <url | search terms...>");
                 return Some(2);
             }
-            Some(run(Call::Browse { url: browse_target(&words.join(" ")) }))
+            let url = browse_target(&words.join(" "));
+            if args.iter().any(|a| a == "--pane") {
+                return Some(run(Call::Browse { url }));
+            }
+            match std::process::Command::new("explorer").arg(&url).spawn() {
+                Ok(_) => {
+                    println!("{url}");
+                    Some(0)
+                }
+                Err(e) => {
+                    eprintln!("gmux: could not open browser: {e}");
+                    Some(1)
+                }
+            }
         }
         _ => None, // not an API subcommand
     }
