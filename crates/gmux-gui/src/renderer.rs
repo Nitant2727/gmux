@@ -9,20 +9,21 @@ use wgpu::util::DeviceExt;
 use crate::atlas::{Atlas, GlyphLookup};
 
 // Design tokens (single source of truth). Colors are Catppuccin-Mocha-derived; see the spec.
-const BG_APP: Rgb = Rgb { r: 0x11, g: 0x11, b: 0x1b }; // window / between-pane background
-const BG_SIDEBAR: Rgb = Rgb { r: 0x18, g: 0x18, b: 0x25 };
-const BG_PANE: Rgb = Rgb { r: 0x1e, g: 0x1e, b: 0x2e }; // pane fill + letterbox
-const SIDEBAR_ROW_ACTIVE: Rgb = Rgb { r: 0x31, g: 0x32, b: 0x44 };
-const SIDEBAR_ROW_HOVER: Rgb = Rgb { r: 0x24, g: 0x24, b: 0x3a }; // #24243a — between BG_SIDEBAR and active
-const ACCENT: Rgb = Rgb { r: 0x89, g: 0xb4, b: 0xfa }; // active borders / highlights
-const TEXT: Rgb = Rgb { r: 0xcd, g: 0xd6, b: 0xf4 };
-const TEXT_DIM: Rgb = Rgb { r: 0x7f, g: 0x84, b: 0x9c };
-const ATTENTION: Rgb = Rgb { r: 0xf3, g: 0x8b, b: 0xa8 }; // attention dot / ring
-const PEACH: Rgb = Rgb { r: 0xfa, g: 0xb3, b: 0x87 }; // search-match highlight (Catppuccin Peach)
-const PROGRESS: Rgb = Rgb { r: 0xa6, g: 0xe3, b: 0xa1 };
-const ERROR: Rgb = Rgb { r: 0xf3, g: 0x8b, b: 0xa8 };
-const PANE_BORDER_INACTIVE: Rgb = Rgb { r: 0x31, g: 0x32, b: 0x44 };
-const CURSOR: Rgb = Rgb { r: 0xcd, g: 0xd6, b: 0xf4 };
+// Fluent dark (WinUI layer/accent tokens): neutral gray layers, cyan accent, semantic status hues.
+const BG_APP: Rgb = Rgb { r: 0x1a, g: 0x1a, b: 0x1a }; // window / between-pane background
+const BG_SIDEBAR: Rgb = Rgb { r: 0x20, g: 0x20, b: 0x20 };
+const BG_PANE: Rgb = Rgb { r: 0x27, g: 0x27, b: 0x27 }; // pane fill + letterbox
+const SIDEBAR_ROW_ACTIVE: Rgb = Rgb { r: 0x33, g: 0x33, b: 0x33 };
+const SIDEBAR_ROW_HOVER: Rgb = Rgb { r: 0x2a, g: 0x2a, b: 0x2a }; // between BG_SIDEBAR and active
+const ACCENT: Rgb = Rgb { r: 0x60, g: 0xcd, b: 0xff }; // active borders / highlights
+const TEXT: Rgb = Rgb { r: 0xff, g: 0xff, b: 0xff };
+const TEXT_DIM: Rgb = Rgb { r: 0x9d, g: 0x9d, b: 0x9d };
+const ATTENTION: Rgb = Rgb { r: 0xff, g: 0x99, b: 0xa4 }; // attention dot / ring
+const PEACH: Rgb = Rgb { r: 0xff, g: 0xd3, b: 0x3a }; // search-match highlight (Fluent caution)
+const PROGRESS: Rgb = Rgb { r: 0x6c, g: 0xcb, b: 0x5f };
+const ERROR: Rgb = Rgb { r: 0xff, g: 0x99, b: 0xa4 };
+const PANE_BORDER_INACTIVE: Rgb = Rgb { r: 0x38, g: 0x38, b: 0x38 };
+const CURSOR: Rgb = Rgb { r: 0xd4, g: 0xd4, b: 0xd4 };
 
 // Spacing (8px grid).
 const MARGIN: f32 = 8.0; // outer margin around the pane area
