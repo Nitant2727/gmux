@@ -19,3 +19,4 @@ Cut scope doesn't die; it parks. One line per item: date · item · why parked �
 - Cell wire elision (80% cut) — measured live 2026-07-21 (round 26).
 - Release pipeline — proven end-to-end 2026-07-20 (round 27: tag → green run → published v0.1.0 → downloaded asset runs).
 - Sidebar tab overflow — fixed round 21 (windowed rows + wheel scroll; live check folded into the owed list above).
+- 2026-07-21 � Browser pane occasionally opens collapsed (~276x45) instead of 1024x768 (seen on the 2nd launch of a session; 1st was correct) � low-priority WebView2 window-sizing quirk � wake: reproduce + fix in a browser-polish round.

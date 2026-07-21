@@ -311,6 +311,28 @@ fn write_bmp(path: &str, w: u32, h: u32, rgba: &[u8]) -> std::io::Result<()> {
     std::fs::write(path, out)
 }
 
+/// Resolve `gmux browse` input to a URL: explicit scheme passes through; a single dotted,
+/// space-free token is a domain (https:// prefixed); everything else becomes a DuckDuckGo search (no captcha wall on fresh WebView2 profiles, unlike Google).
+/// Pure/tested.
+fn browse_target(input: &str) -> String {
+    let t = input.trim();
+    if t.starts_with("http://") || t.starts_with("https://") {
+        return t.to_string();
+    }
+    if !t.contains(' ') && t.contains('.') {
+        return format!("https://{t}");
+    }
+    let mut q = String::new();
+    for b in t.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => q.push(b as char),
+            b' ' => q.push('+'),
+            _ => q.push_str(&format!("%{b:02X}")),
+        }
+    }
+    format!("https://duckduckgo.com/?q={q}")
+}
+
 /// Entry: dispatch `gmux <subcommand> ...` API calls. Returns an exit code.
 pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
     match cmd {
@@ -369,11 +391,14 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
             Some(run(Call::SshTmux { target, command }))
         }
         "browse" => {
-            let Some(url) = args.iter().find(|a| !a.starts_with('-')).cloned() else {
-                eprintln!("usage: gmux browse <url>");
+            // All non-flag args form the input: a URL passes through, a bare domain gets https://,
+            // and anything else becomes a web search — `gmux browse rust wgpu present` just works.
+            let words: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).map(|s| s.as_str()).collect();
+            if words.is_empty() {
+                eprintln!("usage: gmux browse <url | search terms...>");
                 return Some(2);
-            };
-            Some(run(Call::Browse { url }))
+            }
+            Some(run(Call::Browse { url: browse_target(&words.join(" ")) }))
         }
         _ => None, // not an API subcommand
     }
@@ -381,7 +406,19 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_pane;
+    use super::{browse_target, parse_pane};
+
+    /// URL passthrough, bare-domain https, and search fallback with percent-encoding.
+    #[test]
+    fn browse_target_resolves() {
+        assert_eq!(browse_target("https://a.test/x"), "https://a.test/x");
+        assert_eq!(browse_target("docs.rs"), "https://docs.rs");
+        assert_eq!(
+            browse_target("rust wgpu present"),
+            "https://duckduckgo.com/?q=rust+wgpu+present"
+        );
+        assert_eq!(browse_target("c# & more"), "https://duckduckgo.com/?q=c%23+%26+more");
+    }
 
     #[test]
     fn pane_targets_parse() {

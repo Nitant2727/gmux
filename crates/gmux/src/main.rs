@@ -166,8 +166,8 @@ USAGE:
   gmux notify --title T [--body B]     emit an OSC 777 notification (run inside a pane)
   gmux ssh-tmux <target>               mirror a remote tmux session over ssh (tmux -CC);
                                        --command <raw> overrides the transport command line
-  gmux browse <url>                    open the url in the browser pane (GUI built with
-                                       --features browser; queued in the daemon otherwise)
+  gmux browse <url | search terms...>  open a url — or web-search free text — in the browser
+                                       pane (in release builds; queued if the GUI lacks it)
   gmux wait-for -t <pane> ...          block until --text <substr> appears, the pane --exit s,
                                        or its screen is --idle <secs>; [--timeout <secs>]
   gmux screenshot -t <pane> [-o F.bmp] render the pane's live grid to an image (headless GPU)

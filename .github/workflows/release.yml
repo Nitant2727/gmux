@@ -31,7 +31,7 @@ jobs:
         with:
           key: release-${{ matrix.label }}
       - name: Build gmux (release)
-        run: cargo build --release --locked -p gmux --target ${{ matrix.target }}
+        run: cargo build --release --locked -p gmux --features browser --target ${{ matrix.target }}
       - name: Package portable zip
         shell: pwsh
         run: |
