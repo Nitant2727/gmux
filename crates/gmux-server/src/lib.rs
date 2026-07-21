@@ -461,6 +461,13 @@ impl Server {
                 }
                 Response::ok(id, ResultBody::Done)
             }
+            Call::GroupWindow { id: win, group } => {
+                // Same stable-id resolution as RenameWindow; an empty group ungroups the window.
+                if let Some(w) = self.session.window_mut(WindowId(*win)) {
+                    w.set_group(group.clone());
+                }
+                Response::ok(id, ResultBody::Done)
+            }
             Call::FocusPaneId { pane } => {
                 self.session.focus_pane(PaneId(*pane));
                 Response::ok(id, ResultBody::Done)
@@ -535,6 +542,7 @@ impl Server {
                     branch: info.branch,
                     attention: info.attention,
                     unread: info.unread,
+                    group: win.group().map(str::to_string),
                     active: i == active_idx,
                     progress,
                     progress_error,
@@ -1570,6 +1578,18 @@ mod tests {
 
         // A gone id is a harmless no-op Ok.
         let resp = server.handle(&Request { id: 3, call: Call::RenameWindow { id: 999_999, name: "x".into() } });
+        assert_eq!(resp.result, Some(ResultBody::Done));
+
+        // GroupWindow files the same window under a sidebar group, and an empty group ungroups it.
+        assert_eq!(server.layout(800, 600).tabs[0].group, None);
+        let resp = server.handle(&Request { id: 4, call: Call::GroupWindow { id: wid, group: "api".into() } });
+        assert_eq!(resp.result, Some(ResultBody::Done));
+        assert_eq!(server.layout(800, 600).tabs[0].group.as_deref(), Some("api"));
+        let resp = server.handle(&Request { id: 5, call: Call::GroupWindow { id: wid, group: String::new() } });
+        assert_eq!(resp.result, Some(ResultBody::Done));
+        assert_eq!(server.layout(800, 600).tabs[0].group, None);
+        // A gone id is a no-op Ok here too.
+        let resp = server.handle(&Request { id: 6, call: Call::GroupWindow { id: 999_999, group: "x".into() } });
         assert_eq!(resp.result, Some(ResultBody::Done));
     }
 

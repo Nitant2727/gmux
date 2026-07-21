@@ -35,6 +35,9 @@ pub struct Window {
     /// User-set name override (a sidebar rename); `None` uses the derived workspace name. Persisted
     /// via [`WindowSnapshot::name`], so a rename survives a daemon restart.
     name: Option<String>,
+    /// Sidebar group this window belongs under (`None` = ungrouped, listed before every group).
+    /// Persisted like `name`, so grouping survives a daemon restart.
+    group: Option<String>,
 }
 
 impl Window {
@@ -42,7 +45,7 @@ impl Window {
         let id = pane.id;
         let mut panes = HashMap::new();
         panes.insert(id, pane);
-        Window { id: WindowId::alloc(), panes, root: Node::leaf(id), active: id, zoom: false, name: None }
+        Window { id: WindowId::alloc(), panes, root: Node::leaf(id), active: id, zoom: false, name: None, group: None }
     }
 
     pub fn active_id(&self) -> PaneId {
@@ -77,7 +80,7 @@ impl Window {
     }
     /// Build a window from a pre-constructed pane map + split tree (used by session restore).
     pub fn from_parts(panes: HashMap<PaneId, Pane>, root: Node, active: PaneId) -> Window {
-        Window { id: WindowId::alloc(), panes, root, active, zoom: false, name: None }
+        Window { id: WindowId::alloc(), panes, root, active, zoom: false, name: None, group: None }
     }
 
     /// Set (or clear) this window's custom name override. An empty `name` clears it back to the
@@ -90,6 +93,16 @@ impl Window {
     /// workspace name. Read by [`WindowSnapshot::capture`] to persist the override across restarts.
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
+    }
+
+    /// Put this window in a sidebar group, or take it out (empty name = ungrouped).
+    pub fn set_group(&mut self, group: String) {
+        self.group = if group.is_empty() { None } else { Some(group) };
+    }
+
+    /// This window's sidebar group, or `None` when it is ungrouped.
+    pub fn group(&self) -> Option<&str> {
+        self.group.as_deref()
     }
 
     /// Replace this window's split tree wholesale (the remote-tmux mirror path, where the remote's

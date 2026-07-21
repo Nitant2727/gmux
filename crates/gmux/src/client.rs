@@ -72,6 +72,11 @@ fn parse_pane(s: &str) -> Option<u64> {
     s.trim_start_matches('%').parse().ok()
 }
 
+/// `@3` / `3` -> a stable window id (the `@N` column `list-panes` prints).
+fn parse_window(s: &str) -> Option<u64> {
+    s.trim_start_matches('@').parse().ok()
+}
+
 /// Rebuild a command line from argv pieces after `--`, re-quoting arguments the shell had
 /// unwrapped: a plain `join(" ")` would turn `claude -p "work on auth"` into
 /// `claude -p work on auth`, splintering the prompt into stray positionals when the child
@@ -373,6 +378,33 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
                 .position(|a| a == "-S")
                 .map(|i| parse_scrollback(args.get(i + 1).map(String::as_str)));
             Some(run(Call::CapturePane { pane, scrollback }))
+        }
+        "group" => {
+            // `gmux group -t @<window-id> <name...>` files a window under a sidebar group;
+            // `--clear` (or no name) takes it back out.
+            let id = args.iter().position(|a| a == "-t").and_then(|i| args.get(i + 1)).and_then(|s| parse_window(s));
+            let Some(id) = id else {
+                eprintln!("usage: gmux group -t @<window-id> <name...> | --clear");
+                return Some(2);
+            };
+            let clear = args.iter().any(|a| a == "--clear");
+            let name = if clear {
+                String::new()
+            } else {
+                // Everything that isn't the flag pair is the group name.
+                let mut words = Vec::new();
+                let mut i = 0;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "-t" => i += 1, // skip the id too
+                        w if !w.starts_with('-') => words.push(w.to_string()),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                words.join(" ")
+            };
+            Some(run(Call::GroupWindow { id, group: name }))
         }
         "split-pane" => {
             let dir = if args.iter().any(|a| a == "-v") { "v" } else { "h" }.to_string();

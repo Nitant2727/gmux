@@ -48,6 +48,8 @@ const ROW_PAD_H: f32 = 10.0; // horizontal padding inside a sidebar row
 const ROW_OUTER_PAD: f32 = 6.0; // gap between the row pill and the panel edges
 const ROW_PAD_V: f32 = 8.0; // padding above the first text line / below the last
 const ROW_STROKE: f32 = 1.5; // hairline around the selected row
+// cmux's group header is a short strip above its members (`dropTargetHeight` bottoms out at 24).
+const HEADER_H: f32 = 24.0;
 const ATTN_DOT: f32 = 8.0;
 // cmux's unread badge padding (`baseUnreadHorizontalPadding` 5 / `baseUnreadVerticalPadding` 1).
 const BADGE_PAD_H: f32 = 5.0;
@@ -212,6 +214,37 @@ pub struct SidebarRow {
     pub progress: Option<u8>,
     /// A pane reported a progress error: renders " !" after the name (takes precedence over pct).
     pub progress_error: bool,
+}
+
+/// One line in the sidebar list: a collapsible group header, or a workspace row. The app builds
+/// this list (grouping + collapse state live there); the renderer just lays it out top to bottom,
+/// which keeps hit-testing and drawing reading off the same sequence.
+pub enum SidebarItem {
+    Header(GroupHeader),
+    Row(SidebarRow),
+}
+
+impl SidebarItem {
+    /// Laid-out height of this item (headers are shorter than workspace rows).
+    fn height(&self) -> f32 {
+        match self {
+            SidebarItem::Header(_) => HEADER_H,
+            SidebarItem::Row(_) => ROW_H,
+        }
+    }
+}
+
+/// A collapsible group header above its member workspaces.
+pub struct GroupHeader {
+    pub name: String,
+    /// Members are hidden; the chevron points right instead of down.
+    pub collapsed: bool,
+    /// How many workspaces are in the group (shown when collapsed, where the rows can't speak).
+    pub members: usize,
+    /// Unread notifications across the group — badged like a row, so a collapsed group still says
+    /// that something inside it wants you.
+    pub unread: u32,
+    pub hover: bool,
 }
 
 /// The command palette overlay: a centered panel with a query line and filtered rows.
@@ -950,26 +983,40 @@ impl Renderer {
 
     /// Map a y coordinate (px, window space) to a sidebar row index — the single source of truth
     /// for click hit-testing, using the same metrics `build_sidebar` draws with.
-    pub fn sidebar_row_at(&self, y: f32, row_count: usize) -> Option<usize> {
-        let rows_y0 = SIDEBAR_PAD_TOP + self.cell_h() as f32 + 8.0;
-        if y < rows_y0 {
+    /// Hit-test a sidebar item (header or workspace row) at window `y`. Walks the same
+    /// variable-height sequence `build_sidebar` draws, so a click can never land on a different
+    /// item than the one under the cursor. `None` in the gaps between items.
+    pub fn sidebar_item_at(&self, y: f32, heights: &[f32]) -> Option<usize> {
+        let mut top = SIDEBAR_PAD_TOP + self.cell_h() as f32 + 8.0;
+        if y < top {
             return None;
         }
-        let stride = ROW_H + ROW_GAP;
-        let rel = y - rows_y0;
-        let idx = (rel / stride) as usize;
-        if rel - idx as f32 * stride >= ROW_H || idx >= row_count {
-            return None;
+        for (i, h) in heights.iter().enumerate() {
+            if y < top + h {
+                return Some(i);
+            }
+            top += h + ROW_GAP;
+            if y < top {
+                return None; // in the gap below this item
+            }
         }
-        Some(idx)
+        None
     }
 
-    /// Hit-test the '+ new tab' row drawn immediately after the last workspace row (same 48px
-    /// metrics as `sidebar_row_at`, so the two never overlap).
-    pub fn sidebar_new_tab_at(&self, y: f32, row_count: usize) -> bool {
-        let rows_y0 = SIDEBAR_PAD_TOP + self.cell_h() as f32 + 8.0;
-        let top = rows_y0 + row_count as f32 * (ROW_H + ROW_GAP);
+    /// Hit-test the '+ new tab' row drawn immediately after the last item (same walk, so the two
+    /// never overlap).
+    pub fn sidebar_new_tab_at(&self, y: f32, heights: &[f32]) -> bool {
+        let mut top = SIDEBAR_PAD_TOP + self.cell_h() as f32 + 8.0;
+        for h in heights {
+            top += h + ROW_GAP;
+        }
         y >= top && y < top + ROW_H
+    }
+
+    /// The laid-out height of each item, for the app to cache alongside its own item metadata (the
+    /// hit-tests above walk exactly this).
+    pub fn sidebar_item_heights(items: &[SidebarItem]) -> Vec<f32> {
+        items.iter().map(SidebarItem::height).collect()
     }
 
     pub fn sidebar_width(&self) -> u32 {
@@ -1000,7 +1047,39 @@ impl Renderer {
         }
     }
 
-    fn build_sidebar(&self, rows: &[SidebarRow], sidebar_w: u32, plus_hover: bool, fw: f32, fh: f32) -> (Vec<BgVertex>, Vec<RoundedVertex>, Vec<GlyphVertex>) {
+    /// One collapsible group header: chevron, name, and (collapsed) member count + unread badge.
+    /// cmux uses SF Symbols chevrons; the atlas is ASCII-only, so `v`/`>` stand in.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_group_header(&self, h: &GroupHeader, top: f32, sw: f32, cw: f32, ch: f32, fw: f32, fh: f32, rd: &mut Vec<RoundedVertex>, gl: &mut Vec<GlyphVertex>) {
+        let (x0, x1) = (ROW_OUTER_PAD, sw - ROW_OUTER_PAD);
+        if h.hover {
+            push_rounded(rd, x0, top, x1, top + HEADER_H, RADIUS, rgba(SIDEBAR_ROW_HOVER), fw, fh);
+        }
+        let ty = top + (HEADER_H - ch) / 2.0;
+        let tx = x0 + ROW_PAD_H;
+        self.text_run(if h.collapsed { ">" } else { "v" }, tx, ty, rgba(TEXT_DIM), fw, fh, gl);
+        let name_x = tx + 2.0 * cw;
+        self.text_run(&h.name, name_x, ty, rgba(TEXT), fw, fh, gl);
+
+        let mut right = x1 - ROW_PAD_H;
+        if h.unread > 0 {
+            let label = unread_label(h.unread);
+            let bw_ = label.chars().count() as f32 * cw + 2.0 * BADGE_PAD_H;
+            let bh = ch + 2.0 * BADGE_PAD_V;
+            let by = ty - BADGE_PAD_V;
+            push_rounded(rd, right - bw_, by, right, by + bh, bh / 2.0, rgba(accent()), fw, fh);
+            self.text_run(&label, right - bw_ + BADGE_PAD_H, ty, rgba(TEXT), fw, fh, gl);
+            right -= bw_ + 6.0;
+        }
+        // Collapsed, the member rows can't speak for themselves — say how many are hidden.
+        if h.collapsed {
+            let count = h.members.to_string();
+            let w = count.chars().count() as f32 * cw;
+            self.text_run(&count, right - w, ty, rgba(TEXT_DIM), fw, fh, gl);
+        }
+    }
+
+    fn build_sidebar(&self, items: &[SidebarItem], sidebar_w: u32, plus_hover: bool, fw: f32, fh: f32) -> (Vec<BgVertex>, Vec<RoundedVertex>, Vec<GlyphVertex>) {
         let mut bg = Vec::new();
         let mut rd = Vec::new(); // rounded chrome (row fills, accent bar, attention dot)
         let mut gl = Vec::new();
@@ -1028,10 +1107,19 @@ impl Renderer {
         // clamped so a large font can't push the second line out of the row.
         let pad_v = ROW_PAD_V.min(((ROW_H - 2.0 * ch) / 2.0).max(2.0));
         let right_edge = sw - ROW_OUTER_PAD - ROW_PAD_H;
-        let stride = ROW_H + ROW_GAP;
 
-        for (i, r) in rows.iter().enumerate() {
-            let top = rows_y0 + i as f32 * stride;
+        // Items are laid out top to bottom with per-item heights (a header is shorter than a row),
+        // so a running cursor replaces the old index * stride — `sidebar_item_at` walks the same way.
+        let mut top = rows_y0;
+        for item in items {
+            let r = match item {
+                SidebarItem::Header(h) => {
+                    self.draw_group_header(h, top, sw, cw, ch, fw, fh, &mut rd, &mut gl);
+                    top += HEADER_H + ROW_GAP;
+                    continue;
+                }
+                SidebarItem::Row(r) => r,
+            };
             let line1 = top + pad_v;
             let line2 = line1 + ch;
             // cmux fills the selected workspace row SOLID with the accent (not a tint) and strokes
@@ -1120,10 +1208,11 @@ impl Renderer {
                     push_rounded(&mut rd, x0, y0, x0 + w, y1, 1.0, rgba(col), fw, fh);
                 }
             }
+            top += ROW_H + ROW_GAP;
         }
 
-        // '+ new tab' row, immediately after the last workspace row (matches sidebar_new_tab_at).
-        let plus_top = rows_y0 + rows.len() as f32 * stride;
+        // '+ new tab' row, immediately after the last item (matches sidebar_new_tab_at).
+        let plus_top = top;
         if plus_hover {
             push_rounded(&mut rd, ROW_OUTER_PAD, plus_top, sw - ROW_OUTER_PAD, plus_top + ROW_H, RADIUS, rgba(SIDEBAR_ROW_HOVER), fw, fh);
         }
@@ -1137,7 +1226,7 @@ impl Renderer {
     pub fn render_frame(
         &self,
         view: &wgpu::TextureView,
-        sidebar: &[SidebarRow],
+        sidebar: &[SidebarItem],
         sidebar_w: u32,
         panes: &[PaneView],
         surf_w: u32,

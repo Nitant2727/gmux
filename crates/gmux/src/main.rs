@@ -168,6 +168,8 @@ USAGE:
                                        --command <raw> overrides the transport command line
   gmux browse <url | search terms...>  open a url — or web-search free text — in the system
                                        browser (--pane targets the in-app WebView2 pane)
+  gmux group -t @<win> <name...>       file a window under a collapsible sidebar group (--clear
+                                       removes it); ids come from `gmux list-panes`
   gmux wait-for -t <pane> ...          block until --text <substr> appears, the pane --exit s,
                                        or its screen is --idle <secs>; [--timeout <secs>]
   gmux screenshot -t <pane> [-o F.bmp] render the pane's live grid to an image (headless GPU)
