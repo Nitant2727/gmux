@@ -39,6 +39,9 @@ pub struct WindowSnapshot {
     /// snapshots (no field) load as ungrouped.
     #[serde(default)]
     pub group: Option<String>,
+    /// Workspace tag color (`#rrggbb`), reapplied on restore. `#[serde(default)]` for older files.
+    #[serde(default)]
+    pub color: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -144,6 +147,7 @@ impl WindowSnapshot {
             active,
             name: window.name().map(str::to_string),
             group: window.group().map(str::to_string),
+            color: window.color().map(str::to_string),
         })
     }
 
@@ -170,6 +174,9 @@ impl WindowSnapshot {
         }
         if let Some(group) = &self.group {
             window.set_group(group.clone());
+        }
+        if let Some(color) = &self.color {
+            window.set_color(color.clone());
         }
         Ok(window)
     }
@@ -236,6 +243,7 @@ mod tests {
                 active: 1,
                 name: Some("backend".into()),
                 group: Some("api".into()),
+                color: Some("#ff8800".into()),
             }],
         };
         let json = serde_json::to_string(&snap).unwrap();
@@ -247,6 +255,7 @@ mod tests {
         let w: WindowSnapshot = serde_json::from_str(old).unwrap();
         assert_eq!(w.name, None, "absent name defaults to None");
         assert_eq!(w.group, None, "absent group defaults to None (older snapshots are ungrouped)");
+        assert_eq!(w.color, None, "absent color defaults to None (older snapshots are untagged)");
     }
 
     /// Contract 6: a renamed window's custom name survives a snapshot round-trip
@@ -258,6 +267,7 @@ mod tests {
         let mut win = Window::from_parts(HashMap::new(), Node::leaf(id), id);
         win.set_name("backend".to_string());
         win.set_group("api".to_string());
+        win.set_color("#ff8800".to_string());
         let session = Session::from_windows("s", vec![win], 0);
 
         let snap = SessionSnapshot::capture(&session);
@@ -278,6 +288,7 @@ mod tests {
             Some("api"),
             "grouping survives a daemon restart, like the rename does"
         );
+        assert_eq!(restored.windows()[0].color(), Some("#ff8800"), "and so does the tag color");
 
         // A window with no override captures None and restores to the derived name ("shell").
         let plain = Window::from_parts(HashMap::new(), Node::leaf(PaneId::alloc()), PaneId::alloc());

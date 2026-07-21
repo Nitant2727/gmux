@@ -170,6 +170,7 @@ USAGE:
                                        browser (--pane targets the in-app WebView2 pane)
   gmux group -t @<win> <name...>       file a window under a collapsible sidebar group (--clear
                                        removes it); ids come from `gmux list-panes`
+  gmux color -t @<win> #rrggbb         tag a workspace row with a color (--clear removes it)
   gmux wait-for -t <pane> ...          block until --text <substr> appears, the pane --exit s,
                                        or its screen is --idle <secs>; [--timeout <secs>]
   gmux screenshot -t <pane> [-o F.bmp] render the pane's live grid to an image (headless GPU)

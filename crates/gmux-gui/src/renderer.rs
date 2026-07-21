@@ -57,6 +57,14 @@ const BADGE_PAD_V: f32 = 1.0;
 const RADIUS: f32 = 6.0; // rounded corner radius for sidebar rows + pane chrome
 const GLOW_W: f32 = 4.0; // accent focus glow around the active pane (must stay < MARGIN)
 const PROGRESS_RAIL: f32 = 3.0; // progress bar height along a sidebar row's bottom edge
+// cmux's leading rail for a color-tagged workspace: a 3px capsule inset 4px, 5px in from the ends.
+const COLOR_RAIL_W: f32 = 3.0;
+const COLOR_RAIL_INSET: f32 = 4.0;
+// Activity spinner: cmux spins 8 spokes on a 0.8s cycle, i.e. one spoke step every 100ms.
+const SPINNER_SPOKES: u32 = 8;
+pub const SPINNER_STEP_MS: u64 = 100;
+const SPINNER_R: f32 = 5.0; // ring radius
+const SPINNER_DOT: f32 = 2.5; // spoke dot diameter
 const BADGE_RADIUS: f32 = 4.0; // scroll badge chip
 const TITLE_STRIP: f32 = 22.0; // pane title band inside the border, above the cells
 const SEARCH_BAR: f32 = 22.0; // search band inside the border, below the cells (active pane only)
@@ -207,6 +215,10 @@ pub struct SidebarRow {
     pub attention: bool,
     /// Unread notifications in this workspace; `> 0` renders a count badge in place of the dot.
     pub unread: u32,
+    /// User tag color (`#rrggbb`): a leading rail on the row, brightened for the dark sidebar.
+    pub color: Option<String>,
+    /// A pane here has running children — spins the activity indicator.
+    pub busy: bool,
     pub active: bool,
     /// Cursor is hovering this row: draws a subtle hover fill (ignored when `active`).
     pub hover: bool,
@@ -355,6 +367,62 @@ fn on_accent(bg: Rgb) -> Rgb {
     }
 }
 
+/// Lift a user-chosen tag color for a dark sidebar, porting cmux's `brightenedForDarkAppearance`:
+/// in HSV, value becomes `min(1, max(v, 0.62) + (1 - v) * 0.28)` and saturation `s + (1 - s) * 0.12`
+/// — except for near-grays (`s <= 0.08`), which keep their saturation so brightening introduces no
+/// hue. Without this a dark red tag is indistinguishable from the panel. Pure/tested.
+fn brighten_for_dark(c: Rgb) -> Rgb {
+    let (r, g, b) = (c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let v = max;
+    let s = if max <= 0.0 { 0.0 } else { (max - min) / max };
+    let v2 = (v.max(0.62) + (1.0 - v) * 0.28).min(1.0);
+    let s2 = if s <= 0.08 { s } else { (s + (1.0 - s) * 0.12).min(1.0) };
+    // Hue is preserved by rebuilding from the original hue sector.
+    let h = if max <= min {
+        0.0
+    } else if max == r {
+        60.0 * (((g - b) / (max - min)) % 6.0)
+    } else if max == g {
+        60.0 * ((b - r) / (max - min) + 2.0)
+    } else {
+        60.0 * ((r - g) / (max - min) + 4.0)
+    };
+    let h = if h < 0.0 { h + 360.0 } else { h };
+    let cc = v2 * s2;
+    let x = cc * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = v2 - cc;
+    let (r2, g2, b2) = match (h / 60.0) as u32 {
+        0 => (cc, x, 0.0),
+        1 => (x, cc, 0.0),
+        2 => (0.0, cc, x),
+        3 => (0.0, x, cc),
+        4 => (x, 0.0, cc),
+        _ => (cc, 0.0, x),
+    };
+    let to8 = |f: f32| ((f + m) * 255.0).round().clamp(0.0, 255.0) as u8;
+    Rgb { r: to8(r2), g: to8(g2), b: to8(b2) }
+}
+
+/// `#rrggbb` -> `Rgb`, or `None` if it isn't six hex digits (a bad value just renders untagged).
+fn parse_hex_color(s: &str) -> Option<Rgb> {
+    let h = s.trim().trim_start_matches('#');
+    if h.len() != 6 {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+    Some(Rgb { r: byte(0)?, g: byte(2)?, b: byte(4)? })
+}
+
+/// Which of the 8 spinner spokes is the bright one at `frame`, and how lit each spoke is: the spoke
+/// under the head is fully lit and the rest fade around the ring, cmux's 8-spoke rotation. Pure.
+fn spoke_alpha(frame: u32, spoke: u32) -> f32 {
+    let behind = (frame + SPINNER_SPOKES - spoke) % SPINNER_SPOKES;
+    // Head at 1.0 down to 0.25 for the spoke just ahead of it.
+    1.0 - 0.75 * (behind as f32 / (SPINNER_SPOKES - 1) as f32)
+}
+
 /// The unread badge's text: the count, capped at "99+" so a runaway agent can't widen the row past
 /// its name. Pure/tested.
 fn unread_label(n: u32) -> String {
@@ -420,6 +488,9 @@ pub struct Renderer {
     // the window clear color and the sidebar text color.
     clear: wgpu::Color,
     text: Rgb,
+    /// Which spoke of the activity spinner is lit. The app advances it (only while something is
+    /// busy), so an idle gmux never redraws and idle CPU stays at zero.
+    spinner_frame: u32,
 }
 
 impl Renderer {
@@ -579,6 +650,7 @@ impl Renderer {
             atlas,
             atlas_bind_layout: bind_layout,
             clear: DEFAULT_CLEAR,
+            spinner_frame: 0,
             text: TEXT,
         }
     }
@@ -679,6 +751,12 @@ impl Renderer {
 
     /// Apply theme colors: `bg` becomes the window clear color, `fg` the sidebar text color.
     /// (Terminal cell colors are owned by the daemon's grid, so they are unaffected.)
+    /// Advance the activity spinner one spoke. Called only while a workspace is busy — an idle
+    /// gmux never ticks it, so the no-timers/0%-idle-CPU invariant holds.
+    pub fn advance_spinner(&mut self) {
+        self.spinner_frame = (self.spinner_frame + 1) % SPINNER_SPOKES;
+    }
+
     pub fn set_theme(&mut self, fg: Rgb, bg: Rgb) {
         self.text = fg;
         self.clear = wgpu::Color {
@@ -1137,6 +1215,15 @@ impl Renderer {
             } else if r.hover {
                 push_rounded(&mut rd, row_x0, top, row_x1, top + ROW_H, RADIUS, rgba(SIDEBAR_ROW_HOVER), fw, fh);
             }
+            // A tagged workspace carries cmux's leading rail: a brightened capsule at the row's
+            // left edge. It sits inside the pill, so it reads on the accent fill too.
+            let tag = r.color.as_deref().and_then(parse_hex_color).map(brighten_for_dark);
+            let mut text_x = text_x;
+            if let Some(tag) = tag {
+                let rx = row_x0 + COLOR_RAIL_INSET;
+                push_rounded(&mut rd, rx, top + 5.0, rx + COLOR_RAIL_W, top + ROW_H - 5.0, COLOR_RAIL_W / 2.0, rgba(tag), fw, fh);
+                text_x += COLOR_RAIL_W + COLOR_RAIL_INSET; // keep the label clear of the rail
+            }
             // On the accent fill the label is the readable-contrast color and the secondary line is
             // the same color at reduced alpha — cmux's `selectedWorkspaceForegroundNSColor`.
             let (label_col, sub_col) = if r.active {
@@ -1187,6 +1274,18 @@ impl Renderer {
                 let dot = if r.active { on_accent(accent()) } else { ATTENTION };
                 push_rounded(&mut rd, x1 - ATTN_DOT, y0, x1, y0 + ATTN_DOT, ATTN_DOT / 2.0, rgba(dot), fw, fh);
                 cursor_right -= ATTN_DOT + 4.0;
+            }
+            // Activity spinner: 8 spokes around a small ring, the lit one advancing per frame.
+            // Drawn on the SECOND line so it never competes with the badge for space.
+            if r.busy {
+                let ink = if r.active { on_accent(accent()) } else { TEXT_DIM };
+                let (cx_s, cy_s) = (right_edge - SPINNER_R, line2 + ch / 2.0);
+                for spoke in 0..SPINNER_SPOKES {
+                    let a = std::f32::consts::TAU * spoke as f32 / SPINNER_SPOKES as f32;
+                    let (px, py) = (cx_s + SPINNER_R * a.cos(), cy_s + SPINNER_R * a.sin());
+                    let h = SPINNER_DOT / 2.0;
+                    push_rounded(&mut rd, px - h, py - h, px + h, py + h, h, rgba_a(ink, spoke_alpha(self.spinner_frame, spoke)), fw, fh);
+                }
             }
             let _ = cursor_right; // (kept assigned so a later indicator can chain leftwards)
 
@@ -1717,6 +1816,49 @@ mod tests {
     fn cell(ch: char) -> Cell {
         let c = Rgb { r: 0, g: 0, b: 0 };
         Cell { ch, fg: c, bg: c, bold: false, italic: false, underline: false, inverse: false, wide: false }
+    }
+
+    #[test]
+    fn dark_brightening_lifts_dim_tags_and_keeps_grays_neutral() {
+        let lum = |c: Rgb| (0.2126 * c.r as f32 + 0.7152 * c.g as f32 + 0.0722 * c.b as f32) / 255.0;
+        // A dark red would disappear into the panel; brightening lifts it while keeping it red.
+        let dark_red = Rgb { r: 0x66, g: 0x00, b: 0x00 };
+        let lifted = brighten_for_dark(dark_red);
+        assert!(lum(lifted) > lum(dark_red), "dim tag must get brighter: {lifted:?}");
+        assert!(lifted.r > lifted.g && lifted.r > lifted.b, "and stay red: {lifted:?}");
+        // A neutral gray stays neutral — no hue introduced by the saturation boost.
+        let gray = brighten_for_dark(Rgb { r: 0x40, g: 0x40, b: 0x40 });
+        assert!(
+            gray.r.abs_diff(gray.g) <= 1 && gray.g.abs_diff(gray.b) <= 1,
+            "gray must not gain a hue: {gray:?}"
+        );
+        // An already-bright color is not pushed past white.
+        let bright = brighten_for_dark(Rgb { r: 0xff, g: 0xff, b: 0xff });
+        assert_eq!(bright, Rgb { r: 0xff, g: 0xff, b: 0xff });
+    }
+
+    #[test]
+    fn parses_tag_hex_and_rejects_junk() {
+        assert_eq!(parse_hex_color("#ff8800"), Some(Rgb { r: 0xff, g: 0x88, b: 0x00 }));
+        assert_eq!(parse_hex_color("ff8800"), Some(Rgb { r: 0xff, g: 0x88, b: 0x00 }));
+        assert_eq!(parse_hex_color("#fff"), None);
+        assert_eq!(parse_hex_color("#gggggg"), None);
+        assert_eq!(parse_hex_color(""), None);
+    }
+
+    #[test]
+    fn spinner_head_is_brightest_and_wraps() {
+        // The lit spoke follows the frame, and every other spoke trails off behind it.
+        for frame in 0..SPINNER_SPOKES {
+            let head = spoke_alpha(frame, frame);
+            assert!((head - 1.0).abs() < f32::EPSILON, "frame {frame} head should be full");
+            for spoke in 0..SPINNER_SPOKES {
+                assert!(spoke_alpha(frame, spoke) <= head + f32::EPSILON);
+                assert!(spoke_alpha(frame, spoke) >= 0.24, "no spoke fully vanishes");
+            }
+        }
+        // Frame 0's dimmest spoke is the one just ahead of the head (it wrapped all the way round).
+        assert!(spoke_alpha(0, 1) < spoke_alpha(0, 7));
     }
 
     #[test]

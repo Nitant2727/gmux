@@ -20,7 +20,9 @@ use winit::window::{Window, WindowId};
 
 use crate::config::{config_path, default_template, Action, Config, Keymap};
 use crate::daemon_client::{spawn_output_subscriber, DaemonClient};
-use crate::renderer::{GroupHeader, PaletteView, PaneView, SearchBar, SidebarItem, SidebarRow};
+use crate::renderer::{
+    GroupHeader, PaletteView, PaneView, SearchBar, SidebarItem, SidebarRow, SPINNER_STEP_MS,
+};
 use crate::Renderer;
 
 // The Windows clipboard helper lives in its own file but is declared here (a child of `app`) so the
@@ -733,6 +735,11 @@ struct State {
     snap_cache: HashMap<u64, PaneSnapshot>,
     /// Last activity (input or a wake): within `ACTIVE_WINDOW` the loop keeps polling at `FRAME`.
     last_activity: Instant,
+    /// Any workspace has a busy pane (from the last layout). While true — and ONLY while true —
+    /// the loop wakes on the spinner cadence to animate it.
+    any_busy: bool,
+    /// When the spinner last stepped.
+    last_spinner: Instant,
     /// Last idle-heartbeat time.
     last_heartbeat: Instant,
     /// Hash of the last layout's geometry; a change forces a full grid refetch (tab switch/split/resize).
@@ -950,6 +957,8 @@ impl ApplicationHandler for App {
             sub_alive: None,
             snap_cache: HashMap::new(),
             last_activity: now,
+            any_busy: false,
+            last_spinner: now,
             last_heartbeat: now,
             last_layout_hash: 0,
             force_full: true,
@@ -1378,6 +1387,17 @@ impl ApplicationHandler for App {
         if st.is_active(now) {
             st.window.request_redraw();
             el.set_control_flow(ControlFlow::WaitUntil(now + FRAME));
+        } else if st.any_busy {
+            // Something is running (a build, an agent): step the spinner at its own slow cadence
+            // and redraw just for that. Nothing else animates, and once the last busy pane goes
+            // quiet this branch stops firing — an idle gmux still never wakes.
+            let step = Duration::from_millis(SPINNER_STEP_MS);
+            if now.duration_since(st.last_spinner) >= step {
+                st.last_spinner = now;
+                st.renderer.advance_spinner();
+                st.window.request_redraw();
+            }
+            el.set_control_flow(ControlFlow::WaitUntil(now + step));
         } else {
             el.set_control_flow(ControlFlow::WaitUntil(now + HEARTBEAT));
         }
@@ -3009,7 +3029,7 @@ impl State {
                         Some(r) if r.id == t.id => format!("{}_", r.buffer),
                         _ => t.name.clone(),
                     };
-                    SidebarRow { name, branch: t.branch.clone(), attention: t.attention, unread: t.unread, active: t.active, progress: t.progress, progress_error: t.progress_error, hover: false }
+                    SidebarRow { name, branch: t.branch.clone(), attention: t.attention, unread: t.unread, color: t.color.clone(), busy: t.busy, active: t.active, progress: t.progress, progress_error: t.progress_error, hover: false }
                 })
                 .collect();
             // Tab overflow: window the rows to what fits (wheel over the sidebar scrolls). The
@@ -3020,6 +3040,8 @@ impl State {
                 rows = rows.into_iter().skip(off).take(cap).collect();
             }
             groups = layout.tabs.iter().skip(off).take(cap).map(|t| t.group.clone()).collect();
+            // Drives the spinner's wake cadence in `about_to_wait` — see `any_busy`.
+            self.any_busy = layout.tabs.iter().any(|t| t.busy);
 
             // Update the taskbar attention badge / progress based on overall attention.
             if let Some(tb) = &self.taskbar {
@@ -3658,6 +3680,8 @@ mod tests {
         let base = LayoutWire { zoomed: false, active_pane: 1, tabs: vec![], panes: panes() };
         let tab = gmux_proto::TabWire {
             group: None,
+            color: None,
+            busy: false,
             index: 0, id: 7, name: "changed".into(), branch: None, attention: true, unread: 0, active: true,
             progress: Some(50), progress_error: false,
         };
@@ -3739,8 +3763,6 @@ mod tests {
         assert_eq!(parse_activation_pane("welcome"), None);
     }
 
-    /// Fuzzy filter: case-insensitive subsequence, whitespace in the needle ignored; palette items
-    /// cover tabs (with alt+N hints) and all default-bound actions except the palette itself.
     /// Rows for grouping tests: named, otherwise inert.
     fn grow(name: &str, unread: u32) -> SidebarRow {
         SidebarRow {
@@ -3748,6 +3770,8 @@ mod tests {
             branch: None,
             attention: false,
             unread,
+            color: None,
+            busy: false,
             active: false,
             hover: false,
             progress: None,

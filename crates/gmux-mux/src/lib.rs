@@ -38,6 +38,8 @@ pub struct Window {
     /// Sidebar group this window belongs under (`None` = ungrouped, listed before every group).
     /// Persisted like `name`, so grouping survives a daemon restart.
     group: Option<String>,
+    /// User-chosen `#rrggbb` tag color for this workspace's sidebar row. Persisted like `name`.
+    color: Option<String>,
 }
 
 impl Window {
@@ -45,7 +47,7 @@ impl Window {
         let id = pane.id;
         let mut panes = HashMap::new();
         panes.insert(id, pane);
-        Window { id: WindowId::alloc(), panes, root: Node::leaf(id), active: id, zoom: false, name: None, group: None }
+        Window { id: WindowId::alloc(), panes, root: Node::leaf(id), active: id, zoom: false, name: None, group: None, color: None }
     }
 
     pub fn active_id(&self) -> PaneId {
@@ -80,7 +82,7 @@ impl Window {
     }
     /// Build a window from a pre-constructed pane map + split tree (used by session restore).
     pub fn from_parts(panes: HashMap<PaneId, Pane>, root: Node, active: PaneId) -> Window {
-        Window { id: WindowId::alloc(), panes, root, active, zoom: false, name: None, group: None }
+        Window { id: WindowId::alloc(), panes, root, active, zoom: false, name: None, group: None, color: None }
     }
 
     /// Set (or clear) this window's custom name override. An empty `name` clears it back to the
@@ -103,6 +105,22 @@ impl Window {
     /// This window's sidebar group, or `None` when it is ungrouped.
     pub fn group(&self) -> Option<&str> {
         self.group.as_deref()
+    }
+
+    /// Tag this workspace with a `#rrggbb` color, or clear it with an empty string.
+    pub fn set_color(&mut self, color: String) {
+        self.color = if color.is_empty() { None } else { Some(color) };
+    }
+
+    /// This workspace's tag color, or `None` when it is untagged.
+    pub fn color(&self) -> Option<&str> {
+        self.color.as_deref()
+    }
+
+    /// Whether any pane in this window has running children (a build, an agent) — the sidebar
+    /// spins a activity indicator while true.
+    pub fn is_busy(&self) -> bool {
+        self.panes().any(|p| p.is_busy())
     }
 
     /// Replace this window's split tree wholesale (the remote-tmux mirror path, where the remote's
