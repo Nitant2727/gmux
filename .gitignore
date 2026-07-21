@@ -1,6 +1,8 @@
 # Rust
 /target/
 **/target/
+# Scratch build dirs used to compile while a launched gmux.exe still holds target/.
+/target-*/
 Cargo.lock.bak
 
 # Vendored redistributables (fetched, not committed — see spikes/fetch-conpty.ps1)
