@@ -5,7 +5,7 @@
 //! toasts exactly like local ones.
 
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -72,6 +72,10 @@ pub struct Pane {
     terminal: Arc<Mutex<Terminal>>,
     events: Receiver<PaneEvent>,
     attention: Arc<Mutex<Attention>>,
+    /// How many notifications/bells have fired since the pane was last focused. `attention` is the
+    /// boolean "does this want you"; this is the count the sidebar badges, so ten finished agents
+    /// don't look the same as one.
+    unread: Arc<AtomicU32>,
     title: Arc<Mutex<String>>,
     cwd: Arc<Mutex<Option<String>>>,
     _pump: Option<JoinHandle<()>>,
@@ -84,6 +88,7 @@ pub struct Pane {
 fn pump_bytes(
     terminal: &Mutex<Terminal>,
     attention: &Mutex<Attention>,
+    unread: &AtomicU32,
     title: &Mutex<String>,
     cwd: &Mutex<Option<String>>,
     tx: &Sender<PaneEvent>,
@@ -96,10 +101,12 @@ fn pump_bytes(
             TermEvent::Damage => damaged = true,
             TermEvent::Notification(n) => {
                 attention.lock().unwrap().set_pending();
+                unread.fetch_add(1, Ordering::Relaxed);
                 let _ = tx.send(PaneEvent::Notification(n));
             }
             TermEvent::Bell => {
                 attention.lock().unwrap().set_pending();
+                unread.fetch_add(1, Ordering::Relaxed);
                 let _ = tx.send(PaneEvent::Bell);
             }
             TermEvent::Title(s) => {
@@ -155,14 +162,16 @@ impl Pane {
             terminal.lock().unwrap().advance(r.as_bytes());
         }
         let attention = Arc::new(Mutex::new(Attention::default()));
+        let unread = Arc::new(AtomicU32::new(0));
         let title = Arc::new(Mutex::new(String::new()));
         let cwd = Arc::new(Mutex::new(None));
 
         let (tx, events) = channel::<PaneEvent>();
-        let (t, a, ti, cw) = (terminal.clone(), attention.clone(), title.clone(), cwd.clone());
+        let (t, a, u, ti, cw) =
+            (terminal.clone(), attention.clone(), unread.clone(), title.clone(), cwd.clone());
         let pump = thread::spawn(move || {
             while let Ok(chunk) = rx.recv() {
-                pump_bytes(&t, &a, &ti, &cw, &tx, &chunk);
+                pump_bytes(&t, &a, &u, &ti, &cw, &tx, &chunk);
             }
             let _ = tx.send(PaneEvent::Exited);
         });
@@ -173,6 +182,7 @@ impl Pane {
             terminal,
             events,
             attention,
+            unread,
             title,
             cwd,
             _pump: Some(pump),
@@ -201,6 +211,7 @@ impl Pane {
             terminal: Arc::new(Mutex::new(Terminal::new(cols, rows))),
             events,
             attention: Arc::new(Mutex::new(Attention::default())),
+            unread: Arc::new(AtomicU32::new(0)),
             title: Arc::new(Mutex::new(String::new())),
             cwd: Arc::new(Mutex::new(None)),
             _pump: None,
@@ -213,7 +224,7 @@ impl Pane {
     /// local panes (their PTY pump owns the terminal feed).
     pub fn push_output(&self, bytes: &[u8]) {
         if let Backend::Remote { tx, .. } = &self.backend {
-            pump_bytes(&self.terminal, &self.attention, &self.title, &self.cwd, tx, bytes);
+            pump_bytes(&self.terminal, &self.attention, &self.unread, &self.title, &self.cwd, tx, bytes);
         }
     }
 
@@ -389,15 +400,22 @@ impl Pane {
         *self.attention.lock().unwrap()
     }
 
-    /// Focus the pane: clears attention.
+    /// Notifications/bells since this pane was last focused (the sidebar's unread badge count).
+    pub fn unread(&self) -> u32 {
+        self.unread.load(Ordering::Relaxed)
+    }
+
+    /// Focus the pane: clears attention and the unread count (the user has now seen them).
     pub fn focus(&self) {
         self.attention.lock().unwrap().focus();
+        self.unread.store(0, Ordering::Relaxed);
     }
 
     /// Externally request attention on this pane (e.g. the `notify` API method — equivalent to the
     /// pane emitting a notification itself).
     pub fn request_attention(&self) {
         self.attention.lock().unwrap().set_pending();
+        self.unread.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn title(&self) -> String {

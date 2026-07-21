@@ -49,6 +49,9 @@ const ROW_OUTER_PAD: f32 = 6.0; // gap between the row pill and the panel edges
 const ROW_PAD_V: f32 = 8.0; // padding above the first text line / below the last
 const ROW_STROKE: f32 = 1.5; // hairline around the selected row
 const ATTN_DOT: f32 = 8.0;
+// cmux's unread badge padding (`baseUnreadHorizontalPadding` 5 / `baseUnreadVerticalPadding` 1).
+const BADGE_PAD_H: f32 = 5.0;
+const BADGE_PAD_V: f32 = 1.0;
 const RADIUS: f32 = 6.0; // rounded corner radius for sidebar rows + pane chrome
 const GLOW_W: f32 = 4.0; // accent focus glow around the active pane (must stay < MARGIN)
 const PROGRESS_RAIL: f32 = 3.0; // progress bar height along a sidebar row's bottom edge
@@ -200,6 +203,8 @@ pub struct SidebarRow {
     pub name: String,
     pub branch: Option<String>,
     pub attention: bool,
+    /// Unread notifications in this workspace; `> 0` renders a count badge in place of the dot.
+    pub unread: u32,
     pub active: bool,
     /// Cursor is hovering this row: draws a subtle hover fill (ignored when `active`).
     pub hover: bool,
@@ -314,6 +319,16 @@ fn on_accent(bg: Rgb) -> Rgb {
         Rgb { r: 0, g: 0, b: 0 }
     } else {
         TEXT
+    }
+}
+
+/// The unread badge's text: the count, capped at "99+" so a runaway agent can't widen the row past
+/// its name. Pure/tested.
+fn unread_label(n: u32) -> String {
+    if n > 99 {
+        "99+".to_string()
+    } else {
+        n.to_string()
     }
 }
 
@@ -1063,12 +1078,29 @@ impl Renderer {
                 self.text_run(&txt, cursor_right - w, line1, rgba(col), fw, fh, &mut gl);
                 cursor_right -= w + 4.0;
             }
-            if r.attention {
+            // Unread count: cmux's capsule badge (accent fill, white semibold count, 5px/1px
+            // padding). With no count to show — a bell with no notification, or an old daemon that
+            // doesn't send one — it degrades to the plain attention dot.
+            if r.unread > 0 {
+                let label = unread_label(r.unread);
+                let tw = label.chars().count() as f32 * cw;
+                let (bw_, bh) = (tw + 2.0 * BADGE_PAD_H, ch + 2.0 * BADGE_PAD_V);
+                let x0 = cursor_right - bw_;
+                let y0 = line1 - BADGE_PAD_V;
+                // On the accent-filled active row the badge inverts, or it would vanish into it.
+                let (fill, ink) =
+                    if r.active { (on_accent(accent()), accent()) } else { (accent(), TEXT) };
+                push_rounded(&mut rd, x0, y0, cursor_right, y0 + bh, bh / 2.0, rgba(fill), fw, fh);
+                self.text_run(&label, x0 + BADGE_PAD_H, line1, rgba(ink), fw, fh, &mut gl);
+                cursor_right -= bw_ + 4.0;
+            } else if r.attention {
                 let x1 = cursor_right;
                 let y0 = line1 + (ch - ATTN_DOT) / 2.0;
                 let dot = if r.active { on_accent(accent()) } else { ATTENTION };
                 push_rounded(&mut rd, x1 - ATTN_DOT, y0, x1, y0 + ATTN_DOT, ATTN_DOT / 2.0, rgba(dot), fw, fh);
+                cursor_right -= ATTN_DOT + 4.0;
             }
+            let _ = cursor_right; // (kept assigned so a later indicator can chain leftwards)
 
             // Progress rail along the row's bottom edge: the percentage as a bar, not just digits.
             // An error fills the whole rail in ERROR (there is no meaningful fraction to show).
@@ -1596,6 +1628,16 @@ mod tests {
     fn cell(ch: char) -> Cell {
         let c = Rgb { r: 0, g: 0, b: 0 };
         Cell { ch, fg: c, bg: c, bold: false, italic: false, underline: false, inverse: false, wide: false }
+    }
+
+    #[test]
+    fn unread_label_caps_at_99_plus() {
+        assert_eq!(unread_label(1), "1");
+        assert_eq!(unread_label(42), "42");
+        assert_eq!(unread_label(99), "99");
+        // Past 99 the badge stops growing, so a runaway agent can't squeeze out the tab name.
+        assert_eq!(unread_label(100), "99+");
+        assert_eq!(unread_label(u32::MAX), "99+");
     }
 
     #[test]

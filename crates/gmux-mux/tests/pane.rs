@@ -96,7 +96,25 @@ fn osc9_sets_attention_and_emits_event() {
         .any(|e| matches!(e, PaneEvent::Notification(n) if n.title.contains("agent needs input")));
     assert!(saw_notification, "expected a PaneEvent::Notification carrying the message");
 
-    // Focusing the pane clears attention.
+    // The same notification counts toward the sidebar's unread badge.
+    assert_eq!(pane.unread(), 1, "one OSC 9 should count as one unread");
+
+    // Focusing the pane clears attention and the unread count.
     pane.focus();
+    assert_eq!(pane.attention(), Attention::Quiet);
+    assert_eq!(pane.unread(), 0, "focusing marks the pane read");
+}
+
+#[test]
+fn request_attention_counts_toward_unread() {
+    // The `notify` API path (no PTY needed): each request is one unread, focus clears them.
+    let pane = Pane::remote(1, 80, 24, Box::new(|_| {}));
+    assert_eq!(pane.unread(), 0);
+    pane.request_attention();
+    pane.request_attention();
+    assert_eq!(pane.unread(), 2);
+    assert!(pane.attention().is_pending());
+    pane.focus();
+    assert_eq!(pane.unread(), 0);
     assert_eq!(pane.attention(), Attention::Quiet);
 }

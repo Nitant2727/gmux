@@ -170,7 +170,8 @@ impl Window {
                 .unwrap_or_else(|| "shell".to_string())
         });
         let attention = self.panes().any(|p| p.attention().is_pending());
-        WorkspaceInfo { name, cwd, branch, attention }
+        let unread = self.panes().map(|p| p.unread()).sum();
+        WorkspaceInfo { name, cwd, branch, attention, unread }
     }
 
     /// Each pane's rectangle within a `(w, h)` area. When zoomed, the active pane fills it.
