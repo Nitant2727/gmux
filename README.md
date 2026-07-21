@@ -79,9 +79,10 @@ Rebindable in `%APPDATA%\gmux\gmux.json` (`Ctrl+,` opens it; see the generated t
 their quoted paths. Wheel scrolls the pane under the cursor; the viewport is content-pinned while
 a background pane keeps producing output.
 
-The chrome follows your Windows accent color (active pane border, focus glow, highlights). Pin a
-different one with `"theme": { "accent": "#60cdff" }`; terminal cell colors are separate and come
-from `theme.scheme` / `theme.ansi`.
+The chrome follows cmux's look: the selected workspace is a solid accent pill, a workspace wanting
+attention washes blue, and the focused pane carries an accent ring. Set `"theme": { "accent":
+"system" }` to follow your Windows accent color instead, or `"#rrggbb"` to pin your own. Terminal
+cell colors are separate and come from `theme.scheme` / `theme.ansi`.
 
 ## Platform
 

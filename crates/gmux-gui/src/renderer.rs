@@ -7,6 +7,7 @@ use gmux_mux::{Attention, Cell, PaneSnapshot, Rect, Rgb};
 use wgpu::util::DeviceExt;
 
 use crate::atlas::{Atlas, GlyphLookup};
+use crate::config::AccentChoice;
 
 // Design tokens (single source of truth).
 // Fluent dark (WinUI layer/accent tokens): neutral gray layers, cyan accent, semantic status hues.
@@ -16,10 +17,15 @@ const BG_SIDEBAR: Rgb = Rgb { r: 0x20, g: 0x20, b: 0x20 };
 const BG_PANE: Rgb = Rgb { r: 0x27, g: 0x27, b: 0x27 }; // pane fill + letterbox
 const SIDEBAR_ROW_ACTIVE: Rgb = Rgb { r: 0x33, g: 0x33, b: 0x33 };
 const SIDEBAR_ROW_HOVER: Rgb = Rgb { r: 0x2a, g: 0x2a, b: 0x2a }; // between BG_SIDEBAR and active
-const ACCENT_FALLBACK: Rgb = Rgb { r: 0x60, g: 0xcd, b: 0xff }; // Fluent default accent (light-2)
+// cmux's accent (its `cmuxAccentNSColor` for the dark scheme: rgb 0,145,255). gmux follows it by
+// default so the two apps look like the same product; `"accent": "system"` opts into the Windows
+// accent instead, and any hex pins a custom one.
+const ACCENT_FALLBACK: Rgb = Rgb { r: 0x00, g: 0x91, b: 0xff };
 const TEXT: Rgb = Rgb { r: 0xff, g: 0xff, b: 0xff };
 const TEXT_DIM: Rgb = Rgb { r: 0x9d, g: 0x9d, b: 0x9d };
-const ATTENTION: Rgb = Rgb { r: 0xff, g: 0x99, b: 0xa4 }; // attention dot / ring
+// cmux rings a pane that wants you in systemBlue, not a warning color — attention there means
+// "this agent has news", not "this is broken". Matching it (macOS dark systemBlue).
+const ATTENTION: Rgb = Rgb { r: 0x0a, g: 0x84, b: 0xff }; // attention dot / ring
 const PEACH: Rgb = Rgb { r: 0xff, g: 0xd3, b: 0x3a }; // search-match highlight (Fluent caution)
 const PROGRESS: Rgb = Rgb { r: 0x6c, g: 0xcb, b: 0x5f };
 const ERROR: Rgb = Rgb { r: 0xff, g: 0x99, b: 0xa4 };
@@ -36,8 +42,12 @@ const SIDEBAR_W: u32 = 220; // fixed sidebar width (app caps it to 1/3 window)
 const SIDEBAR_PAD_TOP: f32 = 16.0;
 const ROW_H: f32 = 48.0;
 const ROW_GAP: f32 = 4.0;
-const ROW_PAD_H: f32 = 12.0; // horizontal padding inside a sidebar row
-const ACCENT_BAR_W: f32 = 3.0; // active-row left-edge bar
+// cmux's sidebar metrics (SidebarWorkspaceListMetrics + the row's own padding): 10px inside the
+// row, 6px between the row and the panel edge, 8px above/below the text block.
+const ROW_PAD_H: f32 = 10.0; // horizontal padding inside a sidebar row
+const ROW_OUTER_PAD: f32 = 6.0; // gap between the row pill and the panel edges
+const ROW_PAD_V: f32 = 8.0; // padding above the first text line / below the last
+const ROW_STROKE: f32 = 1.5; // hairline around the selected row
 const ATTN_DOT: f32 = 8.0;
 const RADIUS: f32 = 6.0; // rounded corner radius for sidebar rows + pane chrome
 const GLOW_W: f32 = 4.0; // accent focus glow around the active pane (must stay < MARGIN)
@@ -69,24 +79,27 @@ fn darker(c: Rgb, a: f32) -> Rgb {
 /// Read on every frame build, so it stays an atomic rather than a lock.
 static ACCENT_RGB: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-/// The accent used for active borders, highlights and chips. Resolves once from the user's Windows
-/// accent color (what every WinUI app does), unless [`set_accent`] pinned one from the config.
+/// The accent used for the selected tab fill, active borders, highlights and chips. Defaults to
+/// [`ACCENT_FALLBACK`]; [`set_accent`] swaps in a pinned or system-derived color.
 pub fn accent() -> Rgb {
     use std::sync::atomic::Ordering;
     let packed = ACCENT_RGB.load(Ordering::Relaxed);
-    if packed != 0 {
-        return unpack_accent(packed);
+    if packed == 0 {
+        return ACCENT_FALLBACK;
     }
-    let c = system_accent().map(ensure_legible).unwrap_or(ACCENT_FALLBACK);
-    set_accent(Some(c));
-    c
+    unpack_accent(packed)
 }
 
-/// Pin the accent (config `theme.accent`), or clear the pin so the next [`accent`] re-reads the
-/// system color. Called at startup and on config hot-reload.
-pub fn set_accent(c: Option<Rgb>) {
+/// Apply the config's accent choice: the built-in default, the Windows accent (lifted if it is too
+/// dark to read against), or a pinned color. Called at startup and on config hot-reload.
+pub fn set_accent(choice: AccentChoice) {
     use std::sync::atomic::Ordering;
-    let packed = match c {
+    let color = match choice {
+        AccentChoice::Default => None,
+        AccentChoice::Fixed([r, g, b]) => Some(Rgb { r, g, b }),
+        AccentChoice::System => system_accent().map(ensure_legible),
+    };
+    let packed = match color {
         Some(c) => 1 << 24 | (c.r as u32) << 16 | (c.g as u32) << 8 | c.b as u32,
         None => 0,
     };
@@ -279,6 +292,28 @@ fn push_rounded_grad(out: &mut Vec<RoundedVertex>, x0: f32, y0: f32, x1: f32, y1
             radius,
             color: if ly < 0.0 { top } else { bot },
         });
+    }
+}
+
+/// Stroke a rounded rect as a ring `w` px thick: the outer rounded quad, then the inner one punched
+/// back to the surface color would need a second pass, so instead this pushes four thin rounded
+/// bars along the edges — cheap, and at 1.5px the corner gap is invisible.
+#[allow(clippy::too_many_arguments)]
+fn stroke_rounded(out: &mut Vec<RoundedVertex>, x0: f32, y0: f32, x1: f32, y1: f32, radius: f32, w: f32, color: [f32; 4], fw: f32, fh: f32) {
+    push_rounded(out, x0 + radius, y0, x1 - radius, y0 + w, 0.0, color, fw, fh); // top
+    push_rounded(out, x0 + radius, y1 - w, x1 - radius, y1, 0.0, color, fw, fh); // bottom
+    push_rounded(out, x0, y0 + radius, x0 + w, y1 - radius, 0.0, color, fw, fh); // left
+    push_rounded(out, x1 - w, y0 + radius, x1, y1 - radius, 0.0, color, fw, fh); // right
+}
+
+/// Text color that reads on `bg`: white or black, whichever has more contrast. cmux computes its
+/// selected-row foreground the same way, which is what lets an arbitrary accent stay legible.
+fn on_accent(bg: Rgb) -> Rgb {
+    let lum = (0.2126 * bg.r as f32 + 0.7152 * bg.g as f32 + 0.0722 * bg.b as f32) / 255.0;
+    if lum > 0.55 {
+        Rgb { r: 0, g: 0, b: 0 }
+    } else {
+        TEXT
     }
 }
 
@@ -971,40 +1006,45 @@ impl Renderer {
         quad_grad(&mut bg, 0.0, 0.0, sw, fh, rgba(BG_SIDEBAR), rgba(darker(BG_SIDEBAR, 0.28)));
 
         // Section label: "WORKSPACES" in dim uppercase.
-        self.text_run("WORKSPACES", ROW_PAD_H, SIDEBAR_PAD_TOP, rgba(TEXT_DIM), fw, fh, &mut gl);
+        let text_x = ROW_OUTER_PAD + ROW_PAD_H;
+        self.text_run("WORKSPACES", text_x, SIDEBAR_PAD_TOP, rgba(TEXT_DIM), fw, fh, &mut gl);
         let rows_y0 = SIDEBAR_PAD_TOP + ch + 8.0;
-        let text_x = ROW_PAD_H;
-        let pad_v = ((ROW_H - 2.0 * ch) / 2.0).max(2.0); // vertically center the two text lines
-        let right_edge = sw - ROW_PAD_H;
+        // Text sits ROW_PAD_V from the row's top edge (cmux pads the block, it does not centre it);
+        // clamped so a large font can't push the second line out of the row.
+        let pad_v = ROW_PAD_V.min(((ROW_H - 2.0 * ch) / 2.0).max(2.0));
+        let right_edge = sw - ROW_OUTER_PAD - ROW_PAD_H;
         let stride = ROW_H + ROW_GAP;
 
         for (i, r) in rows.iter().enumerate() {
             let top = rows_y0 + i as f32 * stride;
             let line1 = top + pad_v;
             let line2 = line1 + ch;
-            // Row fill: active wins over hover. Accent bar sits in the straight span so its sharp
-            // corners never poke past the rounded fill.
+            // cmux fills the selected workspace row SOLID with the accent (not a tint) and strokes
+            // it with a 1.5px hairline; text flips to whatever reads on that fill. Everything else
+            // in the row follows from which of those two worlds it is in.
+            let (row_x0, row_x1) = (ROW_OUTER_PAD, sw - ROW_OUTER_PAD);
             if r.active {
-                // Fluent tints its selection with the accent rather than using a neutral gray, and
-                // the row carries the same faint glow as the active pane so the two read as one
-                // focus story. A pending row keeps ATTENTION as its tint so it stays the loud one.
-                let tint = if r.attention { ATTENTION } else { accent() };
-                let fill = blend(tint, SIDEBAR_ROW_ACTIVE, 0.10);
-                push_rounded(&mut rd, -GLOW_W, top - GLOW_W / 2.0, sw, top + ROW_H + GLOW_W / 2.0, RADIUS + GLOW_W, rgba_a(tint, 0.10), fw, fh);
-                push_rounded_grad(&mut rd, 0.0, top, sw, top + ROW_H, RADIUS, rgba(fill), rgba(darker(fill, 0.22)), fw, fh);
-                push_rounded(&mut rd, 0.0, top + RADIUS, ACCENT_BAR_W, top + ROW_H - RADIUS, 0.0, rgba(tint), fw, fh);
+                let fill = accent();
+                push_rounded(&mut rd, row_x0, top, row_x1, top + ROW_H, RADIUS, rgba(fill), fw, fh);
+                stroke_rounded(&mut rd, row_x0, top, row_x1, top + ROW_H, RADIUS, ROW_STROKE, rgba_a(TEXT, 0.5), fw, fh);
             } else if r.attention {
-                // An unfocused workspace waiting on you: a whole-row wash, not just the dot, so a
-                // sidebar of ten tabs still answers "who needs me" at a glance.
-                let fill = blend(ATTENTION, BG_SIDEBAR, 0.09);
-                push_rounded_grad(&mut rd, 0.0, top, sw, top + ROW_H, RADIUS, rgba(fill), rgba(darker(fill, 0.20)), fw, fh);
+                // An unfocused workspace waiting on you: a whole-row wash, so a sidebar of ten tabs
+                // still answers "who needs me" at a glance.
+                push_rounded(&mut rd, row_x0, top, row_x1, top + ROW_H, RADIUS, rgba_a(ATTENTION, 0.25), fw, fh);
             } else if r.hover {
-                let f = rgba(SIDEBAR_ROW_HOVER);
-                push_rounded_grad(&mut rd, 0.0, top, sw, top + ROW_H, RADIUS, f, rgba(darker(SIDEBAR_ROW_HOVER, 0.20)), fw, fh);
+                push_rounded(&mut rd, row_x0, top, row_x1, top + ROW_H, RADIUS, rgba(SIDEBAR_ROW_HOVER), fw, fh);
             }
-            self.text_run(&r.name, text_x, line1, rgba(self.text), fw, fh, &mut gl);
+            // On the accent fill the label is the readable-contrast color and the secondary line is
+            // the same color at reduced alpha — cmux's `selectedWorkspaceForegroundNSColor`.
+            let (label_col, sub_col) = if r.active {
+                let on = on_accent(accent());
+                (rgba(on), rgba_a(on, 0.72))
+            } else {
+                (rgba(self.text), rgba(TEXT_DIM))
+            };
+            self.text_run(&r.name, text_x, line1, label_col, fw, fh, &mut gl);
             if let Some(b) = &r.branch {
-                self.text_run(&format!("git:{b}"), text_x, line2, rgba(TEXT_DIM), fw, fh, &mut gl);
+                self.text_run(&format!("git:{b}"), text_x, line2, sub_col, fw, fh, &mut gl);
             }
 
             // Right-aligned indicators on line 1: progress text (PROGRESS / ERROR), then the
@@ -1016,6 +1056,9 @@ impl Renderer {
                 } else {
                     (format!("{}%", r.progress.unwrap()), PROGRESS)
                 };
+                // On the accent fill, PROGRESS/ERROR green and red both muddy; the readable
+                // foreground carries the number and the rail below carries the color.
+                let col = if r.active { on_accent(accent()) } else { col };
                 let w = txt.chars().count() as f32 * cw;
                 self.text_run(&txt, cursor_right - w, line1, rgba(col), fw, fh, &mut gl);
                 cursor_right -= w + 4.0;
@@ -1023,16 +1066,17 @@ impl Renderer {
             if r.attention {
                 let x1 = cursor_right;
                 let y0 = line1 + (ch - ATTN_DOT) / 2.0;
-                push_rounded(&mut rd, x1 - ATTN_DOT, y0, x1, y0 + ATTN_DOT, ATTN_DOT / 2.0, rgba(ATTENTION), fw, fh);
+                let dot = if r.active { on_accent(accent()) } else { ATTENTION };
+                push_rounded(&mut rd, x1 - ATTN_DOT, y0, x1, y0 + ATTN_DOT, ATTN_DOT / 2.0, rgba(dot), fw, fh);
             }
 
             // Progress rail along the row's bottom edge: the percentage as a bar, not just digits.
             // An error fills the whole rail in ERROR (there is no meaningful fraction to show).
             if r.progress_error || r.progress.is_some() {
-                // Full-bleed along the row's bottom edge (not inset to the text column): the two
-                // text lines fill the 48px row, so an inset rail reads as an underline of the
-                // branch name instead of a rail.
-                let (x0, x1) = (0.0, sw);
+                // Along the row pill's bottom edge (not inset to the text column): the two text
+                // lines fill the 48px row, so an inset rail reads as an underline of the branch
+                // name instead of a rail.
+                let (x0, x1) = (row_x0, row_x1);
                 let (y0, y1) = (top + ROW_H - PROGRESS_RAIL, top + ROW_H);
                 push_rounded(&mut rd, x0, y0, x1, y1, 1.0, rgba_a(TEXT, 0.10), fw, fh);
                 let (w, col) = if r.progress_error {
@@ -1049,7 +1093,7 @@ impl Renderer {
         // '+ new tab' row, immediately after the last workspace row (matches sidebar_new_tab_at).
         let plus_top = rows_y0 + rows.len() as f32 * stride;
         if plus_hover {
-            push_rounded(&mut rd, 0.0, plus_top, sw, plus_top + ROW_H, RADIUS, rgba(SIDEBAR_ROW_HOVER), fw, fh);
+            push_rounded(&mut rd, ROW_OUTER_PAD, plus_top, sw - ROW_OUTER_PAD, plus_top + ROW_H, RADIUS, rgba(SIDEBAR_ROW_HOVER), fw, fh);
         }
         self.text_run("+ new tab", text_x, plus_top + (ROW_H - ch) / 2.0, rgba(TEXT_DIM), fw, fh, &mut gl);
 
@@ -1587,16 +1631,24 @@ mod tests {
     }
 
     #[test]
-    fn set_accent_pins_and_clears() {
-        let pinned = Rgb { r: 0x12, g: 0xc4, b: 0x9a };
-        set_accent(Some(pinned));
-        assert_eq!(accent(), pinned);
-        // Clearing un-pins: the next read re-resolves (system or fallback), and either way it is a
-        // legible color, not the zero sentinel.
-        set_accent(None);
-        let resolved = accent();
-        assert!(resolved.r as u16 + resolved.g as u16 + resolved.b as u16 > 0);
-        set_accent(None);
+    fn accent_choice_applies_and_resets() {
+        let pinned = [0x12u8, 0xc4, 0x9a];
+        set_accent(AccentChoice::Fixed(pinned));
+        assert_eq!(accent(), Rgb { r: pinned[0], g: pinned[1], b: pinned[2] });
+        // System resolves to a legible color (or falls back when the registry read fails).
+        set_accent(AccentChoice::System);
+        let sys = accent();
+        assert!(sys.r as u16 + sys.g as u16 + sys.b as u16 > 0);
+        // Default is cmux blue, and resetting must actually go back to it.
+        set_accent(AccentChoice::Default);
+        assert_eq!(accent(), ACCENT_FALLBACK);
+    }
+
+    #[test]
+    fn on_accent_flips_with_fill_brightness() {
+        // White text on the cmux blue; black on a bright accent a user might pin.
+        assert_eq!(on_accent(ACCENT_FALLBACK), TEXT);
+        assert_eq!(on_accent(Rgb { r: 0xff, g: 0xd3, b: 0x3a }), Rgb { r: 0, g: 0, b: 0 });
     }
 
     #[test]

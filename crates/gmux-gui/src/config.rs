@@ -151,8 +151,9 @@ pub struct Theme {
     /// Non-WT inline path: 16 `"#rrggbb"` strings for the ANSI 0..=15 system colors. Applied over
     /// the defaults (and over `scheme`, if both are given); entries past 16 or bad hex are ignored.
     pub ansi: Option<Vec<String>>,
-    /// Chrome accent (active pane border, focus glow, highlights). Unset = follow the user's
-    /// Windows accent color, like every other WinUI app.
+    /// Chrome accent (selected tab fill, active pane border, focus glow, highlights). Unset = the
+    /// built-in cmux blue; `"system"` follows the user's Windows accent color; any `#rrggbb` pins
+    /// that color.
     pub accent: Option<String>,
 }
 
@@ -183,6 +184,17 @@ const WT_ANSI_KEYS: [&str; 16] = [
     "brightBlack", "brightRed", "brightGreen", "brightYellow", "brightBlue", "brightPurple",
     "brightCyan", "brightWhite",
 ];
+
+/// What the config asks the chrome accent to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccentChoice {
+    /// The built-in accent (cmux blue).
+    Default,
+    /// Follow the Windows accent color.
+    System,
+    /// A pinned `#rrggbb`.
+    Fixed([u8; 3]),
+}
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
@@ -222,9 +234,14 @@ impl Config {
         self.theme.as_ref().and_then(|t| t.bg.as_deref()).and_then(parse_hex).unwrap_or(default)
     }
 
-    /// `theme.accent` as `[r, g, b]`. `None` (unset or bad hex) means "follow the system accent".
-    pub fn accent(&self) -> Option<[u8; 3]> {
-        self.theme.as_ref().and_then(|t| t.accent.as_deref()).and_then(parse_hex)
+    /// How `theme.accent` resolves: a pinned color, the Windows accent (`"system"`), or the
+    /// built-in default when unset or unparseable.
+    pub fn accent(&self) -> AccentChoice {
+        match self.theme.as_ref().and_then(|t| t.accent.as_deref()) {
+            Some(s) if s.eq_ignore_ascii_case("system") => AccentChoice::System,
+            Some(s) => parse_hex(s).map_or(AccentChoice::Default, AccentChoice::Fixed),
+            None => AccentChoice::Default,
+        }
     }
 
     /// Resolve the full terminal palette from `theme`, layering (in order) over the gmux defaults:
@@ -646,19 +663,19 @@ mod tests {
     }
 
     #[test]
-    fn accent_is_optional_and_hex_parsed() {
-        // Unset (and bad hex) means "follow the Windows accent"; a good hex pins the chrome accent.
-        assert_eq!(Config::default().accent(), None);
-        let bad = Config {
-            theme: Some(Theme { accent: Some("nope".into()), ..Default::default() }),
+    fn accent_choice_resolves_three_ways() {
+        let with = |v: &str| Config {
+            theme: Some(Theme { accent: Some(v.into()), ..Default::default() }),
             ..Default::default()
         };
-        assert_eq!(bad.accent(), None);
-        let pinned = Config {
-            theme: Some(Theme { accent: Some("#60cdff".into()), ..Default::default() }),
-            ..Default::default()
-        };
-        assert_eq!(pinned.accent(), Some([0x60, 0xcd, 0xff]));
+        // Unset, and any unparseable value, fall back to the built-in accent.
+        assert_eq!(Config::default().accent(), AccentChoice::Default);
+        assert_eq!(with("nope").accent(), AccentChoice::Default);
+        // "system" (any casing) opts into the Windows accent color.
+        assert_eq!(with("system").accent(), AccentChoice::System);
+        assert_eq!(with("System").accent(), AccentChoice::System);
+        // A hex pins that exact color.
+        assert_eq!(with("#60cdff").accent(), AccentChoice::Fixed([0x60, 0xcd, 0xff]));
     }
 
     #[test]

@@ -154,8 +154,11 @@ mod tests {
         drop(r);
         let (w, _h, px) = render_offscreen(&snap, Attention::Pending, cw, ch).expect("render");
         let corner = pixel(&px, w, 1, 1);
-        // Attention ring is now the pink ATTENTION token (#f38ba8), not blue.
-        assert!(corner[0] > 150 && corner[1] > 80 && corner[2] > 100, "expected pink ring, got {corner:?}");
+        // The attention ring is cmux's notification blue (systemBlue #0a84ff): blue-dominant.
+        assert!(
+            corner[2] > 150 && corner[2] > corner[0] + 60,
+            "expected a blue ring, got {corner:?}"
+        );
     }
 
     #[test]
@@ -192,12 +195,18 @@ mod tests {
         }];
         r.render_frame(&view, &rows, sw, &[], w, h, "", false, None, None, None);
         let px = read_rgba(&r, &tex, w, h).expect("readback");
-        // Panel bg is #202020 (r≈32, and only darker further down the gradient); active fill is
-        // #333333 (r≈51) fading to r≈40. Threshold 40 still splits them.
-        let corner = pixel(&px, w, 1, rows_y0 + 1);
+        // The active row is a solid accent pill (cmux blue #0091ff) inset ROW_OUTER_PAD from the
+        // panel edge. x=1 is outside the pill entirely (neutral panel gray); the centre is accent.
+        let outside = pixel(&px, w, 1, rows_y0 + row_h / 2);
         let center = pixel(&px, w, sw / 2, rows_y0 + row_h / 2);
-        assert!(corner[0] < 40, "active-row corner should round away to panel bg, got {corner:?}");
-        assert!(center[0] > 40, "active-row centre should be the solid fill, got {center:?}");
+        assert!(
+            outside[2] < 60 && outside[2].abs_diff(outside[0]) < 12,
+            "left of the pill should be the neutral panel, got {outside:?}"
+        );
+        assert!(
+            center[2] > 150 && center[2] > center[0] + 80,
+            "active-row centre should be the solid accent fill, got {center:?}"
+        );
     }
 
     #[test]
