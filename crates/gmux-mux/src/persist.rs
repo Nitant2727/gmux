@@ -42,6 +42,10 @@ pub struct WindowSnapshot {
     /// Workspace tag color (`#rrggbb`), reapplied on restore. `#[serde(default)]` for older files.
     #[serde(default)]
     pub color: Option<String>,
+    /// A pull-request badge `(number, status_token)`, reapplied on restore. `#[serde(default)]` so
+    /// older snapshots load without one.
+    #[serde(default)]
+    pub pr: Option<(u32, String)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -148,6 +152,7 @@ impl WindowSnapshot {
             name: window.name().map(str::to_string),
             group: window.group().map(str::to_string),
             color: window.color().map(str::to_string),
+            pr: window.pr().map(|b| (b.number, b.status.as_str().to_string())),
         })
     }
 
@@ -177,6 +182,11 @@ impl WindowSnapshot {
         }
         if let Some(color) = &self.color {
             window.set_color(color.clone());
+        }
+        if let Some((number, status)) = &self.pr {
+            if let Some(status) = crate::PrStatus::parse(status) {
+                window.set_pr(Some(crate::PrBadge { number: *number, status }));
+            }
         }
         Ok(window)
     }
@@ -244,6 +254,7 @@ mod tests {
                 name: Some("backend".into()),
                 group: Some("api".into()),
                 color: Some("#ff8800".into()),
+                pr: Some((42, "open".into())),
             }],
         };
         let json = serde_json::to_string(&snap).unwrap();
@@ -256,6 +267,7 @@ mod tests {
         assert_eq!(w.name, None, "absent name defaults to None");
         assert_eq!(w.group, None, "absent group defaults to None (older snapshots are ungrouped)");
         assert_eq!(w.color, None, "absent color defaults to None (older snapshots are untagged)");
+        assert_eq!(w.pr, None, "absent pr defaults to None");
     }
 
     /// Contract 6: a renamed window's custom name survives a snapshot round-trip
@@ -268,6 +280,7 @@ mod tests {
         win.set_name("backend".to_string());
         win.set_group("api".to_string());
         win.set_color("#ff8800".to_string());
+        win.set_pr(Some(crate::PrBadge { number: 42, status: crate::PrStatus::Draft }));
         let session = Session::from_windows("s", vec![win], 0);
 
         let snap = SessionSnapshot::capture(&session);
@@ -289,6 +302,11 @@ mod tests {
             "grouping survives a daemon restart, like the rename does"
         );
         assert_eq!(restored.windows()[0].color(), Some("#ff8800"), "and so does the tag color");
+        assert_eq!(
+            restored.windows()[0].pr(),
+            Some(crate::PrBadge { number: 42, status: crate::PrStatus::Draft }),
+            "and the PR badge, so it need not be re-resolved every launch"
+        );
 
         // A window with no override captures None and restores to the derived name ("shell").
         let plain = Window::from_parts(HashMap::new(), Node::leaf(PaneId::alloc()), PaneId::alloc());

@@ -14,7 +14,7 @@ pub use ids::{PaneId, SessionId, WindowId};
 pub use layout::{FocusDir, Rect, SplitDir};
 pub use pane::{Pane, PaneEvent, PaneSnapshot};
 pub use persist::SessionSnapshot;
-pub use workspace::WorkspaceInfo;
+pub use workspace::{PrBadge, PrStatus, WorkspaceInfo};
 
 // Re-export the types callers need so they don't have to depend on gmux-pty / gmux-vt directly.
 pub use gmux_pty::PtySize;
@@ -40,6 +40,9 @@ pub struct Window {
     group: Option<String>,
     /// User-chosen `#rrggbb` tag color for this workspace's sidebar row. Persisted like `name`.
     color: Option<String>,
+    /// A pull request badge (number + state) pushed in via `gmux pr`. Persisted like `name`, so a
+    /// badge survives a daemon restart (the CLI need not re-resolve it every launch).
+    pr: Option<workspace::PrBadge>,
 }
 
 impl Window {
@@ -47,7 +50,7 @@ impl Window {
         let id = pane.id;
         let mut panes = HashMap::new();
         panes.insert(id, pane);
-        Window { id: WindowId::alloc(), panes, root: Node::leaf(id), active: id, zoom: false, name: None, group: None, color: None }
+        Window { id: WindowId::alloc(), panes, root: Node::leaf(id), active: id, zoom: false, name: None, group: None, color: None, pr: None }
     }
 
     pub fn active_id(&self) -> PaneId {
@@ -82,7 +85,7 @@ impl Window {
     }
     /// Build a window from a pre-constructed pane map + split tree (used by session restore).
     pub fn from_parts(panes: HashMap<PaneId, Pane>, root: Node, active: PaneId) -> Window {
-        Window { id: WindowId::alloc(), panes, root, active, zoom: false, name: None, group: None, color: None }
+        Window { id: WindowId::alloc(), panes, root, active, zoom: false, name: None, group: None, color: None, pr: None }
     }
 
     /// Set (or clear) this window's custom name override. An empty `name` clears it back to the
@@ -115,6 +118,16 @@ impl Window {
     /// This workspace's tag color, or `None` when it is untagged.
     pub fn color(&self) -> Option<&str> {
         self.color.as_deref()
+    }
+
+    /// Set (or clear, with `None`) this workspace's pull-request badge.
+    pub fn set_pr(&mut self, pr: Option<workspace::PrBadge>) {
+        self.pr = pr;
+    }
+
+    /// This workspace's pull-request badge, if one is set.
+    pub fn pr(&self) -> Option<workspace::PrBadge> {
+        self.pr
     }
 
     /// Whether any pane in this window has running children (a build, an agent) — the sidebar

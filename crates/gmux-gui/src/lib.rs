@@ -196,6 +196,7 @@ mod tests {
             unread: 0,
             color: None,
             busy: false,
+            pr: None,
             active: true,
             hover: false,
             progress: None,
@@ -232,6 +233,7 @@ mod tests {
             unread: 0,
             color: None,
             busy: false,
+            pr: None,
             active: false,
             hover: false,
             progress: None,
@@ -291,6 +293,7 @@ mod tests {
             unread: 0,
             color: None,
             busy: false,
+            pr: None,
             active: false,
             hover: false,
             progress: None,
@@ -493,7 +496,7 @@ mod tests {
     #[test]
     #[ignore = "artifact dump, not an assertion; run explicitly"]
     fn dump_chrome_preview() {
-        use crate::renderer::{PaneView, SearchBar, SidebarItem, SidebarRow};
+        use crate::renderer::{PaneView, SearchBar, SidebarRow};
         use gmux_mux::{PaneSnapshot, Rect};
         let Some(mut r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
             return;
@@ -518,6 +521,7 @@ mod tests {
                 unread: 0,
                 color: Some("#e0533d".into()),
                 busy: true,
+                pr: None,
                 active: true,
                 hover: false,
                 progress: Some(42),
@@ -530,6 +534,7 @@ mod tests {
                 unread: 3,
                 color: None,
                 busy: false,
+                pr: Some((128, "open".into())),
                 active: false,
                 hover: false,
                 progress: None,
@@ -542,6 +547,7 @@ mod tests {
                 unread: 0,
                 color: Some("#3d7de0".into()),
                 busy: false,
+                pr: None,
                 active: false,
                 hover: true,
                 progress: None,

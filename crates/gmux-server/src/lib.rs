@@ -474,6 +474,15 @@ impl Server {
                 }
                 Response::ok(id, ResultBody::Done)
             }
+            Call::SetPr { id: win, number, status } => {
+                if let Some(w) = self.session.window_mut(WindowId(*win)) {
+                    // An unparseable/empty status clears the badge.
+                    let badge = gmux_mux::PrStatus::parse(status)
+                        .map(|status| gmux_mux::PrBadge { number: *number, status });
+                    w.set_pr(badge);
+                }
+                Response::ok(id, ResultBody::Done)
+            }
             Call::FocusPaneId { pane } => {
                 self.session.focus_pane(PaneId(*pane));
                 Response::ok(id, ResultBody::Done)
@@ -551,6 +560,7 @@ impl Server {
                     group: win.group().map(str::to_string),
                     color: win.color().map(str::to_string),
                     busy: win.is_busy(),
+                    pr: win.pr().map(|b| (b.number, b.status.as_str().to_string())),
                     active: i == active_idx,
                     progress,
                     progress_error,
@@ -1607,6 +1617,14 @@ mod tests {
         let resp = server.handle(&Request { id: 8, call: Call::ColorWindow { id: wid, color: String::new() } });
         assert_eq!(resp.result, Some(ResultBody::Done));
         assert_eq!(server.layout(800, 600).tabs[0].color, None);
+
+        // SetPr sets a badge; an empty/unparseable status clears it.
+        let resp = server.handle(&Request { id: 9, call: Call::SetPr { id: wid, number: 42, status: "open".into() } });
+        assert_eq!(resp.result, Some(ResultBody::Done));
+        assert_eq!(server.layout(800, 600).tabs[0].pr, Some((42, "open".into())));
+        let resp = server.handle(&Request { id: 10, call: Call::SetPr { id: wid, number: 42, status: "bogus".into() } });
+        assert_eq!(resp.result, Some(ResultBody::Done));
+        assert_eq!(server.layout(800, 600).tabs[0].pr, None, "an unparseable status clears the badge");
     }
 
     /// CONTRACT test (needs gmux-vt's OSC 52 -> `TermEvent::Clipboard` and gmux-mux's

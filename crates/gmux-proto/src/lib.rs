@@ -143,6 +143,16 @@ pub enum Call {
         #[serde(default)]
         color: String,
     },
+    /// Set a window's pull-request badge by stable id. `status` is `open`/`draft`/`merged`/`closed`;
+    /// an empty `status` (or an unparseable one) clears the badge. A gone id is a harmless no-op.
+    SetPr {
+        #[serde(default)]
+        id: u64,
+        #[serde(default)]
+        number: u32,
+        #[serde(default)]
+        status: String,
+    },
     /// Focus a specific pane by id, activating its window too (a pane click). Unknown ids are
     /// ignored server-side.
     FocusPaneId {
@@ -389,6 +399,10 @@ pub struct TabWire {
     /// activity indicator while true. `#[serde(default)]` so an old daemon reads as idle.
     #[serde(default)]
     pub busy: bool,
+    /// A pull-request badge `(number, status)` where status is `open`/`draft`/`merged`/`closed`;
+    /// `None` = no PR. `#[serde(default)]` so an old daemon reads as none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<(u32, String)>,
     pub active: bool,
     /// Aggregate agent progress across the window's panes: `Some(pct)` = the least-done active
     /// agent's percentage, `None` = no pane reporting progress. Indeterminate/paused panes count
@@ -539,6 +553,7 @@ mod tests {
             Call::RenameWindow { id: 5, name: "backend".into() },
             Call::GroupWindow { id: 5, group: "api".into() },
             Call::ColorWindow { id: 5, color: "#ff8800".into() },
+            Call::SetPr { id: 5, number: 42, status: "open".into() },
             Call::FocusPaneId { pane: 7 },
             Call::MoveWindow { from: 3, to: 1 },
             Call::SetPalette {
@@ -583,8 +598,8 @@ mod tests {
         let layout = LayoutWire { zoomed: false,
             active_pane: 1,
             tabs: vec![
-                TabWire { index: 0, id: 10, name: "a".into(), branch: Some("main".into()), attention: false, unread: 0, group: None, color: None, busy: false, active: true, progress: Some(42), progress_error: false },
-                TabWire { index: 1, id: 11, name: "b".into(), branch: None, attention: true, unread: 7, group: Some("api".into()), color: Some("#ff8800".into()), busy: true, active: false, progress: None, progress_error: true },
+                TabWire { index: 0, id: 10, name: "a".into(), branch: Some("main".into()), attention: false, unread: 0, group: None, color: None, busy: false, pr: None, active: true, progress: Some(42), progress_error: false },
+                TabWire { index: 1, id: 11, name: "b".into(), branch: None, attention: true, unread: 7, group: Some("api".into()), color: Some("#ff8800".into()), busy: true, pr: Some((42, "open".into())), active: false, progress: None, progress_error: true },
             ],
             panes: Vec::new(),
         };
@@ -603,6 +618,7 @@ mod tests {
         assert_eq!(tab.group, None, "and as ungrouped, so the sidebar renders it at the root");
         assert_eq!(tab.color, None, "untagged, so no color rail");
         assert!(!tab.busy, "and idle, so no spinner");
+        assert_eq!(tab.pr, None, "and no PR badge");
     }
 
     #[test]

@@ -3,6 +3,59 @@
 
 use std::path::{Path, PathBuf};
 
+/// A pull request's state, as the sidebar badges it. Mirrors cmux's `PullRequestStatus` plus a
+/// `Draft` variant (cmux distinguishes drafts too). The daemon never queries GitHub — this is
+/// pushed in via `gmux pr` (which optionally shells `gh` in the short-lived CLI process), keeping
+/// the no-timers/0%-idle-CPU invariant intact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrStatus {
+    Open,
+    Draft,
+    Merged,
+    Closed,
+}
+
+impl PrStatus {
+    /// Parse a wire / CLI token (`open`/`draft`/`merged`/`closed`, any case). `None` otherwise.
+    pub fn parse(s: &str) -> Option<PrStatus> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "open" => Some(PrStatus::Open),
+            "draft" => Some(PrStatus::Draft),
+            "merged" => Some(PrStatus::Merged),
+            "closed" => Some(PrStatus::Closed),
+            _ => None,
+        }
+    }
+
+    /// The canonical token (round-trips with [`parse`]).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PrStatus::Open => "open",
+            PrStatus::Draft => "draft",
+            PrStatus::Merged => "merged",
+            PrStatus::Closed => "closed",
+        }
+    }
+
+    /// Map GitHub's `gh pr view` output to a status: its `state` is `OPEN`/`MERGED`/`CLOSED`, and an
+    /// open PR with `isDraft: true` is a draft. `None` for an unrecognized state.
+    pub fn from_github(state: &str, is_draft: bool) -> Option<PrStatus> {
+        match state.trim().to_ascii_uppercase().as_str() {
+            "OPEN" => Some(if is_draft { PrStatus::Draft } else { PrStatus::Open }),
+            "MERGED" => Some(PrStatus::Merged),
+            "CLOSED" => Some(PrStatus::Closed),
+            _ => None,
+        }
+    }
+}
+
+/// A pull request badge for a workspace: its number and state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrBadge {
+    pub number: u32,
+    pub status: PrStatus,
+}
+
 /// A snapshot of a window's sidebar metadata.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkspaceInfo {
@@ -66,6 +119,26 @@ pub fn cwd_name(cwd: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pr_status_round_trips_and_maps_github_states() {
+        for s in [PrStatus::Open, PrStatus::Draft, PrStatus::Merged, PrStatus::Closed] {
+            assert_eq!(PrStatus::parse(s.as_str()), Some(s), "{s:?} must round-trip");
+        }
+        assert_eq!(PrStatus::parse("OPEN"), Some(PrStatus::Open), "case-insensitive");
+        assert_eq!(PrStatus::parse(" merged "), Some(PrStatus::Merged), "whitespace tolerated");
+        assert_eq!(PrStatus::parse("bogus"), None);
+        assert_eq!(PrStatus::parse(""), None);
+
+        // GitHub reports OPEN + isDraft for drafts; everything else maps straight across.
+        assert_eq!(PrStatus::from_github("OPEN", false), Some(PrStatus::Open));
+        assert_eq!(PrStatus::from_github("OPEN", true), Some(PrStatus::Draft));
+        assert_eq!(PrStatus::from_github("MERGED", false), Some(PrStatus::Merged));
+        // A merged PR is never a draft, so the flag must not override the state.
+        assert_eq!(PrStatus::from_github("MERGED", true), Some(PrStatus::Merged));
+        assert_eq!(PrStatus::from_github("CLOSED", false), Some(PrStatus::Closed));
+        assert_eq!(PrStatus::from_github("SOMETHING_NEW", false), None);
+    }
 
     #[test]
     fn reads_branch_from_head_ref() {

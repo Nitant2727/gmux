@@ -77,6 +77,55 @@ fn parse_window(s: &str) -> Option<u64> {
     s.trim_start_matches('@').parse().ok()
 }
 
+/// Resolve the current branch's PR via `gh pr view --json number,state,isDraft`, returning
+/// `(number, status_token)`. Runs in THIS short-lived CLI process (the user's cwd), never in the
+/// daemon — so the daemon stays free of network calls and timers. `None` if `gh` is missing/
+/// unauthenticated, there's no PR, or the JSON can't be parsed. The parse is dependency-free
+/// (serde isn't a dep of the gmux binary): it scavenges the three fields from the flat object.
+fn resolve_pr_via_gh() -> Option<(u32, String)> {
+    let out = std::process::Command::new("gh")
+        .args(["pr", "view", "--json", "number,state,isDraft"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let json = String::from_utf8_lossy(&out.stdout);
+    let number: u32 = json_number(&json, "number")?;
+    let state = json_string(&json, "state")?;
+    let is_draft = json.contains("\"isDraft\":true") || json.contains("\"isDraft\": true");
+    let status = gmux_status_from_github(&state, is_draft)?;
+    Some((number, status.to_string()))
+}
+
+/// Extract `"key":<digits>` from a flat JSON object.
+fn json_number(json: &str, key: &str) -> Option<u32> {
+    let at = json.find(&format!("\"{key}\""))? + key.len() + 2;
+    let rest = json[at..].trim_start_matches([':', ' ']);
+    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+/// Extract `"key":"<value>"` from a flat JSON object.
+fn json_string(json: &str, key: &str) -> Option<String> {
+    let at = json.find(&format!("\"{key}\""))? + key.len() + 2;
+    let rest = json[at..].trim_start_matches([':', ' ']);
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Map GitHub's state + draft flag to a gmux status token (mirrors `PrStatus::from_github`, kept
+/// here so the gmux binary needn't depend on gmux-mux just for the CLI). `None` on an unknown state.
+fn gmux_status_from_github(state: &str, is_draft: bool) -> Option<&'static str> {
+    match state.trim().to_ascii_uppercase().as_str() {
+        "OPEN" => Some(if is_draft { "draft" } else { "open" }),
+        "MERGED" => Some("merged"),
+        "CLOSED" => Some("closed"),
+        _ => None,
+    }
+}
+
 /// `#rrggbb` / `rrggbb` -> a canonical `#rrggbb`, or `None` if it isn't six hex digits. Mirrors
 /// cmux's `WorkspaceTabColorSettings.normalizedHex`, so a typo is rejected at the CLI instead of
 /// being stored and silently ignored by the renderer. Pure/tested.
@@ -448,6 +497,44 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
                 found
             };
             Some(run(Call::ColorWindow { id, color: hex }))
+        }
+        "pr" => {
+            // `gmux pr -t @<win> <number> <open|draft|merged|closed>` sets a PR badge;
+            // `gmux pr -t @<win> --resolve` shells `gh` here (NOT in the daemon) to read the
+            // current branch's PR; `--clear` removes it.
+            let id = args.iter().position(|a| a == "-t").and_then(|i| args.get(i + 1)).and_then(|s| parse_window(s));
+            let Some(id) = id else {
+                eprintln!("usage: gmux pr -t @<win> <number> <open|draft|merged|closed> | --resolve | --clear");
+                return Some(2);
+            };
+            if args.iter().any(|a| a == "--clear") {
+                return Some(run(Call::SetPr { id, number: 0, status: String::new() }));
+            }
+            if args.iter().any(|a| a == "--resolve") {
+                return Some(match resolve_pr_via_gh() {
+                    Some((number, status)) => run(Call::SetPr { id, number, status }),
+                    None => {
+                        eprintln!("gmux pr: no PR found for the current branch (is `gh` installed and authenticated?)");
+                        1
+                    }
+                });
+            }
+            // Explicit: the non-flag words are the number then the status.
+            let words: Vec<&str> = args
+                .iter()
+                .enumerate()
+                .filter(|(i, a)| !a.starts_with('-') && args.get(i.wrapping_sub(1)).map(String::as_str) != Some("-t"))
+                .map(|(_, a)| a.as_str())
+                .collect();
+            let (Some(num), Some(status)) = (words.first().and_then(|n| n.parse::<u32>().ok()), words.get(1)) else {
+                eprintln!("usage: gmux pr -t @<win> <number> <open|draft|merged|closed> | --resolve | --clear");
+                return Some(2);
+            };
+            if !matches!(status.to_ascii_lowercase().as_str(), "open" | "draft" | "merged" | "closed") {
+                eprintln!("gmux pr: status must be open, draft, merged, or closed");
+                return Some(2);
+            }
+            Some(run(Call::SetPr { id, number: num, status: status.to_string() }))
         }
         "split-pane" => {
             let dir = if args.iter().any(|a| a == "-v") { "v" } else { "h" }.to_string();

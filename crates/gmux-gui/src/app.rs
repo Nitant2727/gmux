@@ -3029,7 +3029,7 @@ impl State {
                         Some(r) if r.id == t.id => format!("{}_", r.buffer),
                         _ => t.name.clone(),
                     };
-                    SidebarRow { name, branch: t.branch.clone(), attention: t.attention, unread: t.unread, color: t.color.clone(), busy: t.busy, active: t.active, progress: t.progress, progress_error: t.progress_error, hover: false }
+                    SidebarRow { name, branch: t.branch.clone(), attention: t.attention, unread: t.unread, color: t.color.clone(), busy: t.busy, pr: t.pr.clone(), active: t.active, progress: t.progress, progress_error: t.progress_error, hover: false }
                 })
                 .collect();
             // Tab overflow: window the rows to what fits (wheel over the sidebar scrolls). The
@@ -3682,6 +3682,7 @@ mod tests {
             group: None,
             color: None,
             busy: false,
+            pr: None,
             index: 0, id: 7, name: "changed".into(), branch: None, attention: true, unread: 0, active: true,
             progress: Some(50), progress_error: false,
         };
@@ -3772,6 +3773,7 @@ mod tests {
             unread,
             color: None,
             busy: false,
+            pr: None,
             active: false,
             hover: false,
             progress: None,
