@@ -219,6 +219,8 @@ pub struct SidebarRow {
     pub color: Option<String>,
     /// A pane here has running children — spins the activity indicator.
     pub busy: bool,
+    /// A pull-request badge: `(number, status)` where status is `open`/`draft`/`merged`/`closed`.
+    pub pr: Option<(u32, String)>,
     pub active: bool,
     /// Cursor is hovering this row: draws a subtle hover fill (ignored when `active`).
     pub hover: bool,
@@ -413,6 +415,18 @@ fn parse_hex_color(s: &str) -> Option<Rgb> {
     }
     let byte = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
     Some(Rgb { r: byte(0)?, g: byte(2)?, b: byte(4)? })
+}
+
+/// GitHub's PR-state color (dark-theme values): open green, draft gray, merged purple, closed red.
+/// `None` for an unrecognized status token, so a bad value just renders no PR badge. Pure/tested.
+fn pr_color(status: &str) -> Option<Rgb> {
+    Some(match status {
+        "open" => Rgb { r: 0x3f, g: 0xb9, b: 0x50 },
+        "draft" => Rgb { r: 0x8b, g: 0x94, b: 0x9e },
+        "merged" => Rgb { r: 0xa3, g: 0x71, b: 0xf7 },
+        "closed" => Rgb { r: 0xf8, g: 0x51, b: 0x49 },
+        _ => return None,
+    })
 }
 
 /// Which of the 8 spinner spokes is the bright one at `frame`, and how lit each spoke is: the spoke
@@ -1233,8 +1247,24 @@ impl Renderer {
                 (rgba(self.text), rgba(TEXT_DIM))
             };
             self.text_run(&r.name, text_x, line1, label_col, fw, fh, &mut gl);
+            // PR badge on the second line, before the branch: a small "#42" chip in the state
+            // color (open green / draft gray / merged purple / closed red). The branch text starts
+            // after it. On the accent-filled active row the chip text flips for contrast.
+            let mut sub_x = text_x;
+            if let Some((num, status)) = &r.pr {
+                if let Some(col) = pr_color(status) {
+                    let label = format!("#{num}");
+                    let tw = label.chars().count() as f32 * cw;
+                    let (bw_, bh) = (tw + 2.0 * BADGE_PAD_H, ch + 2.0 * BADGE_PAD_V);
+                    let y0 = line2 - BADGE_PAD_V;
+                    let ink = if r.active { on_accent(accent()) } else { TEXT };
+                    push_rounded(&mut rd, sub_x, y0, sub_x + bw_, y0 + bh, bh / 2.0, rgba(col), fw, fh);
+                    self.text_run(&label, sub_x + BADGE_PAD_H, line2, rgba(ink), fw, fh, &mut gl);
+                    sub_x += bw_ + 5.0;
+                }
+            }
             if let Some(b) = &r.branch {
-                self.text_run(&format!("git:{b}"), text_x, line2, sub_col, fw, fh, &mut gl);
+                self.text_run(&format!("git:{b}"), sub_x, line2, sub_col, fw, fh, &mut gl);
             }
 
             // Right-aligned indicators on line 1: progress text (PROGRESS / ERROR), then the
@@ -1835,6 +1865,21 @@ mod tests {
         // An already-bright color is not pushed past white.
         let bright = brighten_for_dark(Rgb { r: 0xff, g: 0xff, b: 0xff });
         assert_eq!(bright, Rgb { r: 0xff, g: 0xff, b: 0xff });
+    }
+
+    #[test]
+    fn pr_status_colors_are_distinct_and_junk_is_none() {
+        // The four states must be visually distinct (GitHub's green/gray/purple/red).
+        let open = pr_color("open").unwrap();
+        let merged = pr_color("merged").unwrap();
+        let closed = pr_color("closed").unwrap();
+        assert!(open.g > open.r && open.g > open.b, "open is green: {open:?}");
+        assert!(merged.r > merged.g && merged.b > merged.g, "merged is purple: {merged:?}");
+        assert!(closed.r > closed.g && closed.r > closed.b, "closed is red: {closed:?}");
+        assert!(pr_color("draft").is_some());
+        // An unknown status renders no badge rather than a wrong color.
+        assert_eq!(pr_color("bogus"), None);
+        assert_eq!(pr_color(""), None);
     }
 
     #[test]
