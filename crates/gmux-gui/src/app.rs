@@ -210,13 +210,16 @@ enum PaletteCmd {
 }
 
 /// Case-insensitive subsequence match ("spl h" chars all appear in order in "split horizontal").
-/// Pure/tested.
+/// `_` and `-` are dropped alongside whitespace, so typing the config's action name (`split_h`,
+/// which is what a user who has edited `gmux.json` knows) matches the palette's "split h" label
+/// instead of silently filtering everything out. Pure/tested.
 fn fuzzy_match(hay: &str, needle: &str) -> bool {
-    let mut h = hay.chars().flat_map(char::to_lowercase);
+    let skip = |c: &char| c.is_whitespace() || *c == '_' || *c == '-';
+    let mut h = hay.chars().flat_map(char::to_lowercase).filter(|c| !skip(c));
     needle
         .chars()
         .flat_map(char::to_lowercase)
-        .filter(|c| !c.is_whitespace())
+        .filter(|c| !skip(c))
         .all(|n| h.any(|c| c == n))
 }
 
@@ -3632,6 +3635,15 @@ mod tests {
         assert!(fuzzy_match("Split Horizontal", "SPLIT"));
         assert!(!fuzzy_match("split", "splx"));
         assert!(fuzzy_match("anything", ""));
+        // The config's action names (underscored) must find their palette labels — a user who has
+        // edited gmux.json types `split_h`, and that used to match nothing at all.
+        assert!(fuzzy_match("split h", "split_h"));
+        assert!(fuzzy_match("new window", "new_window"));
+        assert!(fuzzy_match("export scrollback", "export-scrollback"));
+        // Separators in the label are ignored too, so "tab: my_project" is reachable either way.
+        assert!(fuzzy_match("tab: my_project", "myproject"));
+        // A genuine mismatch still fails — dropping separators must not make everything match.
+        assert!(!fuzzy_match("new window", "new_windowz"));
 
         let tabs = vec!["backend".to_string(), "web".to_string()];
         let all = palette_items(&tabs, "", &[]);
