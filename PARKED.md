@@ -11,6 +11,7 @@ Cut scope doesn't die; it parks. One line per item: date · item · why parked �
 - 2026-07-20 · ARM64 zip **compiles** in the release workflow but has never executed on ARM64 hardware · no device · wake: an ARM64 Windows machine.
 - (user-blocked) · Code signing for released binaries · needs a certificate · wake: cert available; README documents the SmartScreen consequence meanwhile.
 - 2026-07-21 · Browser pane occasionally opens collapsed (~276x45) instead of 1024x768 (2nd launch of a session; 1st was correct) · low-priority WebView2 window-sizing quirk · wake: reproduce + fix in a browser-polish round.
+- 2026-07-21 · Release workflow still builds WITHOUT `--features browser` (one-line edit deferred: the gh token lacks the `workflow` scope, so pushes touching .github/workflows are rejected) · wake: user runs `gh auth refresh -h github.com -s workflow`, then add `--features browser` to release.yml's build line. Until then released zips lack the browser pane; `scripts/package.ps1` zips DO include it.
 
 ## Cleared
 
