@@ -55,6 +55,13 @@ fn blend(fg: Rgb, bg: Rgb, a: f32) -> Rgb {
     Rgb { r: m(fg.r, bg.r), g: m(fg.g, bg.g), b: m(fg.b, bg.b) }
 }
 
+/// Fluent surfaces are lit from above: every gradient keeps the token color at the TOP and falls
+/// off toward the bottom (never brightens past the token, so contrast floors stay where they were).
+const BLACK: Rgb = Rgb { r: 0, g: 0, b: 0 };
+fn darker(c: Rgb, a: f32) -> Rgb {
+    blend(BLACK, c, a)
+}
+
 /// Border width + color for a pane: attention ring overrides the active/inactive border.
 fn border_style(active: bool, attention: Attention) -> (f32, Rgb) {
     if attention.is_pending() {
@@ -157,6 +164,12 @@ struct RoundedVertex {
 
 /// Push a rounded rect (`x0,y0`..`x1,y1` in pixels) into a rounded-pipeline vertex buffer.
 fn push_rounded(out: &mut Vec<RoundedVertex>, x0: f32, y0: f32, x1: f32, y1: f32, radius: f32, color: [f32; 4], fw: f32, fh: f32) {
+    push_rounded_grad(out, x0, y0, x1, y1, radius, color, color, fw, fh);
+}
+
+/// Same, with a vertical gradient: `top` at the rect's top edge, `bot` at its bottom. The rounded
+/// pipeline interpolates vertex color, so this costs nothing beyond the two colors.
+fn push_rounded_grad(out: &mut Vec<RoundedVertex>, x0: f32, y0: f32, x1: f32, y1: f32, radius: f32, top: [f32; 4], bot: [f32; 4], fw: f32, fh: f32) {
     let to_ndc = |x: f32, y: f32| [x / fw * 2.0 - 1.0, 1.0 - y / fh * 2.0];
     let (cx, cy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
     let (hx, hy) = ((x1 - x0) * 0.5, (y1 - y0) * 0.5);
@@ -167,7 +180,7 @@ fn push_rounded(out: &mut Vec<RoundedVertex>, x0: f32, y0: f32, x1: f32, y1: f32
             local: [lx, ly],
             half: [hx, hy],
             radius,
-            color,
+            color: if ly < 0.0 { top } else { bot },
         });
     }
 }
@@ -836,14 +849,18 @@ impl Renderer {
         let sw = sidebar_w as f32;
         let ch = self.atlas.cell_h as f32;
         let to_ndc = |x: f32, y: f32| [x / fw * 2.0 - 1.0, 1.0 - y / fh * 2.0];
-        let quad = |bg: &mut Vec<BgVertex>, x0: f32, y0: f32, x1: f32, y1: f32, c: [f32; 4]| {
+        // Vertical-gradient quad: `top` at y0, `bot` at y1 (the bg pipeline interpolates color).
+        let quad_grad = |bg: &mut Vec<BgVertex>, x0: f32, y0: f32, x1: f32, y1: f32, top: [f32; 4], bot: [f32; 4]| {
             let (a, b, cc, d) = (to_ndc(x0, y0), to_ndc(x1, y0), to_ndc(x1, y1), to_ndc(x0, y1));
-            for p in [a, b, cc, a, cc, d] {
+            for (p, c) in [(a, top), (b, top), (cc, bot), (a, top), (cc, bot), (d, bot)] {
                 bg.push(BgVertex { pos: p, color: c });
             }
         };
         let cw = self.atlas.cell_w as f32;
-        quad(&mut bg, 0.0, 0.0, sw, fh, rgba(BG_SIDEBAR));
+        // App background: the clear color is flat, so paint the whole surface with a top-lit
+        // gradient first; the panes draw over their own viewports afterwards.
+        quad_grad(&mut bg, 0.0, 0.0, fw, fh, rgba(BG_APP), rgba(darker(BG_APP, 0.22)));
+        quad_grad(&mut bg, 0.0, 0.0, sw, fh, rgba(BG_SIDEBAR), rgba(darker(BG_SIDEBAR, 0.28)));
 
         // Section label: "WORKSPACES" in dim uppercase.
         self.text_run("WORKSPACES", ROW_PAD_H, SIDEBAR_PAD_TOP, rgba(TEXT_DIM), fw, fh, &mut gl);
@@ -860,10 +877,12 @@ impl Renderer {
             // Row fill: active wins over hover. Accent bar sits in the straight span so its sharp
             // corners never poke past the rounded fill.
             if r.active {
-                push_rounded(&mut rd, 0.0, top, sw, top + ROW_H, RADIUS, rgba(SIDEBAR_ROW_ACTIVE), fw, fh);
+                let f = rgba(SIDEBAR_ROW_ACTIVE);
+                push_rounded_grad(&mut rd, 0.0, top, sw, top + ROW_H, RADIUS, f, rgba(darker(SIDEBAR_ROW_ACTIVE, 0.22)), fw, fh);
                 push_rounded(&mut rd, 0.0, top + RADIUS, ACCENT_BAR_W, top + ROW_H - RADIUS, 0.0, rgba(ACCENT), fw, fh);
             } else if r.hover {
-                push_rounded(&mut rd, 0.0, top, sw, top + ROW_H, RADIUS, rgba(SIDEBAR_ROW_HOVER), fw, fh);
+                let f = rgba(SIDEBAR_ROW_HOVER);
+                push_rounded_grad(&mut rd, 0.0, top, sw, top + ROW_H, RADIUS, f, rgba(darker(SIDEBAR_ROW_HOVER, 0.20)), fw, fh);
             }
             self.text_run(&r.name, text_x, line1, rgba(self.text), fw, fh, &mut gl);
             if let Some(b) = &r.branch {
@@ -954,8 +973,11 @@ impl Renderer {
             // Pane chrome: a rounded border ring (outer) with the BG_PANE fill (inner, inset by the
             // border width) drawn on top. The fill also letterboxes the cell-grid remainder.
             let (bw, bc) = border_style(pv.active, pv.attention);
-            push_rounded(&mut srd, cx, cy, cx + cw_, cy + ch_, RADIUS, rgba(bc), fw, fh);
-            push_rounded(&mut srd, cx + bw, cy + bw, cx + cw_ - bw, cy + ch_ - bw, (RADIUS - bw).max(0.0), rgba(BG_PANE), fw, fh);
+            // The inactive stroke fades toward the bottom (Fluent's lit-from-above control stroke);
+            // active/attention rings stay flat so focus reads as one uniform color.
+            let bc_bot = if pv.active { bc } else { darker(bc, 0.35) };
+            push_rounded_grad(&mut srd, cx, cy, cx + cw_, cy + ch_, RADIUS, rgba(bc), rgba(bc_bot), fw, fh);
+            push_rounded_grad(&mut srd, cx + bw, cy + bw, cx + cw_ - bw, cy + ch_ - bw, (RADIUS - bw).max(0.0), rgba(BG_PANE), rgba(darker(BG_PANE, 0.12)), fw, fh);
 
             // Title strip: a TITLE_STRIP-tall BG_SIDEBAR band inside the border. First quad rounds
             // the top corners (radius RADIUS-bw); the second (radius 0) squares off the bottom edge
@@ -963,8 +985,11 @@ impl Renderer {
             let (sx0, sx1) = (cx + bw, cx + cw_ - bw);
             let (sy0, sy1) = (cy + bw, cy + bw + TITLE_STRIP);
             let sr = (RADIUS - bw).max(0.0);
-            push_rounded(&mut srd, sx0, sy0, sx1, sy1, sr, rgba(BG_SIDEBAR), fw, fh);
-            push_rounded(&mut srd, sx0, sy0 + sr, sx1, sy1, 0.0, rgba(BG_SIDEBAR), fw, fh);
+            // Title band: lit at the top, settling into BG_PANE where it meets the cells, so the
+            // strip reads as a raised surface instead of a flat stripe.
+            let (t_top, t_bot) = (rgba(blend(TEXT, BG_SIDEBAR, 0.05)), rgba(BG_SIDEBAR));
+            push_rounded_grad(&mut srd, sx0, sy0, sx1, sy1, sr, t_top, t_bot, fw, fh);
+            push_rounded_grad(&mut srd, sx0, sy0 + sr, sx1, sy1, 0.0, t_top, t_bot, fw, fh);
             let ty = (sy0 + (TITLE_STRIP - ch_cell) / 2.0).max(sy0);
             let mut tx = sx0 + 12.0;
             if pv.active {
@@ -1024,8 +1049,9 @@ impl Renderer {
                 let by1 = cy + ch_ - bw;
                 let by0 = by1 - SEARCH_BAR;
                 let sr = (RADIUS - bw).max(0.0);
-                push_rounded(&mut srd, bx0, by0, bx1, by1, sr, rgba(BG_SIDEBAR), fw, fh);
-                push_rounded(&mut srd, bx0, by0, bx1, by1 - sr, 0.0, rgba(BG_SIDEBAR), fw, fh);
+                let (b_top, b_bot) = (rgba(blend(TEXT, BG_SIDEBAR, 0.05)), rgba(BG_SIDEBAR));
+                push_rounded_grad(&mut srd, bx0, by0, bx1, by1, sr, b_top, b_bot, fw, fh);
+                push_rounded_grad(&mut srd, bx0, by0, bx1, by1 - sr, 0.0, b_top, b_bot, fw, fh);
                 let ty = (by0 + (SEARCH_BAR - ch_cell) / 2.0).max(by0);
                 let lx = bx0 + 12.0;
                 self.text_run(&sb.label, lx, ty, rgba(TEXT_DIM), fw, fh, &mut sgl);
