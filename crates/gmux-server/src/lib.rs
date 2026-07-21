@@ -534,6 +534,7 @@ impl Server {
                     name: info.name,
                     branch: info.branch,
                     attention: info.attention,
+                    unread: info.unread,
                     active: i == active_idx,
                     progress,
                     progress_error,

@@ -14,6 +14,9 @@ pub struct WorkspaceInfo {
     pub branch: Option<String>,
     /// Any pane in the window is requesting attention.
     pub attention: bool,
+    /// Notifications across the window's panes since each was last focused — the sidebar badges
+    /// this count, so "one agent finished" and "nine did" don't look identical.
+    pub unread: u32,
 }
 
 /// Read the current git branch for `cwd` by walking up to a `.git` dir and parsing `HEAD`.

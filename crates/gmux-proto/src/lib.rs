@@ -359,6 +359,10 @@ pub struct TabWire {
     pub name: String,
     pub branch: Option<String>,
     pub attention: bool,
+    /// Unread notifications in this window (badged in the sidebar). `#[serde(default)]` so an old
+    /// daemon that doesn't send it just reads as zero.
+    #[serde(default)]
+    pub unread: u32,
     pub active: bool,
     /// Aggregate agent progress across the window's panes: `Some(pct)` = the least-done active
     /// agent's percentage, `None` = no pane reporting progress. Indeterminate/paused panes count
@@ -551,8 +555,8 @@ mod tests {
         let layout = LayoutWire { zoomed: false,
             active_pane: 1,
             tabs: vec![
-                TabWire { index: 0, id: 10, name: "a".into(), branch: Some("main".into()), attention: false, active: true, progress: Some(42), progress_error: false },
-                TabWire { index: 1, id: 11, name: "b".into(), branch: None, attention: true, active: false, progress: None, progress_error: true },
+                TabWire { index: 0, id: 10, name: "a".into(), branch: Some("main".into()), attention: false, unread: 0, active: true, progress: Some(42), progress_error: false },
+                TabWire { index: 1, id: 11, name: "b".into(), branch: None, attention: true, unread: 7, active: false, progress: None, progress_error: true },
             ],
             panes: Vec::new(),
         };
@@ -567,6 +571,7 @@ mod tests {
         let tab: TabWire = serde_json::from_str(line).unwrap();
         assert_eq!(tab.progress, None);
         assert!(!tab.progress_error);
+        assert_eq!(tab.unread, 0, "an old daemon's tab reads as zero unread, not a bad badge");
     }
 
     #[test]

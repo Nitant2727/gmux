@@ -2911,7 +2911,7 @@ impl State {
                         Some(r) if r.id == t.id => format!("{}_", r.buffer),
                         _ => t.name.clone(),
                     };
-                    SidebarRow { name, branch: t.branch.clone(), attention: t.attention, active: t.active, progress: t.progress, progress_error: t.progress_error, hover: false }
+                    SidebarRow { name, branch: t.branch.clone(), attention: t.attention, unread: t.unread, active: t.active, progress: t.progress, progress_error: t.progress_error, hover: false }
                 })
                 .collect();
             // Tab overflow: window the rows to what fits (wheel over the sidebar scrolls). The
@@ -3546,7 +3546,7 @@ mod tests {
         let panes = || vec![rect(1, 0, 0, 80, 40), rect(2, 80, 0, 80, 40)];
         let base = LayoutWire { zoomed: false, active_pane: 1, tabs: vec![], panes: panes() };
         let tab = gmux_proto::TabWire {
-            index: 0, id: 7, name: "changed".into(), branch: None, attention: true, active: true,
+            index: 0, id: 7, name: "changed".into(), branch: None, attention: true, unread: 0, active: true,
             progress: Some(50), progress_error: false,
         };
         let same = LayoutWire { zoomed: false, active_pane: 1, tabs: vec![tab], panes: panes() };
