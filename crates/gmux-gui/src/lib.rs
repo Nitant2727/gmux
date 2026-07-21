@@ -192,11 +192,52 @@ mod tests {
         }];
         r.render_frame(&view, &rows, sw, &[], w, h, "", false, None, None, None);
         let px = read_rgba(&r, &tex, w, h).expect("readback");
-        // Panel bg is #181825 (r≈24); active fill is #313244 (r≈49). Threshold 40 splits them.
+        // Panel bg is #202020 (r≈32, and only darker further down the gradient); active fill is
+        // #333333 (r≈51) fading to r≈40. Threshold 40 still splits them.
         let corner = pixel(&px, w, 1, rows_y0 + 1);
         let center = pixel(&px, w, sw / 2, rows_y0 + row_h / 2);
         assert!(corner[0] < 40, "active-row corner should round away to panel bg, got {corner:?}");
         assert!(center[0] > 40, "active-row centre should be the solid fill, got {center:?}");
+    }
+
+    #[test]
+    fn sidebar_panel_is_top_lit() {
+        // The chrome gradients run token-color-at-top to darker-at-bottom. Sample the panel's own
+        // column (x=2, left of any row content) near the top and near the bottom.
+        use crate::renderer::SidebarRow;
+        let Some(r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
+            return;
+        };
+        let sw = r.sidebar_width();
+        let (w, h) = (sw, 400u32);
+        let tex = r.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gmux-gradient-test"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let rows = vec![SidebarRow {
+            name: "ws".into(),
+            branch: None,
+            attention: false,
+            active: false,
+            hover: false,
+            progress: None,
+            progress_error: false,
+        }];
+        r.render_frame(&view, &rows, sw, &[], w, h, "", false, None, None, None);
+        let px = read_rgba(&r, &tex, w, h).expect("readback");
+        let top = pixel(&px, w, 2, 2);
+        let bottom = pixel(&px, w, 2, h - 3);
+        assert!(
+            top[0] > bottom[0] + 3,
+            "sidebar should fade downward: top {top:?} vs bottom {bottom:?}"
+        );
     }
 
     #[test]
