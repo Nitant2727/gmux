@@ -378,4 +378,100 @@ mod tests {
         assert!(first > 0, "wide glyph produced no coverage in its own cell ({first})");
         assert!(second > 0, "wide glyph did not extend into the spacer cell ({second})");
     }
+
+    /// Not a test: dumps a representative full-chrome frame to `chrome_preview.ppm` for
+    /// eyeballing theme changes headlessly (WDAC blocks fresh example binaries on the dev
+    /// machine; this rides the always-runnable test binary). Run explicitly:
+    /// `cargo test -p gmux-gui --lib dump_chrome_preview -- --ignored`.
+    #[test]
+    #[ignore = "artifact dump, not an assertion; run explicitly"]
+    fn dump_chrome_preview() {
+        use crate::renderer::{PaneView, SearchBar, SidebarRow};
+        use gmux_mux::{PaneSnapshot, Rect};
+        let Some(r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
+            return;
+        };
+        let (w, h) = (960u32, 600u32);
+        let tex = r.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("chrome-preview"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let rows = vec![
+            SidebarRow {
+                name: "backend".into(),
+                branch: Some("main".into()),
+                attention: false,
+                active: true,
+                hover: false,
+                progress: Some(42),
+                progress_error: false,
+            },
+            SidebarRow {
+                name: "web".into(),
+                branch: Some("feat/ui".into()),
+                attention: true,
+                active: false,
+                hover: false,
+                progress: None,
+                progress_error: false,
+            },
+            SidebarRow {
+                name: "agents".into(),
+                branch: None,
+                attention: false,
+                active: false,
+                hover: true,
+                progress: None,
+                progress_error: false,
+            },
+        ];
+        let mk = |ch: char| {
+            cell(ch, Rgb { r: 0xcc, g: 0xcc, b: 0xcc }, Rgb { r: 0x11, g: 0x11, b: 0x11 })
+        };
+        let mut cells = Vec::new();
+        for line in [
+            "PS C:\\work> cargo build",
+            "   Compiling gmux v0.1.0",
+            "warning: unused variable",
+            "PS C:\\work> _",
+        ] {
+            let mut row: Vec<Cell> = line.chars().map(mk).collect();
+            row.resize(70, mk(' '));
+            cells.push(row);
+        }
+        cells.resize(24, vec![mk(' '); 70]);
+        let snap = PaneSnapshot { cells, cursor: (12, 3), cursor_style: 0, cols: 70, rows: 24 };
+        let sw = r.sidebar_width();
+        let pane = PaneView {
+            snap: &snap,
+            attention: Attention::Quiet,
+            active: true,
+            rect: Rect { x: sw, y: 0, w: w - sw, h },
+            scrolled: 0,
+            history: 120,
+            title: "powershell — build".into(),
+            selection: None,
+        };
+        let sb = SearchBar {
+            label: "find:".into(),
+            query: "warn".into(),
+            current: 1,
+            total: 3,
+            overlay_only: false,
+        };
+        r.render_frame(&view, &rows, sw, &[pane], w, h, "", false, Some(&sb), None, None);
+        let px = read_rgba(&r, &tex, w, h).expect("readback");
+        let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+        for p in px.chunks(4) {
+            out.extend_from_slice(&p[..3]);
+        }
+        std::fs::write("chrome_preview.ppm", out).expect("write");
+    }
 }

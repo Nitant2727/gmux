@@ -777,6 +777,29 @@ impl ApplicationHandler for App {
         });
 
         let hwnd = window_hwnd(&window).unwrap_or(0);
+        // Fluent window chrome: dark titlebar + Mica backdrop (best-effort; pre-Win11 ignores both).
+        if hwnd != 0 {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::Graphics::Dwm::{
+                DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
+            };
+            unsafe {
+                let dark: i32 = 1;
+                let _ = DwmSetWindowAttribute(
+                    HWND(hwnd as *mut _),
+                    DWMWA_USE_IMMERSIVE_DARK_MODE,
+                    &dark as *const _ as *const _,
+                    std::mem::size_of::<i32>() as u32,
+                );
+                let mica: i32 = 2; // DWMSBT_MAINWINDOW
+                let _ = DwmSetWindowAttribute(
+                    HWND(hwnd as *mut _),
+                    DWMWA_SYSTEMBACKDROP_TYPE,
+                    &mica as *const _ as *const _,
+                    std::mem::size_of::<i32>() as u32,
+                );
+            }
+        }
         let notifier = Notifier::new("com.gmux.app", "gmux").ok();
         let taskbar = if hwnd != 0 { Taskbar::new(hwnd) } else { None };
 

@@ -20,6 +20,7 @@ serde_json = "1"
 # Clipboard copy/paste (CF_UNICODETEXT via user32/kernel32). Same major as gmux-notify's dep.
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Ole",
