@@ -210,8 +210,10 @@ fn browser_thread(
                 };
                 if let Ok(wv) = controller.CoreWebView2() {
                     // A URL queued during initialization supersedes the one we opened with.
-                    let target = pcwstr(pending.as_deref().unwrap_or(&url));
+                    let shown = pending.as_deref().unwrap_or(&url);
+                    let target = pcwstr(shown);
                     let _ = wv.Navigate(target.as_pcwstr());
+                    set_title(hwnd, shown);
                 }
             }
             Err(e) => {
@@ -264,7 +266,22 @@ unsafe fn create_window(queue: &Arc<Mutex<Vec<Cmd>>>) -> Result<HWND, String> {
     })?;
 
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
+    scale_to_dpi(hwnd);
     Ok(hwnd)
+}
+
+/// `CreateWindowExW` takes physical pixels, so on a scaled display the 1024x768 we ask for lands as
+/// a window that is *smaller* than intended — 571x402 client at 175%, and worse on a 4K panel (the
+/// "collapsed window" this pane was reported with). Re-apply the size scaled by the window's DPI.
+unsafe fn scale_to_dpi(hwnd: HWND) {
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOMOVE, SWP_NOZORDER};
+    let dpi = GetDpiForWindow(hwnd);
+    if dpi == 0 || dpi == 96 {
+        return; // unscaled display (or the call failed): the created size is already right
+    }
+    let scale = |v: i32| v * dpi as i32 / 96;
+    let _ = SetWindowPos(hwnd, None, 0, 0, scale(1024), scale(768), SWP_NOMOVE | SWP_NOZORDER);
 }
 
 /// Synchronously (message-pumped) create the WebView2 environment + a controller parented to `hwnd`.
@@ -341,6 +358,15 @@ unsafe fn eval_on_thread(
     }
 }
 
+/// Retitle the window `gmux browser - <url>`. The pane's whole state is otherwise invisible from
+/// outside the process, which is what made the "it silently did nothing" bug so hard to pin down;
+/// the title makes the current target observable to a human and to a test.
+unsafe fn set_title(hwnd: HWND, url: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::SetWindowTextW;
+    let title = pcwstr(&format!("gmux browser - {url}"));
+    let _ = SetWindowTextW(hwnd, title.as_pcwstr());
+}
+
 /// Fit the WebView2 controller to the window's client rect.
 unsafe fn resize_to_client(controller: &ICoreWebView2Controller, hwnd: HWND) {
     let mut rect = RECT::default();
@@ -380,6 +406,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                                 if let Ok(wv) = ctl.CoreWebView2() {
                                     let target = pcwstr(&u);
                                     let _ = wv.Navigate(target.as_pcwstr());
+                                    set_title(hwnd, &u);
                                 }
                             }
                             // Still initializing: hold the URL instead of dropping it.
