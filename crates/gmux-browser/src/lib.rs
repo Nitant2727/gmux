@@ -94,9 +94,23 @@ impl BrowserPane {
         }
     }
 
-    /// Navigate the existing pane to `url`.
-    pub fn navigate(&self, url: &str) {
+    /// Navigate the existing pane to `url`. Returns `false` if the pane's window is gone (the user
+    /// closed it) — the caller should drop this handle and [`open`] a fresh pane, because a post to
+    /// a destroyed window is a silent no-op and every later browse would vanish.
+    ///
+    /// [`open`]: BrowserPane::open
+    #[must_use]
+    pub fn navigate(&self, url: &str) -> bool {
+        if !self.is_alive() {
+            return false;
+        }
         self.post(Cmd::Navigate(url.to_string()));
+        true
+    }
+
+    /// Whether the pane's window still exists. False once the user closes it (its thread has ended).
+    pub fn is_alive(&self) -> bool {
+        unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(self.hwnd.0)).as_bool() }
     }
 
     /// Close the pane (destroys the window and ends its thread).
@@ -145,6 +159,11 @@ impl Drop for BrowserPane {
 struct WindowState {
     controller: Option<ICoreWebView2Controller>,
     queue: Arc<Mutex<Vec<Cmd>>>,
+    /// A URL that arrived while the WebView2 was still initializing. `create_webview` is async and
+    /// pumps messages while it runs, so a `Navigate` posted in that window would otherwise be
+    /// drained against a `None` controller and silently dropped — one of the two ways the pane
+    /// "did nothing with no error". Navigated as soon as the controller lands.
+    pending: Option<String>,
 }
 
 const CLASS_NAME: PCWSTR = w!("gmux-browser");
@@ -181,13 +200,18 @@ fn browser_thread(
         match create_webview(hwnd) {
             Ok(controller) => {
                 resize_to_client(&controller, hwnd);
+                // Stash the live controller FIRST: from here on any WM_APP navigates directly, so
+                // there is no gap where a command could land against a `None` controller.
+                let pending = if let Some(state) = window_state(hwnd) {
+                    state.controller = Some(controller.clone());
+                    state.pending.take()
+                } else {
+                    None
+                };
                 if let Ok(wv) = controller.CoreWebView2() {
-                    let target = pcwstr(&url);
+                    // A URL queued during initialization supersedes the one we opened with.
+                    let target = pcwstr(pending.as_deref().unwrap_or(&url));
                     let _ = wv.Navigate(target.as_pcwstr());
-                }
-                // Stash the live controller so WM_APP command handling can drive it.
-                if let Some(state) = window_state(hwnd) {
-                    state.controller = Some(controller);
                 }
             }
             Err(e) => {
@@ -216,7 +240,7 @@ unsafe fn create_window(queue: &Arc<Mutex<Vec<Cmd>>>) -> Result<HWND, String> {
     // RegisterClassW returns 0 if the class already exists; that's fine on a second pane.
     RegisterClassW(&class);
 
-    let state = Box::new(WindowState { controller: None, queue: Arc::clone(queue) });
+    let state = Box::new(WindowState { controller: None, queue: Arc::clone(queue), pending: None });
     let state_ptr = Box::into_raw(state);
 
     let hwnd = CreateWindowExW(
@@ -351,14 +375,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     state.queue.lock().map(|mut q| std::mem::take(&mut *q)).unwrap_or_default();
                 for cmd in cmds {
                     match cmd {
-                        Cmd::Navigate(u) if !u.is_empty() => {
-                            if let Some(ctl) = &state.controller {
+                        Cmd::Navigate(u) if !u.is_empty() => match &state.controller {
+                            Some(ctl) => {
                                 if let Ok(wv) = ctl.CoreWebView2() {
                                     let target = pcwstr(&u);
                                     let _ = wv.Navigate(target.as_pcwstr());
                                 }
                             }
-                        }
+                            // Still initializing: hold the URL instead of dropping it.
+                            None => state.pending = Some(u),
+                        },
                         Cmd::Navigate(_) => {} // the keep-alive hint from post(); ignore
                         Cmd::Eval { script, reply } => eval_on_thread(&state.controller, &script, reply),
                         Cmd::Close => {
