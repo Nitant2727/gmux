@@ -151,6 +151,9 @@ pub struct Theme {
     /// Non-WT inline path: 16 `"#rrggbb"` strings for the ANSI 0..=15 system colors. Applied over
     /// the defaults (and over `scheme`, if both are given); entries past 16 or bad hex are ignored.
     pub ansi: Option<Vec<String>>,
+    /// Chrome accent (active pane border, focus glow, highlights). Unset = follow the user's
+    /// Windows accent color, like every other WinUI app.
+    pub accent: Option<String>,
 }
 
 /// A resolved palette for the wire (`Call::SetPalette`): default fg/bg + the 16 system colors,
@@ -217,6 +220,11 @@ impl Config {
     }
     pub fn bg(&self, default: [u8; 3]) -> [u8; 3] {
         self.theme.as_ref().and_then(|t| t.bg.as_deref()).and_then(parse_hex).unwrap_or(default)
+    }
+
+    /// `theme.accent` as `[r, g, b]`. `None` (unset or bad hex) means "follow the system accent".
+    pub fn accent(&self) -> Option<[u8; 3]> {
+        self.theme.as_ref().and_then(|t| t.accent.as_deref()).and_then(parse_hex)
     }
 
     /// Resolve the full terminal palette from `theme`, layering (in order) over the gmux defaults:
@@ -317,7 +325,8 @@ pub fn default_template() -> String {
     \"fg\": \"#{fg:02x}{fg1:02x}{fg2:02x}\",
     \"bg\": \"#{bg:02x}{bg1:02x}{bg2:02x}\",
     \"scheme\": null,
-    \"ansi\": null
+    \"ansi\": null,
+    \"accent\": null
   }},
   \"keys\": {{
 {keys}
@@ -637,6 +646,22 @@ mod tests {
     }
 
     #[test]
+    fn accent_is_optional_and_hex_parsed() {
+        // Unset (and bad hex) means "follow the Windows accent"; a good hex pins the chrome accent.
+        assert_eq!(Config::default().accent(), None);
+        let bad = Config {
+            theme: Some(Theme { accent: Some("nope".into()), ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(bad.accent(), None);
+        let pinned = Config {
+            theme: Some(Theme { accent: Some("#60cdff".into()), ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(pinned.accent(), Some([0x60, 0xcd, 0xff]));
+    }
+
+    #[test]
     fn parses_theme_hex() {
         assert_eq!(parse_hex("#ff8800"), Some([0xff, 0x88, 0x00]));
         assert_eq!(parse_hex("00ff00"), Some([0x00, 0xff, 0x00]));
@@ -725,6 +750,7 @@ mod tests {
                 bg: Some("#040506".into()),
                 ansi: Some(vec!["#111111".into(), "#deadbe".into()]), // slots 0,1
                 scheme: None,
+                accent: None,
             }),
             ..Default::default()
         };

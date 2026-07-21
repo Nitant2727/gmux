@@ -777,28 +777,28 @@ impl ApplicationHandler for App {
         });
 
         let hwnd = window_hwnd(&window).unwrap_or(0);
-        // Fluent window chrome: dark titlebar + Mica backdrop (best-effort; pre-Win11 ignores both).
+        // Fluent window chrome: dark titlebar, Mica backdrop, rounded Win11 corners, and a window
+        // border tinted with the same accent the chrome uses. All best-effort — pre-Win11 DWM
+        // rejects the attributes it doesn't know and the window just looks like it did before.
         if hwnd != 0 {
             use windows::Win32::Foundation::HWND;
             use windows::Win32::Graphics::Dwm::{
-                DwmSetWindowAttribute, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_SYSTEMBACKDROP_TYPE,
+                DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE,
             };
-            unsafe {
-                let dark: i32 = 1;
+            let set = |attr, value: u32| unsafe {
                 let _ = DwmSetWindowAttribute(
                     HWND(hwnd as *mut _),
-                    DWMWA_USE_IMMERSIVE_DARK_MODE,
-                    &dark as *const _ as *const _,
-                    std::mem::size_of::<i32>() as u32,
+                    attr,
+                    &value as *const _ as *const _,
+                    std::mem::size_of::<u32>() as u32,
                 );
-                let mica: i32 = 2; // DWMSBT_MAINWINDOW
-                let _ = DwmSetWindowAttribute(
-                    HWND(hwnd as *mut _),
-                    DWMWA_SYSTEMBACKDROP_TYPE,
-                    &mica as *const _ as *const _,
-                    std::mem::size_of::<i32>() as u32,
-                );
-            }
+            };
+            set(DWMWA_USE_IMMERSIVE_DARK_MODE, 1);
+            set(DWMWA_SYSTEMBACKDROP_TYPE, 2); // DWMSBT_MAINWINDOW (Mica)
+            set(DWMWA_WINDOW_CORNER_PREFERENCE, 2); // DWMWCP_ROUND
+            let a = crate::renderer::accent();
+            set(DWMWA_BORDER_COLOR, (a.b as u32) << 16 | (a.g as u32) << 8 | a.r as u32); // COLORREF
         }
         let notifier = Notifier::new("com.gmux.app", "gmux").ok();
         let taskbar = if hwnd != 0 { Taskbar::new(hwnd) } else { None };
@@ -3258,6 +3258,8 @@ fn apply_theme(renderer: &mut Renderer, config: &Config) {
     let [fr, fg, fb] = config.fg(DEFAULT_FG);
     let [br, bg, bb] = config.bg(DEFAULT_BG);
     renderer.set_theme(Rgb { r: fr, g: fg, b: fb }, Rgb { r: br, g: bg, b: bb });
+    // `theme.accent` pins the chrome accent; unset clears the pin so it follows Windows again.
+    crate::renderer::set_accent(config.accent().map(|[r, g, b]| Rgb { r, g, b }));
 }
 
 /// Where the first-run marker lives: `%LOCALAPPDATA%\gmux\state`.
