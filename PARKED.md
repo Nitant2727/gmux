@@ -10,6 +10,7 @@ Cut scope doesn't die; it parks. One line per item: date · item · why parked �
 - 2026-07-19 · Workspace-unified test binaries intermittently WDAC-blocked (os error 4551) — the block roams with content hashes (gmux-gui r7, vt r10, pipe r11, mux-pane r14) · machine policy, not code; every crate green solo · wake: policy change or CI-only battery (CI runs the full workspace green).
 - 2026-07-20 · ARM64 zip **compiles** in the release workflow but has never executed on ARM64 hardware · no device · wake: an ARM64 Windows machine.
 - (user-blocked) · Code signing for released binaries · needs a certificate · wake: cert available; README documents the SmartScreen consequence meanwhile.
+- 2026-07-21 · Browser pane occasionally opens collapsed (~276x45) instead of 1024x768 (2nd launch of a session; 1st was correct) · low-priority WebView2 window-sizing quirk · wake: reproduce + fix in a browser-polish round.
 
 ## Cleared
 
@@ -19,4 +20,3 @@ Cut scope doesn't die; it parks. One line per item: date · item · why parked �
 - Cell wire elision (80% cut) — measured live 2026-07-21 (round 26).
 - Release pipeline — proven end-to-end 2026-07-20 (round 27: tag → green run → published v0.1.0 → downloaded asset runs).
 - Sidebar tab overflow — fixed round 21 (windowed rows + wheel scroll; live check folded into the owed list above).
-- 2026-07-21 � Browser pane occasionally opens collapsed (~276x45) instead of 1024x768 (seen on the 2nd launch of a session; 1st was correct) � low-priority WebView2 window-sizing quirk � wake: reproduce + fix in a browser-polish round.
