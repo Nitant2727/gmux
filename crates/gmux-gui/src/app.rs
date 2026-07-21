@@ -3265,8 +3265,8 @@ fn apply_theme(renderer: &mut Renderer, config: &Config) {
     let [fr, fg, fb] = config.fg(DEFAULT_FG);
     let [br, bg, bb] = config.bg(DEFAULT_BG);
     renderer.set_theme(Rgb { r: fr, g: fg, b: fb }, Rgb { r: br, g: bg, b: bb });
-    // `theme.accent` pins the chrome accent; unset clears the pin so it follows Windows again.
-    crate::renderer::set_accent(config.accent().map(|[r, g, b]| Rgb { r, g, b }));
+    // `theme.accent`: unset = the built-in cmux blue, "system" = the Windows accent, hex = pinned.
+    crate::renderer::set_accent(config.accent());
 }
 
 /// Where the first-run marker lives: `%LOCALAPPDATA%\gmux\state`.
