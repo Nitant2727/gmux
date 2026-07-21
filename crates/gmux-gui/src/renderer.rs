@@ -41,6 +41,7 @@ const ACCENT_BAR_W: f32 = 3.0; // active-row left-edge bar
 const ATTN_DOT: f32 = 8.0;
 const RADIUS: f32 = 6.0; // rounded corner radius for sidebar rows + pane chrome
 const GLOW_W: f32 = 4.0; // accent focus glow around the active pane (must stay < MARGIN)
+const PROGRESS_RAIL: f32 = 3.0; // progress bar height along a sidebar row's bottom edge
 const BADGE_RADIUS: f32 = 4.0; // scroll badge chip
 const TITLE_STRIP: f32 = 22.0; // pane title band inside the border, above the cells
 const SEARCH_BAR: f32 = 22.0; // search band inside the border, below the cells (active pane only)
@@ -279,6 +280,17 @@ fn push_rounded_grad(out: &mut Vec<RoundedVertex>, x0: f32, y0: f32, x1: f32, y1
             color: if ly < 0.0 { top } else { bot },
         });
     }
+}
+
+/// Filled width of a progress rail: `pct` of `track`, clamped to 0..=100 so an out-of-range agent
+/// report can't draw past the row. A nonzero percentage keeps a minimum nub so "1%" is visible.
+/// Pure/tested.
+fn progress_rail_w(track: f32, pct: u8) -> f32 {
+    if pct == 0 {
+        return 0.0;
+    }
+    let w = track * pct.min(100) as f32 / 100.0;
+    w.max(PROGRESS_RAIL).min(track)
 }
 
 /// The scrollback scrollbar thumb `(top, bottom)` in px within a `track_h`-tall track. The thumb
@@ -973,9 +985,19 @@ impl Renderer {
             // Row fill: active wins over hover. Accent bar sits in the straight span so its sharp
             // corners never poke past the rounded fill.
             if r.active {
-                let f = rgba(SIDEBAR_ROW_ACTIVE);
-                push_rounded_grad(&mut rd, 0.0, top, sw, top + ROW_H, RADIUS, f, rgba(darker(SIDEBAR_ROW_ACTIVE, 0.22)), fw, fh);
-                push_rounded(&mut rd, 0.0, top + RADIUS, ACCENT_BAR_W, top + ROW_H - RADIUS, 0.0, rgba(accent()), fw, fh);
+                // Fluent tints its selection with the accent rather than using a neutral gray, and
+                // the row carries the same faint glow as the active pane so the two read as one
+                // focus story. A pending row keeps ATTENTION as its tint so it stays the loud one.
+                let tint = if r.attention { ATTENTION } else { accent() };
+                let fill = blend(tint, SIDEBAR_ROW_ACTIVE, 0.10);
+                push_rounded(&mut rd, -GLOW_W, top - GLOW_W / 2.0, sw, top + ROW_H + GLOW_W / 2.0, RADIUS + GLOW_W, rgba_a(tint, 0.10), fw, fh);
+                push_rounded_grad(&mut rd, 0.0, top, sw, top + ROW_H, RADIUS, rgba(fill), rgba(darker(fill, 0.22)), fw, fh);
+                push_rounded(&mut rd, 0.0, top + RADIUS, ACCENT_BAR_W, top + ROW_H - RADIUS, 0.0, rgba(tint), fw, fh);
+            } else if r.attention {
+                // An unfocused workspace waiting on you: a whole-row wash, not just the dot, so a
+                // sidebar of ten tabs still answers "who needs me" at a glance.
+                let fill = blend(ATTENTION, BG_SIDEBAR, 0.09);
+                push_rounded_grad(&mut rd, 0.0, top, sw, top + ROW_H, RADIUS, rgba(fill), rgba(darker(fill, 0.20)), fw, fh);
             } else if r.hover {
                 let f = rgba(SIDEBAR_ROW_HOVER);
                 push_rounded_grad(&mut rd, 0.0, top, sw, top + ROW_H, RADIUS, f, rgba(darker(SIDEBAR_ROW_HOVER, 0.20)), fw, fh);
@@ -1002,6 +1024,25 @@ impl Renderer {
                 let x1 = cursor_right;
                 let y0 = line1 + (ch - ATTN_DOT) / 2.0;
                 push_rounded(&mut rd, x1 - ATTN_DOT, y0, x1, y0 + ATTN_DOT, ATTN_DOT / 2.0, rgba(ATTENTION), fw, fh);
+            }
+
+            // Progress rail along the row's bottom edge: the percentage as a bar, not just digits.
+            // An error fills the whole rail in ERROR (there is no meaningful fraction to show).
+            if r.progress_error || r.progress.is_some() {
+                // Full-bleed along the row's bottom edge (not inset to the text column): the two
+                // text lines fill the 48px row, so an inset rail reads as an underline of the
+                // branch name instead of a rail.
+                let (x0, x1) = (0.0, sw);
+                let (y0, y1) = (top + ROW_H - PROGRESS_RAIL, top + ROW_H);
+                push_rounded(&mut rd, x0, y0, x1, y1, 1.0, rgba_a(TEXT, 0.10), fw, fh);
+                let (w, col) = if r.progress_error {
+                    (x1 - x0, ERROR)
+                } else {
+                    (progress_rail_w(x1 - x0, r.progress.unwrap()), PROGRESS)
+                };
+                if w > 0.0 {
+                    push_rounded(&mut rd, x0, y0, x0 + w, y1, 1.0, rgba(col), fw, fh);
+                }
             }
         }
 
@@ -1511,6 +1552,18 @@ mod tests {
     fn cell(ch: char) -> Cell {
         let c = Rgb { r: 0, g: 0, b: 0 };
         Cell { ch, fg: c, bg: c, bold: false, italic: false, underline: false, inverse: false, wide: false }
+    }
+
+    #[test]
+    fn progress_rail_width_is_clamped() {
+        assert_eq!(progress_rail_w(100.0, 0), 0.0); // 0% draws nothing at all
+        assert_eq!(progress_rail_w(100.0, 50), 50.0);
+        assert_eq!(progress_rail_w(100.0, 100), 100.0);
+        assert_eq!(progress_rail_w(100.0, 255), 100.0, "over-100 reports clamp to the track");
+        // A tiny percentage still shows a visible nub instead of a sub-pixel sliver.
+        assert_eq!(progress_rail_w(100.0, 1), PROGRESS_RAIL);
+        // A track narrower than the minimum nub never overflows it.
+        assert_eq!(progress_rail_w(2.0, 1), 2.0);
     }
 
     #[test]
