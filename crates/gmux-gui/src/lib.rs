@@ -194,6 +194,8 @@ mod tests {
             branch: None,
             attention: false,
             unread: 0,
+            color: None,
+            busy: false,
             active: true,
             hover: false,
             progress: None,
@@ -228,6 +230,8 @@ mod tests {
             branch: None,
             attention: false,
             unread: 0,
+            color: None,
+            busy: false,
             active: false,
             hover: false,
             progress: None,
@@ -285,6 +289,8 @@ mod tests {
             branch: None,
             attention: false,
             unread: 0,
+            color: None,
+            busy: false,
             active: false,
             hover: false,
             progress: None,
@@ -489,7 +495,7 @@ mod tests {
     fn dump_chrome_preview() {
         use crate::renderer::{PaneView, SearchBar, SidebarItem, SidebarRow};
         use gmux_mux::{PaneSnapshot, Rect};
-        let Some(r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
+        let Some(mut r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
             return;
         };
         let (w, h) = (960u32, 600u32);
@@ -510,6 +516,8 @@ mod tests {
                 branch: Some("main".into()),
                 attention: false,
                 unread: 0,
+                color: Some("#e0533d".into()),
+                busy: true,
                 active: true,
                 hover: false,
                 progress: Some(42),
@@ -520,6 +528,8 @@ mod tests {
                 branch: Some("feat/ui".into()),
                 attention: true,
                 unread: 3,
+                color: None,
+                busy: false,
                 active: false,
                 hover: false,
                 progress: None,
@@ -530,6 +540,8 @@ mod tests {
                 branch: None,
                 attention: false,
                 unread: 0,
+                color: Some("#3d7de0".into()),
+                busy: false,
                 active: false,
                 hover: true,
                 progress: None,
@@ -584,6 +596,7 @@ mod tests {
             total: 3,
             overlay_only: false,
         };
+        r.advance_spinner(); // step off frame 0 so a lit spoke shows in the busy row
         r.render_frame(&view, &rows, sw, &[pane], w, h, "", false, Some(&sb), None, None);
         let px = read_rgba(&r, &tex, w, h).expect("readback");
         let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();

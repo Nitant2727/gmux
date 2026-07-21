@@ -77,6 +77,18 @@ fn parse_window(s: &str) -> Option<u64> {
     s.trim_start_matches('@').parse().ok()
 }
 
+/// `#rrggbb` / `rrggbb` -> a canonical `#rrggbb`, or `None` if it isn't six hex digits. Mirrors
+/// cmux's `WorkspaceTabColorSettings.normalizedHex`, so a typo is rejected at the CLI instead of
+/// being stored and silently ignored by the renderer. Pure/tested.
+fn normalize_hex(s: &str) -> Option<String> {
+    let body = s.trim().trim_start_matches('#');
+    if body.len() == 6 && body.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(format!("#{}", body.to_ascii_lowercase()))
+    } else {
+        None
+    }
+}
+
 /// Rebuild a command line from argv pieces after `--`, re-quoting arguments the shell had
 /// unwrapped: a plain `join(" ")` would turn `claude -p "work on auth"` into
 /// `claude -p work on auth`, splintering the prompt into stray positionals when the child
@@ -406,6 +418,37 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
             };
             Some(run(Call::GroupWindow { id, group: name }))
         }
+        "color" => {
+            // `gmux color -t @<window-id> #rrggbb` tags a workspace row; `--clear` untags it.
+            let id = args.iter().position(|a| a == "-t").and_then(|i| args.get(i + 1)).and_then(|s| parse_window(s));
+            let Some(id) = id else {
+                eprintln!("usage: gmux color -t @<window-id> #rrggbb | --clear");
+                return Some(2);
+            };
+            let clear = args.iter().any(|a| a == "--clear");
+            let hex = if clear {
+                String::new()
+            } else {
+                // The color is the first non-flag word that isn't the id. '#rrggbb' starts with
+                // '#', not '-', so it never looks like a flag.
+                let mut found = String::new();
+                let mut i = 0;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "-t" => i += 1,
+                        w if !w.starts_with('-') && found.is_empty() => found = w.to_string(),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if normalize_hex(&found).is_none() {
+                    eprintln!("gmux color: expected a #rrggbb color, got '{found}'");
+                    return Some(2);
+                }
+                found
+            };
+            Some(run(Call::ColorWindow { id, color: hex }))
+        }
         "split-pane" => {
             let dir = if args.iter().any(|a| a == "-v") { "v" } else { "h" }.to_string();
             let command = args.iter().position(|a| a == "--").map(|i| join_command(&args[i + 1..])).filter(|s| !s.is_empty());
@@ -454,7 +497,7 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{browse_target, parse_pane};
+    use super::{browse_target, normalize_hex, parse_pane, parse_window};
 
     /// URL passthrough, bare-domain https, and search fallback with percent-encoding.
     #[test]
@@ -473,6 +516,19 @@ mod tests {
         assert_eq!(parse_pane("%5"), Some(5));
         assert_eq!(parse_pane("5"), Some(5));
         assert_eq!(parse_pane("nope"), None);
+    }
+
+    #[test]
+    fn window_targets_and_hex_parse() {
+        assert_eq!(parse_window("@3"), Some(3));
+        assert_eq!(parse_window("3"), Some(3));
+        assert_eq!(parse_window("nope"), None);
+        // The color CLI canonicalizes to lowercase #rrggbb and rejects anything else.
+        assert_eq!(normalize_hex("#FF8800").as_deref(), Some("#ff8800"));
+        assert_eq!(normalize_hex("ff8800").as_deref(), Some("#ff8800"));
+        assert_eq!(normalize_hex("#fff"), None);
+        assert_eq!(normalize_hex("#gggggg"), None);
+        assert_eq!(normalize_hex("red"), None);
     }
 
     #[test]

@@ -468,6 +468,12 @@ impl Server {
                 }
                 Response::ok(id, ResultBody::Done)
             }
+            Call::ColorWindow { id: win, color } => {
+                if let Some(w) = self.session.window_mut(WindowId(*win)) {
+                    w.set_color(color.clone());
+                }
+                Response::ok(id, ResultBody::Done)
+            }
             Call::FocusPaneId { pane } => {
                 self.session.focus_pane(PaneId(*pane));
                 Response::ok(id, ResultBody::Done)
@@ -543,6 +549,8 @@ impl Server {
                     attention: info.attention,
                     unread: info.unread,
                     group: win.group().map(str::to_string),
+                    color: win.color().map(str::to_string),
+                    busy: win.is_busy(),
                     active: i == active_idx,
                     progress,
                     progress_error,
@@ -1591,6 +1599,14 @@ mod tests {
         // A gone id is a no-op Ok here too.
         let resp = server.handle(&Request { id: 6, call: Call::GroupWindow { id: 999_999, group: "x".into() } });
         assert_eq!(resp.result, Some(ResultBody::Done));
+
+        // ColorWindow tags the row and an empty color clears it, same id resolution.
+        let resp = server.handle(&Request { id: 7, call: Call::ColorWindow { id: wid, color: "#ff8800".into() } });
+        assert_eq!(resp.result, Some(ResultBody::Done));
+        assert_eq!(server.layout(800, 600).tabs[0].color.as_deref(), Some("#ff8800"));
+        let resp = server.handle(&Request { id: 8, call: Call::ColorWindow { id: wid, color: String::new() } });
+        assert_eq!(resp.result, Some(ResultBody::Done));
+        assert_eq!(server.layout(800, 600).tabs[0].color, None);
     }
 
     /// CONTRACT test (needs gmux-vt's OSC 52 -> `TermEvent::Clipboard` and gmux-mux's
