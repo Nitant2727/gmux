@@ -20,7 +20,7 @@ use winit::window::{Window, WindowId};
 
 use crate::config::{config_path, default_template, Action, Config, Keymap};
 use crate::daemon_client::{spawn_output_subscriber, DaemonClient};
-use crate::renderer::{PaletteView, PaneView, SearchBar, SidebarRow};
+use crate::renderer::{GroupHeader, PaletteView, PaneView, SearchBar, SidebarItem, SidebarRow};
 use crate::Renderer;
 
 // The Windows clipboard helper lives in its own file but is declared here (a child of `app`) so the
@@ -221,6 +221,78 @@ fn fuzzy_match(hay: &str, needle: &str) -> bool {
         .flat_map(char::to_lowercase)
         .filter(|c| !skip(c))
         .all(|n| h.any(|c| c == n))
+}
+
+/// What a rendered sidebar item stands for, so a click on item `i` knows what it hit. Parallel to
+/// the `SidebarItem` list handed to the renderer.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum ItemMeta {
+    /// A group header; toggling it collapses/expands that group.
+    Header(String),
+    /// A workspace row, carrying its index among the VISIBLE rows (already windowed).
+    Row(usize),
+}
+
+/// Fold `rows` (with each row's group) into the renderer's item list plus the parallel meta list.
+///
+/// Ungrouped workspaces come first at the root, the way cmux lists them; each group then gets a
+/// header followed by its members, and a collapsed group contributes its header alone (carrying the
+/// member count and the group's summed unread, so a collapsed group can still shout). Groups appear
+/// in first-seen order, so the sidebar doesn't reshuffle when a window is renamed. Pure/tested.
+fn sidebar_items(
+    rows: Vec<SidebarRow>,
+    groups: &[Option<String>],
+    collapsed: &HashSet<String>,
+    hover_item: Option<usize>,
+) -> (Vec<SidebarItem>, Vec<ItemMeta>) {
+    // Group name -> the visible-row indices under it, in order; `None` collects the ungrouped.
+    let mut order: Vec<String> = Vec::new();
+    let mut members: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut ungrouped: Vec<usize> = Vec::new();
+    for (i, _) in rows.iter().enumerate() {
+        match groups.get(i).and_then(|g| g.clone()) {
+            Some(g) => {
+                if !members.contains_key(&g) {
+                    order.push(g.clone());
+                }
+                members.entry(g).or_default().push(i);
+            }
+            None => ungrouped.push(i),
+        }
+    }
+
+    // `rows` is consumed as we place each index exactly once, so take them out by index.
+    let mut slots: Vec<Option<SidebarRow>> = rows.into_iter().map(Some).collect();
+    let mut items = Vec::new();
+    let mut meta = Vec::new();
+    fn push_row(slots: &mut [Option<SidebarRow>], idx: usize, items: &mut Vec<SidebarItem>, meta: &mut Vec<ItemMeta>) {
+        if let Some(row) = slots[idx].take() {
+            items.push(SidebarItem::Row(row));
+            meta.push(ItemMeta::Row(idx));
+        }
+    }
+    for idx in ungrouped {
+        push_row(&mut slots, idx, &mut items, &mut meta);
+    }
+    for name in order {
+        let idxs = members.remove(&name).unwrap_or_default();
+        let is_collapsed = collapsed.contains(&name);
+        let unread = idxs.iter().filter_map(|i| slots[*i].as_ref()).map(|r| r.unread).sum();
+        items.push(SidebarItem::Header(GroupHeader {
+            name: name.clone(),
+            collapsed: is_collapsed,
+            members: idxs.len(),
+            unread,
+            hover: hover_item == Some(items.len()),
+        }));
+        meta.push(ItemMeta::Header(name));
+        if !is_collapsed {
+            for idx in idxs {
+                push_row(&mut slots, idx, &mut items, &mut meta);
+            }
+        }
+    }
+    (items, meta)
 }
 
 /// Build the palette's filtered item list: recently-run actions first, then every "tab: NAME"
@@ -600,6 +672,14 @@ struct State {
     /// Tab names per sidebar row from the last layout, cached to seed a rename buffer with the
     /// current name (rename starts from a mouse gesture, outside the render that builds the rows).
     tab_names: Vec<String>,
+    /// What each rendered sidebar item was, from the last render — mouse handlers run between
+    /// renders, so they hit-test against this rather than rebuilding the list.
+    item_meta: Vec<ItemMeta>,
+    /// Item heights from the last render, in the same order as `item_meta`; the hit-test walks
+    /// these so a header (24px) and a row (48px) can't be confused for one another.
+    item_heights: Vec<f32>,
+    /// Group headers the user has collapsed (by name; a group that disappears just drops out).
+    collapsed_groups: HashSet<String>,
     /// Active sidebar tab rename (double-click a row), or `None`. While `Some`, all keyboard input
     /// edits the buffer instead of reaching the pane — mutually exclusive with `search`.
     rename: Option<RenameState>,
@@ -846,6 +926,9 @@ impl ApplicationHandler for App {
             tab_count: 0,
             tab_ids: Vec::new(),
             tab_names: Vec::new(),
+            item_meta: Vec::new(),
+            item_heights: Vec::new(),
+            collapsed_groups: HashSet::new(),
             rename: None,
             notifier,
             taskbar,
@@ -1672,14 +1755,13 @@ impl State {
         let (px, py) = (cx as u32, cy as u32);
         if px < sidebar_w {
             self.clear_selection();
-            // The '+' new-tab row sits after the last workspace row, so test it first.
-            let visible = self.sidebar_window().1;
-            if self.renderer.sidebar_new_tab_at(cy as f32, visible) {
+            // The '+' new-tab row sits after the last item, so test it first.
+            if self.renderer.sidebar_new_tab_at(cy as f32, &self.item_heights) {
                 self.set_scroll(self.active_pane, 0);
                 self.client.control(Call::NewWindow { command: None });
                 self.sync_size();
                 self.window.request_redraw();
-            } else if let Some(vi) = self.renderer.sidebar_row_at(cy as f32, visible) {
+            } else if let Some(vi) = self.hit_row(cy) {
                 let idx = self.real_tab(vi);
                 // A second click on the same row within CLICK_INTERVAL starts renaming that tab.
                 let now = Instant::now();
@@ -1693,6 +1775,13 @@ impl State {
                 self.client.control(Call::SelectWindow { index: idx });
                 // Arm a tab reorder: a >8px vertical drag before release turns into a MoveWindow.
                 self.sidebar_drag = Some(SidebarDrag { from_row: idx, start_y: cy, reordering: false });
+                self.window.request_redraw();
+            } else if let Some(group) = self.hit_header(cy) {
+                // A click on a group header folds/unfolds it. Collapse state is GUI-local: the
+                // daemon owns which group a window is in, not whether you have it open.
+                if !self.collapsed_groups.remove(&group) {
+                    self.collapsed_groups.insert(group);
+                }
                 self.window.request_redraw();
             }
             return;
@@ -1864,11 +1953,7 @@ impl State {
         self.scrollbar_drag = false;
         if let Some(sd) = self.sidebar_drag.take() {
             if sd.reordering {
-                let visible = self.sidebar_window().1;
-                let target = self
-                    .renderer
-                    .sidebar_row_at(self.cursor.1 as f32, visible)
-                    .map(|vi| self.real_tab(vi));
+                let target = self.hit_row(self.cursor.1).map(|vi| self.real_tab(vi));
                 if let Some(to) = target {
                     if to != sd.from_row {
                         self.client.control(Call::MoveWindow { from: sd.from_row, to });
@@ -2455,6 +2540,23 @@ impl State {
         visible_idx + self.sidebar_window().0
     }
 
+    /// The visible row index under `y`, or `None` when the cursor is on a group header, in a gap,
+    /// or past the list. Headers and rows share one hit-test walk, so they can't be confused.
+    fn hit_row(&self, y: f64) -> Option<usize> {
+        match self.renderer.sidebar_item_at(y as f32, &self.item_heights).and_then(|i| self.item_meta.get(i)) {
+            Some(ItemMeta::Row(vi)) => Some(*vi),
+            _ => None,
+        }
+    }
+
+    /// The group name whose header sits under `y`, if any.
+    fn hit_header(&self, y: f64) -> Option<String> {
+        match self.renderer.sidebar_item_at(y as f32, &self.item_heights).and_then(|i| self.item_meta.get(i)) {
+            Some(ItemMeta::Header(g)) => Some(g.clone()),
+            _ => None,
+        }
+    }
+
     /// Whether the cursor sits on the active pane's search band (the bottom `SEARCH_BAR` strip the
     /// renderer draws while searching, plus the margin/border sliver below it — clicks there hit
     /// nothing anyway).
@@ -2553,13 +2655,7 @@ impl State {
         if (cx as u32) >= sidebar_w {
             return false;
         }
-        let visible = self.sidebar_window().1;
-        match self
-            .renderer
-            .sidebar_row_at(cy as f32, visible)
-            .map(|vi| self.real_tab(vi))
-            .and_then(|i| self.tab_ids.get(i))
-        {
+        match self.hit_row(cy).map(|vi| self.real_tab(vi)).and_then(|i| self.tab_ids.get(i)) {
             Some(&win) => {
                 // By stable id: a window removed daemon-side since the last render shifts the
                 // indices, but never re-targets an id (ids are never reused — a stale id no-ops).
@@ -2873,6 +2969,8 @@ impl State {
         // acquired SurfaceTexture unpresented exhausts the swapchain and wedges the window white, so
         // every path presents (a cleared frame when there's nothing to draw).
         let mut rows: Vec<SidebarRow> = Vec::new();
+        // Each visible row's group (parallel to `rows`), used to fold them under headers below.
+        let mut groups: Vec<Option<String>> = Vec::new();
         // Per pane: snapshot, attention, active, rect (window coords), scroll offset, id, title.
         let mut snaps: Vec<(PaneSnapshot, Attention, bool, Rect, u32, u64, String)> = Vec::new();
         // URL spans detected this frame, keyed by pane id (rebuilt every render).
@@ -2921,6 +3019,7 @@ impl State {
             if off > 0 || rows.len() > cap {
                 rows = rows.into_iter().skip(off).take(cap).collect();
             }
+            groups = layout.tabs.iter().skip(off).take(cap).map(|t| t.group.clone()).collect();
 
             // Update the taskbar attention badge / progress based on overall attention.
             if let Some(tb) = &self.taskbar {
@@ -3064,14 +3163,26 @@ impl State {
         // sidebar). The renderer draws the hover fill (and ignores it on the active row).
         let (cx, cy) = self.cursor;
         let mut plus_hover = false;
-        if cx >= 0.0 && (cx as u32) < sidebar_w {
-            // Rows are already windowed, so the hit-test's visual index maps 1:1.
-            if let Some(hi) = self.renderer.sidebar_row_at(cy as f32, rows.len()) {
-                if let Some(row) = rows.get_mut(hi) {
-                    row.hover = true;
-                }
+        let over_sidebar = cx >= 0.0 && (cx as u32) < sidebar_w;
+        // Hover is resolved against the PREVIOUS render's item list (the new one isn't folded yet);
+        // it only tints a fill, so a one-frame lag on a fast pointer costs nothing.
+        let hover_item = if over_sidebar {
+            self.renderer.sidebar_item_at(cy as f32, &self.item_heights)
+        } else {
+            None
+        };
+        if let Some(ItemMeta::Row(vi)) = hover_item.and_then(|i| self.item_meta.get(i)).cloned() {
+            if let Some(row) = rows.get_mut(vi) {
+                row.hover = true;
             }
-            plus_hover = self.renderer.sidebar_new_tab_at(cy as f32, rows.len());
+        }
+        // Fold the rows under their group headers, then cache what was drawn so the mouse handlers
+        // (which run between renders) hit-test the same list.
+        let (items, meta) = sidebar_items(rows, &groups, &self.collapsed_groups, hover_item);
+        self.item_meta = meta;
+        self.item_heights = Renderer::sidebar_item_heights(&items);
+        if over_sidebar {
+            plus_hover = self.renderer.sidebar_new_tab_at(cy as f32, &self.item_heights);
         }
         // Search bar shows a 1-based "current/total" (renderer renders the numbers as-is). A
         // pending close confirmation reuses the same band as a pure prompt (label only) — search
@@ -3158,7 +3269,7 @@ impl State {
         });
         self.renderer.render_frame(
             &view,
-            &rows,
+            &items,
             sidebar_w,
             &views,
             w,
@@ -3546,6 +3657,7 @@ mod tests {
         let panes = || vec![rect(1, 0, 0, 80, 40), rect(2, 80, 0, 80, 40)];
         let base = LayoutWire { zoomed: false, active_pane: 1, tabs: vec![], panes: panes() };
         let tab = gmux_proto::TabWire {
+            group: None,
             index: 0, id: 7, name: "changed".into(), branch: None, attention: true, unread: 0, active: true,
             progress: Some(50), progress_error: false,
         };
@@ -3629,6 +3741,78 @@ mod tests {
 
     /// Fuzzy filter: case-insensitive subsequence, whitespace in the needle ignored; palette items
     /// cover tabs (with alt+N hints) and all default-bound actions except the palette itself.
+    /// Rows for grouping tests: named, otherwise inert.
+    fn grow(name: &str, unread: u32) -> SidebarRow {
+        SidebarRow {
+            name: name.into(),
+            branch: None,
+            attention: false,
+            unread,
+            active: false,
+            hover: false,
+            progress: None,
+            progress_error: false,
+        }
+    }
+
+    fn item_names(items: &[SidebarItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|i| match i {
+                SidebarItem::Header(h) => format!("#{}", h.name),
+                SidebarItem::Row(r) => r.name.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn grouping_puts_ungrouped_first_then_headers_in_first_seen_order() {
+        let rows = vec![grow("a", 0), grow("b", 0), grow("c", 0), grow("d", 0)];
+        // b + d are in "api", c is in "web", a is ungrouped. "api" is seen first.
+        let groups = vec![None, Some("api".into()), Some("web".into()), Some("api".into())];
+        let (items, meta) = sidebar_items(rows, &groups, &HashSet::new(), None);
+        assert_eq!(item_names(&items), ["a", "#api", "b", "d", "#web", "c"]);
+        // Meta rows carry the ORIGINAL visible-row index, so a click still selects the right tab.
+        assert_eq!(
+            meta,
+            vec![
+                ItemMeta::Row(0),
+                ItemMeta::Header("api".into()),
+                ItemMeta::Row(1),
+                ItemMeta::Row(3),
+                ItemMeta::Header("web".into()),
+                ItemMeta::Row(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn collapsed_group_hides_members_and_summarizes_them() {
+        let rows = vec![grow("a", 2), grow("b", 5)];
+        let groups = vec![Some("api".into()), Some("api".into())];
+        let collapsed: HashSet<String> = ["api".to_string()].into_iter().collect();
+        let (items, meta) = sidebar_items(rows, &groups, &collapsed, None);
+        assert_eq!(item_names(&items), ["#api"]);
+        assert_eq!(meta, vec![ItemMeta::Header("api".into())]);
+        match &items[0] {
+            SidebarItem::Header(h) => {
+                assert_eq!(h.members, 2, "collapsed header reports how many are hidden");
+                assert_eq!(h.unread, 7, "and sums their unread so it can still shout");
+                assert!(h.collapsed);
+            }
+            _ => panic!("expected a header"),
+        }
+    }
+
+    #[test]
+    fn ungrouped_rows_alone_produce_no_headers() {
+        // The common case (nobody has grouped anything) must render exactly as it did before.
+        let rows = vec![grow("a", 0), grow("b", 0)];
+        let (items, meta) = sidebar_items(rows, &[None, None], &HashSet::new(), None);
+        assert_eq!(item_names(&items), ["a", "b"]);
+        assert_eq!(meta, vec![ItemMeta::Row(0), ItemMeta::Row(1)]);
+    }
+
     #[test]
     fn palette_fuzzy_filter_and_items() {
         assert!(fuzzy_match("split horizontal", "spl h"));

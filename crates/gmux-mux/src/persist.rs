@@ -35,6 +35,10 @@ pub struct WindowSnapshot {
     /// so pre-round-9 snapshots (no field) still load with no override.
     #[serde(default)]
     pub name: Option<String>,
+    /// Sidebar group this window sits under, reapplied on restore. `#[serde(default)]` so older
+    /// snapshots (no field) load as ungrouped.
+    #[serde(default)]
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -139,6 +143,7 @@ impl WindowSnapshot {
             layout: node_to_snapshot(&root, &index_of),
             active,
             name: window.name().map(str::to_string),
+            group: window.group().map(str::to_string),
         })
     }
 
@@ -162,6 +167,9 @@ impl WindowSnapshot {
         let mut window = Window::from_parts(map, root, active);
         if let Some(name) = &self.name {
             window.set_name(name.clone());
+        }
+        if let Some(group) = &self.group {
+            window.set_group(group.clone());
         }
         Ok(window)
     }
@@ -227,6 +235,7 @@ mod tests {
                 },
                 active: 1,
                 name: Some("backend".into()),
+                group: Some("api".into()),
             }],
         };
         let json = serde_json::to_string(&snap).unwrap();
@@ -237,6 +246,7 @@ mod tests {
         let old = r#"{"panes":[{"cwd":null}],"layout":{"Leaf":0},"active":0}"#;
         let w: WindowSnapshot = serde_json::from_str(old).unwrap();
         assert_eq!(w.name, None, "absent name defaults to None");
+        assert_eq!(w.group, None, "absent group defaults to None (older snapshots are ungrouped)");
     }
 
     /// Contract 6: a renamed window's custom name survives a snapshot round-trip
@@ -247,11 +257,13 @@ mod tests {
         let id = PaneId::alloc();
         let mut win = Window::from_parts(HashMap::new(), Node::leaf(id), id);
         win.set_name("backend".to_string());
+        win.set_group("api".to_string());
         let session = Session::from_windows("s", vec![win], 0);
 
         let snap = SessionSnapshot::capture(&session);
         assert_eq!(snap.windows.len(), 1);
         assert_eq!(snap.windows[0].name.as_deref(), Some("backend"), "custom name captured");
+        assert_eq!(snap.windows[0].group.as_deref(), Some("api"), "sidebar group captured");
 
         let restored = snap
             .restore("s", |_| Ok(Pane::remote(0, 80, 24, Box::new(|_| {}))))
@@ -260,6 +272,11 @@ mod tests {
             restored.windows()[0].workspace_info().name,
             "backend",
             "custom name reapplied on restore"
+        );
+        assert_eq!(
+            restored.windows()[0].group(),
+            Some("api"),
+            "grouping survives a daemon restart, like the rename does"
         );
 
         // A window with no override captures None and restores to the derived name ("shell").

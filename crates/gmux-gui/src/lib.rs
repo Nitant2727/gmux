@@ -110,6 +110,11 @@ mod tests {
         [px[o], px[o + 1], px[o + 2], px[o + 3]]
     }
 
+    /// Wrap plain rows as sidebar items (these tests exercise rows, not group headers).
+    fn items(rows: Vec<crate::renderer::SidebarRow>) -> Vec<crate::renderer::SidebarItem> {
+        rows.into_iter().map(crate::renderer::SidebarItem::Row).collect()
+    }
+
     #[test]
     fn renders_background_cell_colors() {
         let red = Rgb { r: 200, g: 20, b: 20 };
@@ -194,7 +199,7 @@ mod tests {
             progress: None,
             progress_error: false,
         }];
-        r.render_frame(&view, &rows, sw, &[], w, h, "", false, None, None, None);
+        r.render_frame(&view, &items(rows), sw, &[], w, h, "", false, None, None, None);
         let px = read_rgba(&r, &tex, w, h).expect("readback");
         // The active row is a solid accent pill (cmux blue #0091ff) inset ROW_OUTER_PAD from the
         // panel edge. x=1 is outside the pill entirely (neutral panel gray); the centre is accent.
@@ -208,6 +213,50 @@ mod tests {
             center[2] > 150 && center[2] > center[0] + 80,
             "active-row centre should be the solid accent fill, got {center:?}"
         );
+    }
+
+    #[test]
+    fn hit_test_walks_mixed_item_heights() {
+        // A 24px header followed by two 48px rows: every hit must land on the item actually under
+        // the cursor, and the gaps between items must hit nothing.
+        use crate::renderer::{GroupHeader, SidebarItem, SidebarRow};
+        let Some(r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
+            return;
+        };
+        let row = || SidebarRow {
+            name: "w".into(),
+            branch: None,
+            attention: false,
+            unread: 0,
+            active: false,
+            hover: false,
+            progress: None,
+            progress_error: false,
+        };
+        let items = vec![
+            SidebarItem::Header(GroupHeader {
+                name: "api".into(),
+                collapsed: false,
+                members: 2,
+                unread: 0,
+                hover: false,
+            }),
+            SidebarItem::Row(row()),
+            SidebarItem::Row(row()),
+        ];
+        let heights = Renderer::sidebar_item_heights(&items);
+        assert_eq!(heights, vec![24.0, 48.0, 48.0]);
+        let top = 24.0 + r.cell_h() as f32; // SIDEBAR_PAD_TOP(16) + cell_h + 8
+        assert_eq!(r.sidebar_item_at(top - 1.0, &heights), None, "above the list");
+        assert_eq!(r.sidebar_item_at(top + 1.0, &heights), Some(0), "header");
+        assert_eq!(r.sidebar_item_at(top + 23.0, &heights), Some(0), "header, last pixel");
+        assert_eq!(r.sidebar_item_at(top + 25.0, &heights), None, "gap under the header");
+        assert_eq!(r.sidebar_item_at(top + 30.0, &heights), Some(1), "first row");
+        assert_eq!(r.sidebar_item_at(top + 80.0, &heights), Some(2), "second row");
+        assert_eq!(r.sidebar_item_at(top + 400.0, &heights), None, "past the list");
+        // '+ new tab' sits directly after the last item, never overlapping it.
+        assert!(!r.sidebar_new_tab_at(top + 80.0, &heights));
+        assert!(r.sidebar_new_tab_at(top + 24.0 + 4.0 + 2.0 * 52.0 + 1.0, &heights));
     }
 
     #[test]
@@ -241,7 +290,7 @@ mod tests {
             progress: None,
             progress_error: false,
         }];
-        r.render_frame(&view, &rows, sw, &[], w, h, "", false, None, None, None);
+        r.render_frame(&view, &items(rows), sw, &[], w, h, "", false, None, None, None);
         let px = read_rgba(&r, &tex, w, h).expect("readback");
         let top = pixel(&px, w, 2, 2);
         let bottom = pixel(&px, w, 2, h - 3);
@@ -438,7 +487,7 @@ mod tests {
     #[test]
     #[ignore = "artifact dump, not an assertion; run explicitly"]
     fn dump_chrome_preview() {
-        use crate::renderer::{PaneView, SearchBar, SidebarRow};
+        use crate::renderer::{PaneView, SearchBar, SidebarItem, SidebarRow};
         use gmux_mux::{PaneSnapshot, Rect};
         let Some(r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
             return;
@@ -503,6 +552,20 @@ mod tests {
         }
         cells.resize(24, vec![mk(' '); 70]);
         let snap = PaneSnapshot { cells, cursor: (12, 3), cursor_style: 0, cols: 70, rows: 24 };
+        // Fold the last two rows under a collapsible group header, so the preview covers both
+        // sidebar item kinds.
+        let mut list: Vec<crate::renderer::SidebarItem> = Vec::new();
+        let mut rows = rows.into_iter();
+        list.push(crate::renderer::SidebarItem::Row(rows.next().unwrap()));
+        list.push(crate::renderer::SidebarItem::Header(crate::renderer::GroupHeader {
+            name: "frontend".into(),
+            collapsed: false,
+            members: 2,
+            unread: 3,
+            hover: false,
+        }));
+        list.extend(rows.map(crate::renderer::SidebarItem::Row));
+        let rows = list;
         let sw = r.sidebar_width();
         let pane = PaneView {
             snap: &snap,
@@ -530,3 +593,4 @@ mod tests {
         std::fs::write("chrome_preview.ppm", out).expect("write");
     }
 }
+

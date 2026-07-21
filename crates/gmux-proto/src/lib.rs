@@ -127,6 +127,14 @@ pub enum Call {
         #[serde(default)]
         name: String,
     },
+    /// Put a window (by stable id) into a sidebar group, or take it out with an empty `group`.
+    /// Resolved like `RenameWindow`; a gone id is a harmless no-op.
+    GroupWindow {
+        #[serde(default)]
+        id: u64,
+        #[serde(default)]
+        group: String,
+    },
     /// Focus a specific pane by id, activating its window too (a pane click). Unknown ids are
     /// ignored server-side.
     FocusPaneId {
@@ -363,6 +371,9 @@ pub struct TabWire {
     /// daemon that doesn't send it just reads as zero.
     #[serde(default)]
     pub unread: u32,
+    /// Sidebar group this window sits under; `None` = ungrouped (listed above every group).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     pub active: bool,
     /// Aggregate agent progress across the window's panes: `Some(pct)` = the least-done active
     /// agent's percentage, `None` = no pane reporting progress. Indeterminate/paused panes count
@@ -555,8 +566,8 @@ mod tests {
         let layout = LayoutWire { zoomed: false,
             active_pane: 1,
             tabs: vec![
-                TabWire { index: 0, id: 10, name: "a".into(), branch: Some("main".into()), attention: false, unread: 0, active: true, progress: Some(42), progress_error: false },
-                TabWire { index: 1, id: 11, name: "b".into(), branch: None, attention: true, unread: 7, active: false, progress: None, progress_error: true },
+                TabWire { index: 0, id: 10, name: "a".into(), branch: Some("main".into()), attention: false, unread: 0, group: None, active: true, progress: Some(42), progress_error: false },
+                TabWire { index: 1, id: 11, name: "b".into(), branch: None, attention: true, unread: 7, group: Some("api".into()), active: false, progress: None, progress_error: true },
             ],
             panes: Vec::new(),
         };
@@ -572,6 +583,7 @@ mod tests {
         assert_eq!(tab.progress, None);
         assert!(!tab.progress_error);
         assert_eq!(tab.unread, 0, "an old daemon's tab reads as zero unread, not a bad badge");
+        assert_eq!(tab.group, None, "and as ungrouped, so the sidebar renders it at the root");
     }
 
     #[test]
