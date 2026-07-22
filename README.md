@@ -57,7 +57,11 @@ The binary is currently unsigned (SmartScreen may prompt on first run of a downl
 focus-follows-mouse), a **keys** tab listing every action with its current chord, and **schemes**,
 **accent** and **font** pickers, each of which tries a value on live before you keep it (Enter
 keeps, Escape restores). Arrows move, Tab switches tab, Enter
-changes the value — on a keybinding, Enter waits for you to press the new chord. Clicking works
+changes the value — on a keybinding, Enter waits for you to press the new chord. Only one action
+can own a chord, so pressing one that's already taken doesn't quietly steal it: the panel names the
+action holding it and waits for you to press the same chord again to confirm. Chords two actions
+both claim are drawn in red on the keys tab, including ones a hand-edited config created. Clicking
+works
 too: a click on a tab opens it, and on the schemes tab a click previews. Changes are
 written to `%APPDATA%\gmux\gmux.json` and applied live; `e` opens that file for anything the panel
 doesn't cover (colour schemes, per-workspace settings).
