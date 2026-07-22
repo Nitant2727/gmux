@@ -233,7 +233,7 @@ impl ResetScope {
     fn prompt(self) -> &'static str {
         match self {
             ResetScope::Keys => "reset every keybinding? · enter confirms · esc cancels",
-            ResetScope::All => "reset every setting in this panel? · enter confirms · esc cancels",
+            ResetScope::All => "reset every setting here? · enter confirms · esc cancels",
         }
     }
 }
