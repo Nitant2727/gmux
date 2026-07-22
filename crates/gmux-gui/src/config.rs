@@ -54,6 +54,8 @@ pub enum Action {
     OpenWorkspace,
     /// Pick a directory holding several projects and open a workspace for each one inside it.
     ImportWorkspaces,
+    /// Filter the sidebar by typing (Esc clears, Enter selects the first match).
+    FilterWorkspaces,
     /// Rename the active workspace inline (same editor a sidebar double-click opens).
     RenameWorkspace,
     /// Close the active workspace (asks first when it has running children).
@@ -100,6 +102,7 @@ impl Action {
             "toggle_browser" => Action::ToggleBrowser,
             "open_workspace" => Action::OpenWorkspace,
             "import_workspaces" => Action::ImportWorkspaces,
+            "filter_workspaces" => Action::FilterWorkspaces,
             "rename_workspace" => Action::RenameWorkspace,
             "close_workspace" => Action::CloseWorkspace,
             "resize_left" => Action::ResizeLeft,
@@ -151,6 +154,7 @@ const DEFAULTS: &[(&str, &str, Action)] = &[
     ("toggle_browser", "ctrl+shift+b", Action::ToggleBrowser),
     ("open_workspace", "ctrl+shift+o", Action::OpenWorkspace),
     ("import_workspaces", "ctrl+shift+i", Action::ImportWorkspaces),
+    ("filter_workspaces", "ctrl+shift+k", Action::FilterWorkspaces),
     // Not F2 (the usual rename key): a bare key would be swallowed before reaching the pane, and
     // TUIs like htop/mc bind the F-keys. A chord keeps the pane's keyboard intact.
     ("rename_workspace", "ctrl+shift+r", Action::RenameWorkspace),
