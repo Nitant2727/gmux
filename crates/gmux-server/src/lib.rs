@@ -264,9 +264,18 @@ impl Server {
         }
     }
 
+    /// Spawn a pane for the ACTIVE window: it starts in that workspace's directory when one is
+    /// set, so a split lands in the project rather than wherever the daemon happens to have been
+    /// started. Falls back to the shell's own default when the workspace is unanchored.
     fn spawn_pane(&self, command: &Option<String>) -> io::Result<Pane> {
+        let dir = self.session.active_window().and_then(|w| w.workspace_dir()).map(str::to_string);
+        self.spawn_pane_in(command, dir.as_deref())
+    }
+
+    /// Spawn a pane in an explicit directory (`None` = the shell's default).
+    fn spawn_pane_in(&self, command: &Option<String>, cwd: Option<&str>) -> io::Result<Pane> {
         let cmd = command.clone().unwrap_or_else(|| self.shell.clone());
-        let pane = Pane::spawn(&cmd, DEFAULT_SIZE)?;
+        let pane = Pane::spawn_in(&cmd, DEFAULT_SIZE, cwd, None)?;
         pane.set_palette(self.palette); // late arrivals match the current theme
         Ok(pane)
     }
@@ -361,14 +370,29 @@ impl Server {
                     Err(e) => Response::err(id, format!("spawn failed: {e}")),
                 }
             }
-            Call::NewWindow { command } => match self.spawn_pane(command) {
-                Ok(pane) => {
-                    let pid = pane.id.0;
-                    self.session.add_window(pane);
-                    Response::ok(id, ResultBody::PaneId(pid))
+            Call::NewWindow { command, cwd } => {
+                // A workspace opened on a directory anchors the new window to it, so every later
+                // pane in that window opens there too (see `spawn_pane`).
+                match self.spawn_pane_in(command, cwd.as_deref()) {
+                    Ok(pane) => {
+                        let pid = pane.id.0;
+                        let wid = self.session.add_window(pane);
+                        if let Some(dir) = cwd {
+                            if let Some(w) = self.session.window_mut(wid) {
+                                w.set_workspace_dir(dir.clone());
+                            }
+                        }
+                        Response::ok(id, ResultBody::PaneId(pid))
+                    }
+                    Err(e) => Response::err(id, format!("spawn failed: {e}")),
                 }
-                Err(e) => Response::err(id, format!("spawn failed: {e}")),
-            },
+            }
+            Call::SetWorkspaceDir { id: win, dir } => {
+                if let Some(w) = self.session.window_mut(WindowId(*win)) {
+                    w.set_workspace_dir(dir.clone());
+                }
+                Response::ok(id, ResultBody::Done)
+            }
             Call::Notify { pane, title, body } => {
                 let target = pane.or_else(|| self.session.active_window().map(|w| w.active_id().0));
                 match target.and_then(|t| self.find(t)) {
@@ -1399,6 +1423,25 @@ mod tests {
         assert!(!persist_screen_from_json("\u{feff}{\"persist_screen\": false}"), "BOM is stripped");
         // A non-bool value is ignored (defaults true), not coerced.
         assert!(persist_screen_from_json(r#"{"persist_screen": "no"}"#));
+    }
+
+    /// A workspace anchored to a directory hands that directory to every pane spawned in it — the
+    /// point of the feature ("new terminals open in the workspace's folder"). Checked at the seam
+    /// that decides the cwd, so it holds for splits and for `NewWindow` alike without needing a
+    /// console (spawning a real shell would).
+    #[test]
+    fn workspace_dir_is_what_new_panes_inherit() {
+        use gmux_mux::{Pane, Session};
+        let mut session = Session::start("t", Pane::remote(1, 80, 24, Box::new(|_| {})));
+        let wid = session.windows()[0].id;
+        assert_eq!(session.windows()[0].workspace_dir(), None, "unanchored by default");
+
+        session.window_mut(wid).unwrap().set_workspace_dir(r"C:\proj".into());
+        assert_eq!(session.active_window().and_then(|w| w.workspace_dir()), Some(r"C:\proj"));
+
+        // Empty clears it back to "wherever the shell starts".
+        session.window_mut(wid).unwrap().set_workspace_dir(String::new());
+        assert_eq!(session.windows()[0].workspace_dir(), None);
     }
 
     /// PR auto-refresh is opt-in and rate-floored: absent/0/malformed means OFF (no `gh`, no

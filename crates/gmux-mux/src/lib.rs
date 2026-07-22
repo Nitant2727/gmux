@@ -43,6 +43,10 @@ pub struct Window {
     /// A pull request badge (number + state) pushed in via `gmux pr`. Persisted like `name`, so a
     /// badge survives a daemon restart (the CLI need not re-resolve it every launch).
     pr: Option<workspace::PrBadge>,
+    /// The workspace's directory. Every pane opened in this window — the first one, splits, and
+    /// panes restored from a snapshot — starts here, so a workspace stays anchored to its project
+    /// instead of drifting with whatever directory a shell was last `cd`'d into. Persisted.
+    workspace_dir: Option<String>,
 }
 
 impl Window {
@@ -50,7 +54,7 @@ impl Window {
         let id = pane.id;
         let mut panes = HashMap::new();
         panes.insert(id, pane);
-        Window { id: WindowId::alloc(), panes, root: Node::leaf(id), active: id, zoom: false, name: None, group: None, color: None, pr: None }
+        Window { id: WindowId::alloc(), panes, root: Node::leaf(id), active: id, zoom: false, name: None, group: None, color: None, pr: None, workspace_dir: None }
     }
 
     pub fn active_id(&self) -> PaneId {
@@ -85,7 +89,7 @@ impl Window {
     }
     /// Build a window from a pre-constructed pane map + split tree (used by session restore).
     pub fn from_parts(panes: HashMap<PaneId, Pane>, root: Node, active: PaneId) -> Window {
-        Window { id: WindowId::alloc(), panes, root, active, zoom: false, name: None, group: None, color: None, pr: None }
+        Window { id: WindowId::alloc(), panes, root, active, zoom: false, name: None, group: None, color: None, pr: None, workspace_dir: None }
     }
 
     /// Set (or clear) this window's custom name override. An empty `name` clears it back to the
@@ -128,6 +132,16 @@ impl Window {
     /// This workspace's pull-request badge, if one is set.
     pub fn pr(&self) -> Option<&workspace::PrBadge> {
         self.pr.as_ref()
+    }
+
+    /// Anchor this workspace to a directory (empty clears it back to "wherever the shell starts").
+    pub fn set_workspace_dir(&mut self, dir: String) {
+        self.workspace_dir = if dir.is_empty() { None } else { Some(dir) };
+    }
+
+    /// The workspace's directory: where every new pane in this window opens.
+    pub fn workspace_dir(&self) -> Option<&str> {
+        self.workspace_dir.as_deref()
     }
 
     /// Whether any pane in this window has running children (a build, an agent) — the sidebar

@@ -79,6 +79,16 @@ Rebindable in `%APPDATA%\gmux\gmux.json` (`Ctrl+,` opens it; see the generated t
 their quoted paths. Wheel scrolls the pane under the cursor; the viewport is content-pinned while
 a background pane keeps producing output.
 
+## Workspaces
+
+A workspace is a sidebar row anchored to a **directory**. Click `+ open workspace` in the sidebar
+(or press `Ctrl+Shift+O`) to pick a folder, and every terminal in that workspace starts there — the
+first shell, every split (horizontal or vertical), and every pane restored after a daemon restart.
+No more splitting into whatever directory the daemon happened to start in.
+
+From the CLI: `gmux new-window --cwd <dir>` opens one, and `gmux workspace -t @2 <dir>` re-anchors
+an existing workspace (`--clear` unpins it). `Ctrl+Shift+T` still opens a plain unanchored tab.
+
 Workspaces can be filed under collapsible groups: `gmux group -t @2 backend` puts window `@2`
 (the id `gmux list-panes` prints) under a "backend" header, `--clear` takes it back out, and
 clicking a header folds the group away — a folded header keeps showing its member count and its

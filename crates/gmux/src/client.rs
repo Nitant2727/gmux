@@ -545,7 +545,37 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
         }
         "new-window" => {
             let command = args.iter().position(|a| a == "--").map(|i| join_command(&args[i + 1..])).filter(|s| !s.is_empty());
-            Some(run(Call::NewWindow { command }))
+            // `--cwd <dir>` opens the window as a workspace anchored to that directory.
+            let cwd = args.iter().position(|a| a == "--cwd").and_then(|i| args.get(i + 1)).cloned();
+            Some(run(Call::NewWindow { command, cwd }))
+        }
+        "workspace" => {
+            // `gmux workspace -t @<win> <dir>` re-anchors an existing workspace; `--clear` unpins.
+            let id = args.iter().position(|a| a == "-t").and_then(|i| args.get(i + 1)).and_then(|s| parse_window(s));
+            let Some(id) = id else {
+                eprintln!("usage: gmux workspace -t @<window-id> <directory> | --clear");
+                return Some(2);
+            };
+            let dir = if args.iter().any(|a| a == "--clear") {
+                String::new()
+            } else {
+                let mut found = String::new();
+                let mut i = 0;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "-t" => i += 1,
+                        w if !w.starts_with('-') && found.is_empty() => found = w.to_string(),
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if found.is_empty() {
+                    eprintln!("usage: gmux workspace -t @<window-id> <directory> | --clear");
+                    return Some(2);
+                }
+                found
+            };
+            Some(run(Call::SetWorkspaceDir { id, dir }))
         }
         "ssh-tmux" => {
             let Some((target, command)) = parse_ssh_tmux(args) else {

@@ -50,6 +50,8 @@ pub enum Action {
     CopyMode,
     /// Show/hide the embedded browser panel (needs a `--features browser` build).
     ToggleBrowser,
+    /// Pick a directory and open it as a new workspace (every pane in it starts there).
+    OpenWorkspace,
     /// Nudge the active pane's split divider by a small fraction (keyboard resize).
     ResizeLeft,
     ResizeRight,
@@ -90,6 +92,7 @@ impl Action {
             "export_scrollback" => Action::ExportScrollback,
             "copy_mode" => Action::CopyMode,
             "toggle_browser" => Action::ToggleBrowser,
+            "open_workspace" => Action::OpenWorkspace,
             "resize_left" => Action::ResizeLeft,
             "resize_right" => Action::ResizeRight,
             "resize_up" => Action::ResizeUp,
@@ -137,6 +140,7 @@ const DEFAULTS: &[(&str, &str, Action)] = &[
     ("export_scrollback", "ctrl+shift+s", Action::ExportScrollback),
     ("copy_mode", "ctrl+shift+m", Action::CopyMode),
     ("toggle_browser", "ctrl+shift+b", Action::ToggleBrowser),
+    ("open_workspace", "ctrl+shift+o", Action::OpenWorkspace),
     ("resize_left", "alt+shift+left", Action::ResizeLeft),
     ("resize_right", "alt+shift+right", Action::ResizeRight),
     ("resize_up", "alt+shift+up", Action::ResizeUp),

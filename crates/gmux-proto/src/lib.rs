@@ -57,8 +57,21 @@ pub enum Call {
     },
     /// Split the active pane. `dir` is "h" (side-by-side) or "v" (stacked).
     SplitPane { dir: String, #[serde(default)] command: Option<String> },
-    /// Open a new window (tab).
-    NewWindow { #[serde(default)] command: Option<String> },
+    /// Open a new window (tab). `cwd` anchors it to a workspace directory: the first pane starts
+    /// there and so does every later pane in that window (splits included).
+    NewWindow {
+        #[serde(default)]
+        command: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
+    /// Anchor an existing window (by stable id) to a workspace directory; empty clears it.
+    SetWorkspaceDir {
+        #[serde(default)]
+        id: u64,
+        #[serde(default)]
+        dir: String,
+    },
     /// Raise a notification (as if the target pane emitted OSC 777).
     Notify { #[serde(default)] pane: Option<u64>, title: String, #[serde(default)] body: String },
 
@@ -499,7 +512,8 @@ mod tests {
             Call::PaneBusy { pane: 5 },
             Call::WindowBusy { id: 3 },
             Call::SplitPane { dir: "h".into(), command: None },
-            Call::NewWindow { command: Some("cmd.exe".into()) },
+            Call::NewWindow { command: Some("cmd.exe".into()), cwd: Some(r"C:\\proj".into()) },
+            Call::SetWorkspaceDir { id: 5, dir: r"C:\\proj".into() },
             Call::Notify { pane: Some(5), title: "T".into(), body: "B".into() },
             Call::SshTmux { target: "dev@build-box".into(), command: None },
             Call::SshTmux { target: String::new(), command: Some("cmd.exe /c type canned.bin".into()) },

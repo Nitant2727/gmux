@@ -506,6 +506,37 @@ fn scrollbar_offset_at(cursor_y: f32, track_top: f32, track_h: f32, history: usi
     ((1.0 - frac) * history as f32).round() as usize
 }
 
+/// Ask the user for a folder with the standard Windows picker (`IFileOpenDialog` in
+/// pick-folders mode), returning its path. `None` on cancel or any COM failure.
+///
+/// Modal, so it blocks the event loop while open — acceptable because it only runs from an
+/// explicit gesture (clicking '+ open workspace'), never from the render or heartbeat path.
+#[cfg(windows)]
+fn pick_folder() -> Option<String> {
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::{
+        FileOpenDialog, IFileOpenDialog, IShellItem, FOS_PICKFOLDERS, SIGDN_FILESYSPATH,
+    };
+    unsafe {
+        // winit already put this thread in an STA, so no CoInitialize here.
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let opts = dialog.GetOptions().ok()?;
+        dialog.SetOptions(opts | FOS_PICKFOLDERS).ok()?;
+        // A cancelled dialog returns an error HRESULT; that is the common path, not a fault.
+        dialog.Show(None).ok()?;
+        let item: IShellItem = dialog.GetResult().ok()?;
+        let path = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let s = path.to_string().ok();
+        windows::Win32::System::Com::CoTaskMemFree(Some(path.0 as *const _));
+        s
+    }
+}
+
+#[cfg(not(windows))]
+fn pick_folder() -> Option<String> {
+    None
+}
+
 /// Open a detected URL in the default browser. ponytail: `explorer.exe <url>` rather than the
 /// settings' `cmd /c start` pattern — the URL is untrusted terminal content, and `cmd` shell-parses
 /// `&`/`|` and expands `%VAR%`, so `cmd /c start "" http://x&calc` would run calc. `explorer` hands
@@ -1573,9 +1604,10 @@ impl State {
             Action::ZoomOut => self.zoom(-2.0),
             Action::ZoomReset => self.apply_font_px(self.config_font_px),
             Action::NewWindow => {
-                self.client.control(Call::NewWindow { command: None });
+                self.client.control(Call::NewWindow { command: None, cwd: None });
                 self.sync_size();
             }
+            Action::OpenWorkspace => self.open_workspace_dir(),
             Action::NextWindow => {
                 self.client.control(Call::SwitchWindow { next: true });
                 self.sync_size();
@@ -1759,6 +1791,16 @@ impl State {
         }
     }
 
+    /// Open a workspace: ask for a directory, then create a tab anchored to it. Every pane in that
+    /// window — the first shell, splits, and panes restored from a snapshot — opens there.
+    /// Cancelling the picker does nothing at all (no stray empty tab).
+    fn open_workspace_dir(&mut self) {
+        let Some(dir) = pick_folder() else { return };
+        self.client.control(Call::NewWindow { command: None, cwd: Some(dir) });
+        self.sync_size();
+        self.window.request_redraw();
+    }
+
     /// Default dock width: 40% of the window, floored at 320px and never more than half — a panel
     /// you can't read is useless, and one that swallows the terminal defeats the point.
     #[cfg(feature = "browser")]
@@ -1871,10 +1913,11 @@ impl State {
             self.clear_selection();
             // The '+' new-tab row sits after the last item, so test it first.
             if self.renderer.sidebar_new_tab_at(cy as f32, &self.item_heights) {
+                // Clicking '+ open workspace' asks for a directory: the new workspace is anchored
+                // to it, and every pane opened in it starts there. Ctrl+Shift+T stays the plain
+                // "new tab wherever" path for when you don't want to pick anything.
                 self.set_scroll(self.active_pane, 0);
-                self.client.control(Call::NewWindow { command: None });
-                self.sync_size();
-                self.window.request_redraw();
+                self.open_workspace_dir();
             } else if let Some(vi) = self.hit_row(cy) {
                 // A click on the PR chip opens the pull request instead of selecting the tab.
                 if self.open_pr_at(cx, cy, vi) {
