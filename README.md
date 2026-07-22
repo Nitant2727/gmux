@@ -105,6 +105,8 @@ a background pane keeps producing output.
 A workspace is a sidebar row anchored to a **directory**. Click `+ open workspace` in the sidebar
 (or press `Ctrl+Shift+O`) to pick a folder, and every terminal in that workspace starts there — the
 first shell, every split (horizontal or vertical), and every pane restored after a daemon restart.
+The row is named for the folder (and shows its git branch) without needing shell integration; a
+rename still wins.
 No more splitting into whatever directory the daemon happened to start in.
 
 From the CLI: `gmux new-window --cwd <dir>` opens one, and `gmux workspace -t @2 <dir>` re-anchors
@@ -118,9 +120,9 @@ its title is full-strength, inactive ones stay neutral and dim, so focus survive
 The active pane (and whichever pane you're hovering) shows a close button at the strip's right end;
 closing a pane that's running something asks first, exactly like `Ctrl+Shift+W`.
 
-**At a glance.** Every workspace row carries a leading dot: **filled** while something is running in
-it (a build, an agent), a **hollow ring** when it's idle — so "which agents are still working" is
-one look down the sidebar rather than a hunt for spinners.
+**At a glance.** Every workspace row carries a leading dot: **filled green** while something is
+running in it (a build, a claude session), a **hollow ring** when it's idle — so "which agents are
+still working" is one look down the sidebar rather than a hunt for spinners.
 
 **Filtering.** `Ctrl+Shift+K` turns the sidebar header into a filter box; typing narrows the list by
 workspace name *or* git branch (fuzzy, like the command palette), Enter jumps to the first match,
@@ -158,8 +160,9 @@ supplies one).
 
 `Ctrl+Shift+B` toggles an embedded browser panel down the right-hand side (needs a
 `--features browser` build); the terminal panes reflow around it, and `gmux browse --pane <url>`
-opens the panel and loads the page there. Hiding the panel keeps the page and its login session
-loaded, so toggling back is instant.
+opens the panel and loads the page there. It opens on a start page with a search box, keyboard
+focus stays with your terminal, and the toggle still works while the page itself has focus.
+Hiding the panel keeps the page and its login session loaded, so toggling back is instant.
 
 Auto-refresh is **opt-in**: set `"pr_refresh_secs": 300` in `%APPDATA%\gmux\gmux.json` and the
 daemon re-resolves badges on that cadence — one workspace per cycle, on a worker thread, using each

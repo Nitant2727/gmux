@@ -25,13 +25,15 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use webview2_com::Microsoft::Web::WebView2::Win32::{
-    CreateCoreWebView2Environment, ICoreWebView2Controller,
+    CreateCoreWebView2Environment, ICoreWebView2Controller, COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN,
 };
 use webview2_com::{
-    CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
+    AcceleratorKeyPressedEventHandler, CreateCoreWebView2ControllerCompletedHandler,
+    CreateCoreWebView2EnvironmentCompletedHandler,
 };
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_CONTROL, VK_SHIFT};
 
 /// A WebView2 embedded in the GUI's window. Create once, then drive it with [`navigate`],
 /// [`set_bounds`], and [`set_visible`] — all safe to call before the WebView2 has finished
@@ -45,6 +47,10 @@ pub struct EmbeddedBrowser {
 }
 
 struct Inner {
+    /// The winit window the panel is parented to. Keyboard focus is handed back to it after the
+    /// controller lands — WebView2 grabs focus on creation, which would silently redirect the
+    /// user's typing from their terminal into the page.
+    parent: isize,
     /// `None` until the async controller creation completes.
     controller: RefCell<Option<ICoreWebView2Controller>>,
     /// The URL to show once the controller lands (also the "navigate before ready" queue).
@@ -52,6 +58,10 @@ struct Inner {
     /// Latest requested rect, applied on every change and again when the controller arrives.
     bounds: Cell<RECT>,
     visible: Cell<bool>,
+    /// Set when Ctrl+Shift+B is pressed WHILE THE PAGE HAS FOCUS. Once the user clicks into the
+    /// panel, every keystroke goes to WebView2 and the app's own keymap never sees the toggle —
+    /// so the panel could be opened but not closed. The app polls this each event-loop pass.
+    toggle_requested: Cell<bool>,
 }
 
 impl EmbeddedBrowser {
@@ -64,10 +74,12 @@ impl EmbeddedBrowser {
     /// messages. Both hold for gmux's event loop.
     pub fn new(hwnd: isize, x: i32, y: i32, w: i32, h: i32, url: &str) -> Result<EmbeddedBrowser, String> {
         let inner = Rc::new(Inner {
+            parent: hwnd,
             controller: RefCell::new(None),
             pending_url: RefCell::new(Some(url.to_string())),
             bounds: Cell::new(RECT { left: x, top: y, right: x + w, bottom: y + h }),
             visible: Cell::new(true),
+            toggle_requested: Cell::new(false),
         });
         let for_env = Rc::clone(&inner);
         // `CreateCoreWebView2Environment` is async; its handler then starts the controller, whose
@@ -128,11 +140,16 @@ impl EmbeddedBrowser {
     pub fn is_ready(&self) -> bool {
         self.inner.controller.borrow().is_some()
     }
+
+    /// Whether Ctrl+Shift+B was pressed inside the page since the last call. Clears the flag.
+    pub fn take_toggle_request(&self) -> bool {
+        self.inner.toggle_requested.replace(false)
+    }
 }
 
 impl Inner {
     /// Install the freshly created controller and replay everything requested while it was pending.
-    fn install(&self, controller: ICoreWebView2Controller) {
+    fn install(self: &Rc<Self>, controller: ICoreWebView2Controller) {
         unsafe {
             let _ = controller.SetBounds(self.bounds.get());
             let _ = controller.SetIsVisible(self.visible.get());
@@ -140,7 +157,36 @@ impl Inner {
         if let Some(url) = self.pending_url.borrow_mut().take() {
             navigate_controller(&controller, &url);
         }
+        // Ctrl+Shift+B must keep meaning "toggle the panel" even when the page owns the keyboard,
+        // or a click into the panel makes it uncloseable by key. WebView2 only reports keys to the
+        // host through this accelerator event.
+        let for_keys = Rc::clone(self);
+        let handler = AcceleratorKeyPressedEventHandler::create(Box::new(move |_, args| {
+            let Some(args) = args else { return Ok(()) };
+            unsafe {
+                let mut kind = COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN;
+                let mut vk = 0u32;
+                let _ = args.KeyEventKind(&mut kind);
+                let _ = args.VirtualKey(&mut vk);
+                let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+                let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+                if kind == COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN && vk == 0x42 && ctrl && shift {
+                    for_keys.toggle_requested.set(true);
+                    let _ = args.SetHandled(true);
+                }
+            }
+            Ok(())
+        }));
+        let mut token = 0i64;
+        unsafe {
+            let _ = controller.add_AcceleratorKeyPressed(&handler, &mut token);
+        }
         *self.controller.borrow_mut() = Some(controller);
+        // WebView2 takes keyboard focus as it comes up; give it back to the terminal — opening a
+        // side panel must not redirect what the user is typing.
+        unsafe {
+            let _ = SetFocus(Some(HWND(self.parent as *mut _)));
+        }
     }
 }
 
@@ -154,6 +200,42 @@ impl Drop for EmbeddedBrowser {
             }
         }
     }
+}
+
+/// The panel's start page, as a `data:` URL — what Ctrl+Shift+B shows before any page is loaded.
+///
+/// It used to be `about:blank`, which WebView2 renders honouring the system dark theme: a pure
+/// black page inside a near-black app, i.e. the panel opened and looked exactly like it hadn't.
+/// This page matches the chrome, says what it is, and carries a search box (a plain form posting
+/// to DuckDuckGo), so the panel is usable without the CLI. Nothing loads over the network until
+/// the user submits or `gmux browse --pane` navigates.
+pub fn start_page_url() -> String {
+    const HTML: &str = concat!(
+        "<!doctype html><meta charset='utf-8'><title>gmux</title><style>",
+        "body{background:#0b0b0d;color:#e8e8ec;font-family:Consolas,'Cascadia Mono',monospace;",
+        "display:flex;align-items:center;justify-content:center;height:100vh;margin:0}",
+        ".c{width:min(420px,80%)}h1{color:#3b8ae6;font-size:18px;margin:0 0 14px;font-weight:600}",
+        "input{width:100%;box-sizing:border-box;background:#151518;color:#e8e8ec;",
+        "border:1px solid #242429;border-radius:6px;padding:10px 12px;font:inherit;outline:none}",
+        "input:focus{border-color:#3b8ae6}p{color:#7e8088;font-size:12px;line-height:1.7}",
+        "code{color:#b8bac2}</style><div class='c'><h1>gmux browser</h1>",
+        "<form action='https://duckduckgo.com/'>",
+        "<input name='q' placeholder='search or paste a url' autocomplete='off'></form>",
+        "<p>ctrl+shift+b hides this panel &middot; <code>gmux browse --pane &lt;url&gt;</code> ",
+        "opens a page here &middot; hiding keeps the page loaded</p></div>",
+    );
+    // Percent-encode for a data: URL. Conservative: everything outside unreserved is encoded.
+    let mut url = String::with_capacity(HTML.len() * 2 + 16);
+    url.push_str("data:text/html,");
+    for b in HTML.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                url.push(b as char)
+            }
+            _ => url.push_str(&format!("%{b:02X}")),
+        }
+    }
+    url
 }
 
 fn navigate_controller(controller: &ICoreWebView2Controller, url: &str) {
