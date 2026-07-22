@@ -89,6 +89,14 @@ No more splitting into whatever directory the daemon happened to start in.
 From the CLI: `gmux new-window --cwd <dir>` opens one, and `gmux workspace -t @2 <dir>` re-anchors
 an existing workspace (`--clear` unpins it). `Ctrl+Shift+T` still opens a plain unanchored tab.
 
+**Renaming and closing.** Double-click a sidebar row to rename it inline (`Ctrl+Shift+R` renames
+the active one); the name is persisted. Hovering a row reveals a close button at its right edge —
+click it, middle-click the row, or press `Ctrl+Shift+Q`. Closing a workspace whose panes are
+running something asks for confirmation first. From the CLI: `gmux rename -t @2 <name>` (an empty
+name reverts to the derived one) and `gmux close-window -t @2`.
+
+> In PowerShell, quote window ids — `@2` is the array-literal operator, so `-t '@2'` (or `-t 2`).
+
 **Importing existing projects.** `Ctrl+Shift+I` (or `gmux import <dir>`) points at a folder holding
 several projects and opens a workspace for each one inside it. Only folders containing a `.git` are
 taken — pointing at your projects directory shouldn't also open `Downloads` — and `--all` takes

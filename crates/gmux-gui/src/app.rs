@@ -705,6 +705,8 @@ struct State {
     /// Tab names per sidebar row from the last layout, cached to seed a rename buffer with the
     /// current name (rename starts from a mouse gesture, outside the render that builds the rows).
     tab_names: Vec<String>,
+    /// Index of the active tab from the last layout — what the keyboard rename/close act on.
+    active_tab: usize,
     /// What each rendered sidebar item was, from the last render — mouse handlers run between
     /// renders, so they hit-test against this rather than rebuilding the list.
     item_meta: Vec<ItemMeta>,
@@ -970,6 +972,7 @@ impl ApplicationHandler for App {
             tab_count: 0,
             tab_ids: Vec::new(),
             tab_names: Vec::new(),
+            active_tab: 0,
             item_meta: Vec::new(),
             item_heights: Vec::new(),
             collapsed_groups: HashSet::new(),
@@ -1609,6 +1612,16 @@ impl State {
             }
             Action::OpenWorkspace => self.open_workspace_dir(),
             Action::ImportWorkspaces => self.import_workspaces(),
+            Action::RenameWorkspace => {
+                // The active tab's row, so the keyboard reaches the same inline editor a
+                // double-click opens.
+                let idx = self.active_tab;
+                self.start_rename(idx);
+            }
+            Action::CloseWorkspace => {
+                let idx = self.active_tab;
+                self.close_tab(idx);
+            }
             Action::NextWindow => {
                 self.client.control(Call::SwitchWindow { next: true });
                 self.sync_size();
@@ -1949,6 +1962,10 @@ impl State {
             } else if let Some(vi) = self.hit_row(cy) {
                 // A click on the PR chip opens the pull request instead of selecting the tab.
                 if self.open_pr_at(cx, cy, vi) {
+                    return;
+                }
+                // The hover close button: same busy-guarded path as a middle-click.
+                if self.close_button_at(cx, cy, vi) {
                     return;
                 }
                 let idx = self.real_tab(vi);
@@ -2762,6 +2779,41 @@ impl State {
         true
     }
 
+    /// If `(x, y)` landed on visible row `vi`'s close button, close that workspace (with the same
+    /// busy confirmation a middle-click gets) and report `true` so the caller skips selection.
+    fn close_button_at(&mut self, x: f64, y: f64, vi: usize) -> bool {
+        let (sidebar_w, _, _) = self.areas();
+        let Some(item) = self
+            .item_meta
+            .iter()
+            .position(|m| matches!(m, ItemMeta::Row(i) if *i == vi))
+        else {
+            return false;
+        };
+        let top = self.renderer.sidebar_item_top(item, &self.item_heights);
+        if !self.renderer.close_button_hit(x as f32, y as f32, top, sidebar_w) {
+            return false;
+        }
+        self.close_tab(self.real_tab(vi))
+    }
+
+    /// Close the workspace at tab index `idx` by its STABLE id, asking first when it has running
+    /// children. Shared by the middle-click, the hover close button, and the close action.
+    fn close_tab(&mut self, idx: usize) -> bool {
+        let Some(&win) = self.tab_ids.get(idx) else { return false };
+        let busy =
+            matches!(self.client.call(Call::WindowBusy { id: win }), Ok(ResultBody::Busy(true)));
+        if busy {
+            self.confirm_close = Some(ConfirmClose::Window(win));
+        } else {
+            self.client.control(Call::CloseWindow { id: win });
+            self.sync_size();
+            self.force_full = true;
+        }
+        self.window.request_redraw();
+        true
+    }
+
     /// The group name whose header sits under `y`, if any.
     fn hit_header(&self, y: f64) -> Option<String> {
         match self.renderer.sidebar_item_at(y as f32, &self.item_heights).and_then(|i| self.item_meta.get(i)) {
@@ -2868,25 +2920,11 @@ impl State {
         if (cx as u32) >= sidebar_w {
             return false;
         }
-        match self.hit_row(cy).map(|vi| self.real_tab(vi)).and_then(|i| self.tab_ids.get(i)) {
-            Some(&win) => {
-                // By stable id: a window removed daemon-side since the last render shifts the
-                // indices, but never re-targets an id (ids are never reused — a stale id no-ops).
-                // A tab with busy panes (running builds/agents) asks for confirmation first.
-                let busy = matches!(
-                    self.client.call(Call::WindowBusy { id: win }),
-                    Ok(ResultBody::Busy(true))
-                );
-                if busy {
-                    self.confirm_close = Some(ConfirmClose::Window(win));
-                } else {
-                    self.client.control(Call::CloseWindow { id: win });
-                    self.sync_size();
-                    self.force_full = true;
-                }
-                self.window.request_redraw();
-                true
-            }
+        // By stable id (inside `close_tab`): a window removed daemon-side since the last render
+        // shifts the indices, but never re-targets an id — ids are never reused, so a stale one
+        // no-ops instead of closing someone else's workspace.
+        match self.hit_row(cy) {
+            Some(vi) => self.close_tab(self.real_tab(vi)),
             None => false,
         }
     }
@@ -3216,6 +3254,7 @@ impl State {
             self.tab_count = layout.tabs.len();
             self.tab_ids = layout.tabs.iter().map(|t| t.id).collect();
             self.tab_names = layout.tabs.iter().map(|t| t.name.clone()).collect();
+            self.active_tab = layout.tabs.iter().position(|t| t.active).unwrap_or(0);
             // A tab renamed out of existence (closed elsewhere) can't keep swallowing keystrokes.
             if let Some(r) = self.rename.as_ref() {
                 if !self.tab_ids.contains(&r.id) {

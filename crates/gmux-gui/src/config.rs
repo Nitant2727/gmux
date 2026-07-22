@@ -54,6 +54,10 @@ pub enum Action {
     OpenWorkspace,
     /// Pick a directory holding several projects and open a workspace for each one inside it.
     ImportWorkspaces,
+    /// Rename the active workspace inline (same editor a sidebar double-click opens).
+    RenameWorkspace,
+    /// Close the active workspace (asks first when it has running children).
+    CloseWorkspace,
     /// Nudge the active pane's split divider by a small fraction (keyboard resize).
     ResizeLeft,
     ResizeRight,
@@ -96,6 +100,8 @@ impl Action {
             "toggle_browser" => Action::ToggleBrowser,
             "open_workspace" => Action::OpenWorkspace,
             "import_workspaces" => Action::ImportWorkspaces,
+            "rename_workspace" => Action::RenameWorkspace,
+            "close_workspace" => Action::CloseWorkspace,
             "resize_left" => Action::ResizeLeft,
             "resize_right" => Action::ResizeRight,
             "resize_up" => Action::ResizeUp,
@@ -145,6 +151,10 @@ const DEFAULTS: &[(&str, &str, Action)] = &[
     ("toggle_browser", "ctrl+shift+b", Action::ToggleBrowser),
     ("open_workspace", "ctrl+shift+o", Action::OpenWorkspace),
     ("import_workspaces", "ctrl+shift+i", Action::ImportWorkspaces),
+    // Not F2 (the usual rename key): a bare key would be swallowed before reaching the pane, and
+    // TUIs like htop/mc bind the F-keys. A chord keeps the pane's keyboard intact.
+    ("rename_workspace", "ctrl+shift+r", Action::RenameWorkspace),
+    ("close_workspace", "ctrl+shift+q", Action::CloseWorkspace),
     ("resize_left", "alt+shift+left", Action::ResizeLeft),
     ("resize_right", "alt+shift+right", Action::ResizeRight),
     ("resize_up", "alt+shift+up", Action::ResizeUp),
