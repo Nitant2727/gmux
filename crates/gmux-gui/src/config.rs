@@ -52,6 +52,8 @@ pub enum Action {
     ToggleBrowser,
     /// Pick a directory and open it as a new workspace (every pane in it starts there).
     OpenWorkspace,
+    /// Pick a directory holding several projects and open a workspace for each one inside it.
+    ImportWorkspaces,
     /// Nudge the active pane's split divider by a small fraction (keyboard resize).
     ResizeLeft,
     ResizeRight,
@@ -93,6 +95,7 @@ impl Action {
             "copy_mode" => Action::CopyMode,
             "toggle_browser" => Action::ToggleBrowser,
             "open_workspace" => Action::OpenWorkspace,
+            "import_workspaces" => Action::ImportWorkspaces,
             "resize_left" => Action::ResizeLeft,
             "resize_right" => Action::ResizeRight,
             "resize_up" => Action::ResizeUp,
@@ -141,6 +144,7 @@ const DEFAULTS: &[(&str, &str, Action)] = &[
     ("copy_mode", "ctrl+shift+m", Action::CopyMode),
     ("toggle_browser", "ctrl+shift+b", Action::ToggleBrowser),
     ("open_workspace", "ctrl+shift+o", Action::OpenWorkspace),
+    ("import_workspaces", "ctrl+shift+i", Action::ImportWorkspaces),
     ("resize_left", "alt+shift+left", Action::ResizeLeft),
     ("resize_right", "alt+shift+right", Action::ResizeRight),
     ("resize_up", "alt+shift+up", Action::ResizeUp),

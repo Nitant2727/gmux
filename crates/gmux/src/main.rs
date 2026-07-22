@@ -171,6 +171,8 @@ USAGE:
   gmux new-window [--cwd <dir>]        open a tab; --cwd anchors it as a workspace (every pane
                                        in it, splits included, opens in that directory)
   gmux workspace -t @<win> <dir>       re-anchor an existing workspace (--clear unpins it)
+  gmux import <dir> [--all]            open a workspace per project folder inside <dir> (git
+                                       projects only unless --all); skips ones already open
   gmux group -t @<win> <name...>       file a window under a collapsible sidebar group (--clear
                                        removes it); ids come from `gmux list-panes`
   gmux color -t @<win> #rrggbb         tag a workspace row with a color (--clear removes it)

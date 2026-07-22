@@ -89,6 +89,13 @@ No more splitting into whatever directory the daemon happened to start in.
 From the CLI: `gmux new-window --cwd <dir>` opens one, and `gmux workspace -t @2 <dir>` re-anchors
 an existing workspace (`--clear` unpins it). `Ctrl+Shift+T` still opens a plain unanchored tab.
 
+**Importing existing projects.** `Ctrl+Shift+I` (or `gmux import <dir>`) points at a folder holding
+several projects and opens a workspace for each one inside it. Only folders containing a `.git` are
+taken — pointing at your projects directory shouldn't also open `Downloads` — and `--all` takes
+every subfolder instead. Dot-folders are never imported, folders already open are skipped (so
+re-importing adds only what's new), and an import opens at most 24 workspaces at a time, reporting
+anything left over.
+
 Workspaces can be filed under collapsible groups: `gmux group -t @2 backend` puts window `@2`
 (the id `gmux list-panes` prints) under a "backend" header, `--clear` takes it back out, and
 clicking a header folds the group away — a folded header keeps showing its member count and its

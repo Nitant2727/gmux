@@ -393,6 +393,43 @@ impl Server {
                 }
                 Response::ok(id, ResultBody::Done)
             }
+            Call::ImportWorkspaces { dir, all } => {
+                let candidates = scan_project_dirs(std::path::Path::new(dir), *all);
+                // Already-open folders are skipped so re-importing a projects directory adds only
+                // what is new instead of duplicating every workspace.
+                let open: HashSet<String> = self
+                    .session
+                    .windows()
+                    .iter()
+                    .filter_map(|w| w.workspace_dir().map(str::to_lowercase))
+                    .collect();
+                let (mut created, mut already_open) = (0usize, 0usize);
+                let mut capped = 0usize;
+                for path in candidates {
+                    let dir = path.to_string_lossy().to_string();
+                    if open.contains(&dir.to_lowercase()) {
+                        already_open += 1;
+                        continue;
+                    }
+                    // Each workspace is a real shell; a mis-aimed import (say, `C:\`) must not
+                    // spawn hundreds at once.
+                    if created >= MAX_IMPORT {
+                        capped += 1;
+                        continue;
+                    }
+                    match self.spawn_pane_in(&None, Some(&dir)) {
+                        Ok(pane) => {
+                            let wid = self.session.add_window(pane);
+                            if let Some(w) = self.session.window_mut(wid) {
+                                w.set_workspace_dir(dir);
+                            }
+                            created += 1;
+                        }
+                        Err(e) => eprintln!("gmux: import skipped {dir}: {e}"),
+                    }
+                }
+                Response::ok(id, ResultBody::Imported { created, already_open, capped })
+            }
             Call::Notify { pane, title, body } => {
                 let target = pane.or_else(|| self.session.active_window().map(|w| w.active_id().0));
                 match target.and_then(|t| self.find(t)) {
@@ -918,6 +955,33 @@ fn load_persist_screen() -> bool {
     persist_screen_from_json(&text)
 }
 
+/// Most workspaces one `import-workspaces` call will open. Every workspace is a real shell, so a
+/// mis-aimed import (`C:\`, a node_modules tree) must not spawn hundreds of them; the overflow is
+/// reported back rather than silently dropped.
+const MAX_IMPORT: usize = 24;
+
+/// Project folders directly inside `parent`, sorted by name: the candidates for an import.
+///
+/// `all == false` (the default) keeps only folders containing a `.git`, which is what "my existing
+/// projects" means for an agent multiplexer — pointing at a projects directory should not also
+/// open `Downloads`. `all == true` takes every subfolder. Hidden/dot folders are always skipped,
+/// so `.git`, `.vscode` and friends never become workspaces. Non-directories, unreadable entries,
+/// and an unreadable `parent` yield nothing rather than erroring. Pure/tested.
+fn scan_project_dirs(parent: &std::path::Path, all: bool) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(parent) else { return Vec::new() };
+    let mut out: Vec<std::path::PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .filter(|p| {
+            !p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with('.'))
+        })
+        .filter(|p| all || p.join(".git").exists())
+        .collect();
+    out.sort();
+    out
+}
+
 /// Ask `gh` for the PR of the branch checked out in `cwd`. Returns `None` when `gh` is missing,
 /// unauthenticated, or the directory has no PR — which CLEARS the badge, so a merged-and-deleted
 /// branch doesn't keep advertising a stale PR. Runs on a worker thread (see `pump_pr_refresh`).
@@ -1423,6 +1487,33 @@ mod tests {
         assert!(!persist_screen_from_json("\u{feff}{\"persist_screen\": false}"), "BOM is stripped");
         // A non-bool value is ignored (defaults true), not coerced.
         assert!(persist_screen_from_json(r#"{"persist_screen": "no"}"#));
+    }
+
+    /// Import scanning: git projects only by default, every subfolder with `all`, dot-folders and
+    /// loose files never, and a sorted result so the imported tabs land in a predictable order.
+    #[test]
+    fn scan_finds_git_projects_and_skips_the_rest() {
+        let root = std::env::temp_dir().join(format!("gmux-import-{}-{}", std::process::id(), line!()));
+        let mk = |p: &std::path::Path| std::fs::create_dir_all(p).unwrap();
+        mk(&root.join("beta").join(".git"));
+        mk(&root.join("alpha").join(".git"));
+        mk(&root.join("notes")); // a plain folder: not a project
+        mk(&root.join(".hidden").join(".git")); // dot-folder: never a workspace
+        std::fs::write(root.join("readme.txt"), "x").unwrap();
+
+        let git_only = scan_project_dirs(&root, false);
+        let names: Vec<String> =
+            git_only.iter().filter_map(|p| p.file_name()?.to_str().map(str::to_string)).collect();
+        assert_eq!(names, ["alpha", "beta"], "git projects only, sorted");
+
+        let all = scan_project_dirs(&root, true);
+        let names: Vec<String> =
+            all.iter().filter_map(|p| p.file_name()?.to_str().map(str::to_string)).collect();
+        assert_eq!(names, ["alpha", "beta", "notes"], "--all adds plain folders, still no dot-folders");
+
+        // A missing/unreadable parent yields nothing rather than erroring.
+        assert!(scan_project_dirs(&root.join("does-not-exist"), true).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A workspace anchored to a directory hands that directory to every pane spawned in it — the

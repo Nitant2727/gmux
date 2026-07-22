@@ -72,6 +72,16 @@ pub enum Call {
         #[serde(default)]
         dir: String,
     },
+    /// Open one workspace per project folder directly inside `dir` — importing a projects
+    /// directory in one gesture. By default only folders containing a `.git` are taken (`all`
+    /// takes every subfolder). Folders already open as a workspace are skipped, so re-importing
+    /// the same directory adds only what is new. Replies [`ResultBody::Imported`].
+    ImportWorkspaces {
+        #[serde(default)]
+        dir: String,
+        #[serde(default)]
+        all: bool,
+    },
     /// Raise a notification (as if the target pane emitted OSC 777).
     Notify { #[serde(default)] pane: Option<u64>, title: String, #[serde(default)] body: String },
 
@@ -265,6 +275,9 @@ pub enum ResultBody {
     Browses(Vec<String>),
     /// `pane-busy` / `window-busy` verdict (close-confirmation guard).
     Busy(bool),
+    /// `import-workspaces` outcome: how many workspaces were opened, how many candidate folders
+    /// were skipped because they are already open, and how many were left out by the cap.
+    Imported { created: usize, already_open: usize, capped: usize },
     Done,
 }
 
@@ -514,6 +527,7 @@ mod tests {
             Call::SplitPane { dir: "h".into(), command: None },
             Call::NewWindow { command: Some("cmd.exe".into()), cwd: Some(r"C:\\proj".into()) },
             Call::SetWorkspaceDir { id: 5, dir: r"C:\\proj".into() },
+            Call::ImportWorkspaces { dir: r"C:\\projects".into(), all: true },
             Call::Notify { pane: Some(5), title: "T".into(), body: "B".into() },
             Call::SshTmux { target: "dev@build-box".into(), command: None },
             Call::SshTmux { target: String::new(), command: Some("cmd.exe /c type canned.bin".into()) },

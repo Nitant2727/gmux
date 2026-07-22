@@ -1608,6 +1608,7 @@ impl State {
                 self.sync_size();
             }
             Action::OpenWorkspace => self.open_workspace_dir(),
+            Action::ImportWorkspaces => self.import_workspaces(),
             Action::NextWindow => {
                 self.client.control(Call::SwitchWindow { next: true });
                 self.sync_size();
@@ -1797,6 +1798,33 @@ impl State {
     fn open_workspace_dir(&mut self) {
         let Some(dir) = pick_folder() else { return };
         self.client.control(Call::NewWindow { command: None, cwd: Some(dir) });
+        self.sync_size();
+        self.window.request_redraw();
+    }
+
+    /// Import a projects directory: pick a parent folder, then open one workspace per git project
+    /// inside it. Folders already open are skipped, so re-importing only adds what is new. The
+    /// notice band reports the outcome — this can create several tabs at once, and silence would
+    /// leave you guessing whether anything happened.
+    fn import_workspaces(&mut self) {
+        let Some(dir) = pick_folder() else { return };
+        let msg = match self.client.call(Call::ImportWorkspaces { dir, all: false }) {
+            Ok(ResultBody::Imported { created, already_open, capped }) => {
+                let mut m = format!("imported {created} workspace(s)");
+                if already_open > 0 {
+                    m.push_str(&format!(", {already_open} already open"));
+                }
+                if capped > 0 {
+                    m.push_str(&format!(", {capped} over the limit"));
+                }
+                if created == 0 && already_open == 0 {
+                    m = "no git projects found in that folder".to_string();
+                }
+                m
+            }
+            _ => "import failed".to_string(),
+        };
+        self.notice = Some((msg, Instant::now()));
         self.sync_size();
         self.window.request_redraw();
     }
