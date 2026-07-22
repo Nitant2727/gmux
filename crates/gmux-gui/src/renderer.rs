@@ -58,6 +58,9 @@ const RADIUS: f32 = 6.0; // rounded corner radius for sidebar rows + pane chrome
 const GLOW_W: f32 = 4.0; // accent focus glow around the active pane (must stay < MARGIN)
 const PROGRESS_RAIL: f32 = 3.0; // progress bar height along a sidebar row's bottom edge
 const DROP_LINE: f32 = 2.0; // reorder drop indicator, drawn at the target item's top edge
+const STATUS_DOT: f32 = 8.0; // leading activity dot: filled = busy, ring = idle
+const STATUS_RING: f32 = 1.5; // ring thickness of the idle (hollow) dot
+const STATUS_GAP: f32 = 6.0; // space between the dot and the workspace name
 const DRAG_FADE: f32 = 0.45; // how much of the dragged row's ink survives while it is in flight
 // cmux's leading rail for a color-tagged workspace: a 3px capsule inset 4px, 5px in from the ends.
 const COLOR_RAIL_W: f32 = 3.0;
@@ -1216,7 +1219,8 @@ impl Renderer {
         }
     }
 
-    fn build_sidebar(&self, items: &[SidebarItem], sidebar_w: u32, plus_hover: bool, drop_at: Option<usize>, fw: f32, fh: f32) -> (Vec<BgVertex>, Vec<RoundedVertex>, Vec<GlyphVertex>) {
+    #[allow(clippy::too_many_arguments)]
+    fn build_sidebar(&self, items: &[SidebarItem], sidebar_w: u32, plus_hover: bool, drop_at: Option<usize>, filter: Option<&str>, fw: f32, fh: f32) -> (Vec<BgVertex>, Vec<RoundedVertex>, Vec<GlyphVertex>) {
         let mut bg = Vec::new();
         let mut rd = Vec::new(); // rounded chrome (row fills, accent bar, attention dot)
         let mut gl = Vec::new();
@@ -1236,9 +1240,20 @@ impl Renderer {
         quad_grad(&mut bg, 0.0, 0.0, fw, fh, rgba(BG_APP), rgba(darker(BG_APP, 0.22)));
         quad_grad(&mut bg, 0.0, 0.0, sw, fh, rgba(BG_SIDEBAR), rgba(darker(BG_SIDEBAR, 0.28)));
 
-        // Section label: "WORKSPACES" in dim uppercase.
+        // Section header: "WORKSPACES", or the live filter query while filtering. The filter
+        // replaces the label rather than pushing the list down, so rows don't shift under the
+        // cursor as you type.
         let text_x = ROW_OUTER_PAD + ROW_PAD_H;
-        self.text_run("WORKSPACES", text_x, SIDEBAR_PAD_TOP, rgba(TEXT_DIM), fw, fh, &mut gl);
+        match filter {
+            Some(q) => {
+                self.text_run("/", text_x, SIDEBAR_PAD_TOP, rgba(accent()), fw, fh, &mut gl);
+                let shown = format!("{q}_");
+                self.text_run(&shown, text_x + 2.0 * cw, SIDEBAR_PAD_TOP, rgba(TEXT), fw, fh, &mut gl);
+            }
+            None => {
+                self.text_run("WORKSPACES", text_x, SIDEBAR_PAD_TOP, rgba(TEXT_DIM), fw, fh, &mut gl);
+            }
+        }
         let rows_y0 = SIDEBAR_PAD_TOP + ch + 8.0;
         // Text sits ROW_PAD_V from the row's top edge (cmux pads the block, it does not centre it);
         // clamped so a large font can't push the second line out of the row.
@@ -1279,10 +1294,36 @@ impl Renderer {
             } else if r.hover {
                 push_rounded(&mut rd, row_x0, top, row_x1, top + ROW_H, RADIUS, rgba(SIDEBAR_ROW_HOVER), fw, fh);
             }
+            // Leading activity dot: FILLED while something is running in the workspace, a hollow
+            // ring when it is idle. This is the at-a-glance "which agents are still working"
+            // signal — the spinner says the same thing but only survives a glance at one row.
+            // The ring is drawn as an outer disc with the row's own background punched back into
+            // it (the SDF pipeline fills shapes; it has no stroke mode).
+            let row_bg = if r.active {
+                accent()
+            } else if r.attention {
+                blend(ATTENTION, BG_SIDEBAR, 0.25)
+            } else if r.hover {
+                SIDEBAR_ROW_HOVER
+            } else {
+                BG_SIDEBAR
+            };
+            let dot_ink = if r.active { on_accent(accent()) } else { TEXT_DIM };
+            let dot_cx = ROW_OUTER_PAD + ROW_PAD_H + STATUS_DOT / 2.0;
+            let dot_cy = line1 + ch / 2.0;
+            let disc = |rd: &mut Vec<RoundedVertex>, radius: f32, color: [f32; 4]| {
+                push_rounded(rd, dot_cx - radius, dot_cy - radius, dot_cx + radius, dot_cy + radius, radius, color, fw, fh);
+            };
+            disc(&mut rd, STATUS_DOT / 2.0, rgba(dot_ink));
+            if !r.busy {
+                disc(&mut rd, STATUS_DOT / 2.0 - STATUS_RING, rgba(row_bg));
+            }
+
             // A tagged workspace carries cmux's leading rail: a brightened capsule at the row's
             // left edge. It sits inside the pill, so it reads on the accent fill too.
             let tag = r.color.as_deref().and_then(parse_hex_color).map(brighten_for_dark);
-            let mut text_x = text_x;
+            // Text starts after the status dot.
+            let mut text_x = text_x + STATUS_DOT + STATUS_GAP;
             if let Some(tag) = tag {
                 let rx = row_x0 + COLOR_RAIL_INSET;
                 push_rounded(&mut rd, rx, top + 5.0, rx + COLOR_RAIL_W, top + ROW_H - 5.0, COLOR_RAIL_W / 2.0, rgba(tag), fw, fh);
@@ -1433,6 +1474,8 @@ impl Renderer {
         // `drop_at`: index of the sidebar item a reorder drag would land on (`items.len()` = the
         // end of the list); `None` when nothing is being dragged.
         drop_at: Option<usize>,
+        // `filter`: the live sidebar filter query, shown in place of the WORKSPACES label.
+        filter: Option<&str>,
         search: Option<&SearchBar>,
         preedit: Option<&str>,
         palette: Option<&PaletteView>,
@@ -1441,7 +1484,8 @@ impl Renderer {
         // `sbg` is the opaque sidebar panel; `srd` is the rounded chrome (sidebar rows + pane
         // fills/borders); `sgl` is the sidebar text plus any empty-state message. `obg`/`ogl` are
         // the scroll-badge overlay, drawn last so they sit above the pane cells.
-        let (sbg, mut srd, mut sgl) = self.build_sidebar(sidebar, sidebar_w, plus_hover, drop_at, fw, fh);
+        let (sbg, mut srd, mut sgl) =
+            self.build_sidebar(sidebar, sidebar_w, plus_hover, drop_at, filter, fw, fh);
         let mut obg: Vec<RoundedVertex> = Vec::new();
         let mut ogl: Vec<GlyphVertex> = Vec::new();
         let (cw_cell, ch_cell) = (self.atlas.cell_w as f32, self.atlas.cell_h as f32);
@@ -2150,7 +2194,7 @@ mod tests {
             selection: None,
         };
         let sb = SearchBar { label: "find:".into(), query: "hi".into(), current: 1, total: 1, overlay_only: false };
-        r.render_frame(&view, &[], 0, &[pv], 1, 1, "", false, None, Some(&sb), None, None);
+        r.render_frame(&view, &[], 0, &[pv], 1, 1, "", false, None, None, Some(&sb), None, None);
         let _ = r.device.poll(wgpu::PollType::wait_indefinitely());
     }
 }

@@ -89,6 +89,14 @@ No more splitting into whatever directory the daemon happened to start in.
 From the CLI: `gmux new-window --cwd <dir>` opens one, and `gmux workspace -t @2 <dir>` re-anchors
 an existing workspace (`--clear` unpins it). `Ctrl+Shift+T` still opens a plain unanchored tab.
 
+**At a glance.** Every workspace row carries a leading dot: **filled** while something is running in
+it (a build, an agent), a **hollow ring** when it's idle — so "which agents are still working" is
+one look down the sidebar rather than a hunt for spinners.
+
+**Filtering.** `Ctrl+Shift+K` turns the sidebar header into a filter box; typing narrows the list by
+workspace name *or* git branch (fuzzy, like the command palette), Enter jumps to the first match,
+Escape restores the full list. Groups whose members all filter out disappear with them.
+
 **Reordering.** Drag a sidebar row to move it: a line shows where it will land and the dragged row
 fades while it's in flight. Dropping onto a row inside a group (or onto the group's header) files
 the workspace into that group; dropping it among the ungrouped rows takes it back out.

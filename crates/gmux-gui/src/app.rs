@@ -238,6 +238,16 @@ enum ItemMeta {
     Row(usize),
 }
 
+/// Whether a workspace row survives the sidebar filter. Matches the same fuzzy subsequence the
+/// command palette uses, against the workspace NAME and its git BRANCH — filtering by branch is
+/// the case that matters when several workspaces share a project name. Pure/tested.
+fn row_matches_filter(name: &str, branch: Option<&str>, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    fuzzy_match(name, query) || branch.is_some_and(|b| fuzzy_match(b, query))
+}
+
 /// What a reorder drop onto sidebar item `over` means: `(visible row index to move to, the group
 /// to file the dragged window under)`.
 ///
@@ -743,6 +753,11 @@ struct State {
     active_tab: usize,
     /// Each visible row's group from the last render, so a drop can tell which group it landed in.
     row_groups: Vec<Option<String>>,
+    /// Visible sidebar row -> real tab index (see [`State::real_tab`]); rebuilt every render.
+    row_tabs: Vec<usize>,
+    /// The sidebar filter (Ctrl+Shift+K), or `None` when not filtering. While `Some`, keystrokes
+    /// edit the query instead of reaching the pane — a modal like `search`/`rename`.
+    sidebar_filter: Option<String>,
     /// What each rendered sidebar item was, from the last render — mouse handlers run between
     /// renders, so they hit-test against this rather than rebuilding the list.
     item_meta: Vec<ItemMeta>,
@@ -1010,6 +1025,8 @@ impl ApplicationHandler for App {
             tab_names: Vec::new(),
             active_tab: 0,
             row_groups: Vec::new(),
+            row_tabs: Vec::new(),
+            sidebar_filter: None,
             item_meta: Vec::new(),
             item_heights: Vec::new(),
             collapsed_groups: HashSet::new(),
@@ -1344,6 +1361,14 @@ impl ApplicationHandler for App {
                         return;
                     }
                 }
+                // The sidebar filter is the same kind of modal: while it is open, keys narrow the
+                // list instead of reaching the pane.
+                if let Some(st) = self.state.as_mut() {
+                    if st.sidebar_filter.is_some() {
+                        st.filter_key(&event, self.mods);
+                        return;
+                    }
+                }
                 // Search mode intercepts every key before the keymap/SendKeys: build the query,
                 // navigate matches (Enter/Shift+Enter), edit (Backspace), or exit (Escape).
                 if let Some(st) = self.state.as_mut() {
@@ -1649,6 +1674,14 @@ impl State {
             }
             Action::OpenWorkspace => self.open_workspace_dir(),
             Action::ImportWorkspaces => self.import_workspaces(),
+            Action::FilterWorkspaces => {
+                // Mutually exclusive with the other text modals, like search and rename are.
+                self.search = None;
+                self.rename = None;
+                self.palette = None;
+                self.sidebar_filter = Some(String::new());
+                self.window.request_redraw();
+            }
             Action::RenameWorkspace => {
                 // The active tab's row, so the keyboard reaches the same inline editor a
                 // double-click opens.
@@ -2304,6 +2337,42 @@ impl State {
         self.window.request_redraw();
     }
 
+    /// A key press while the sidebar filter is open. Escape closes it (restoring the full list),
+    /// Enter selects the first surviving workspace and closes it, everything printable edits the
+    /// query. Modelled on the rename editor above, which has the same shape.
+    fn filter_key(&mut self, event: &KeyEvent, mods: ModifiersState) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.sidebar_filter = None,
+            Key::Named(NamedKey::Enter) => {
+                // The first row still visible is what the user is aiming at.
+                if let Some(&idx) = self.row_tabs.first() {
+                    self.client.control(Call::SelectWindow { index: idx });
+                    self.sync_size();
+                }
+                self.sidebar_filter = None;
+                self.force_full = true;
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(q) = self.sidebar_filter.as_mut() {
+                    q.pop();
+                }
+            }
+            Key::Named(NamedKey::Space) => {
+                if let Some(q) = self.sidebar_filter.as_mut() {
+                    q.push(' ');
+                }
+            }
+            // Printable input; same guard as the rename editor (AltGr = Ctrl+Alt still types).
+            Key::Character(text) if !mods.super_key() && !(mods.control_key() && !mods.alt_key()) => {
+                if let Some(q) = self.sidebar_filter.as_mut() {
+                    q.push_str(text.as_str());
+                }
+            }
+            _ => {}
+        }
+        self.window.request_redraw();
+    }
+
     /// Leave search mode and snap the active pane back to its live screen.
     fn exit_search(&mut self) {
         self.search = None;
@@ -2784,9 +2853,14 @@ impl State {
         (self.sidebar_scroll.min(max_off), cap.min(self.tab_count.saturating_sub(self.sidebar_scroll.min(max_off))))
     }
 
-    /// Map a VISIBLE sidebar row index (renderer hit-test) to the real tab index.
+    /// Map a VISIBLE sidebar row index (renderer hit-test) to the real tab index. With a filter
+    /// active the visible rows are not a contiguous slice of the tabs, so this is a lookup rather
+    /// than `index + scroll offset`; the fallback covers the first frame, before any render.
     fn real_tab(&self, visible_idx: usize) -> usize {
-        visible_idx + self.sidebar_window().0
+        self.row_tabs
+            .get(visible_idx)
+            .copied()
+            .unwrap_or_else(|| visible_idx + self.sidebar_window().0)
     }
 
     /// The visible row index under `y`, or `None` when the cursor is on a group header, in a gap,
@@ -3375,6 +3449,22 @@ impl State {
                 rows = rows.into_iter().skip(off).take(cap).collect();
             }
             groups = layout.tabs.iter().skip(off).take(cap).map(|t| t.group.clone()).collect();
+            // The filter narrows the visible rows (and their parallel group list) before grouping,
+            // so a group whose members all filter out disappears with them.
+            // Visible row -> real tab index. Without a filter this is just `i + off`, but a filter
+            // punches holes in it, and every gesture (select, close, rename, drag) resolves through
+            // it — so it is built here rather than recomputed as arithmetic at each call site.
+            self.row_tabs = (off..off + rows.len()).collect();
+            if let Some(q) = self.sidebar_filter.as_deref().filter(|q| !q.is_empty()) {
+                let keep: Vec<bool> =
+                    rows.iter().map(|r| row_matches_filter(&r.name, r.branch.as_deref(), q)).collect();
+                let mut it = keep.iter();
+                rows.retain(|_| *it.next().unwrap_or(&false));
+                let mut it = keep.iter();
+                groups.retain(|_| *it.next().unwrap_or(&false));
+                let mut it = keep.iter();
+                self.row_tabs.retain(|_| *it.next().unwrap_or(&false));
+            }
             self.row_groups = groups.clone();
             // Drives the spinner's wake cadence in `about_to_wait` — see `any_busy`.
             self.any_busy = layout.tabs.iter().any(|t| t.busy);
@@ -3654,6 +3744,7 @@ impl State {
             empty_msg,
             plus_hover,
             self.sidebar_drag.as_ref().filter(|d| d.reordering).and_then(|d| d.over),
+            self.sidebar_filter.as_deref(),
             search_bar.as_ref(),
             self.preedit.as_deref(),
             palette_view.as_ref(),
@@ -4146,6 +4237,19 @@ mod tests {
                 SidebarItem::Row(r) => r.name.clone(),
             })
             .collect()
+    }
+
+    #[test]
+    fn sidebar_filter_matches_name_or_branch() {
+        // Name match, fuzzy like the palette (subsequence, case-insensitive).
+        assert!(row_matches_filter("billing-service", None, "bill"));
+        assert!(row_matches_filter("billing-service", None, "BLS"));
+        assert!(!row_matches_filter("billing-service", None, "zzz"));
+        // Branch match matters when several workspaces share a project name.
+        assert!(row_matches_filter("api", Some("feat/checkout"), "checkout"));
+        assert!(!row_matches_filter("api", Some("main"), "checkout"));
+        // An empty query keeps everything (the filter is open but nothing typed yet).
+        assert!(row_matches_filter("anything", None, ""));
     }
 
     #[test]
