@@ -62,7 +62,14 @@ can own a chord, so pressing one that's already taken doesn't quietly steal it: 
 action holding it and waits for you to press the same chord again to confirm. Chords two actions
 both claim are drawn in red on the keys tab, including ones a hand-edited config created. Clicking
 works
-too: a click on a tab opens it, and on the schemes tab a click previews. Changes are
+too: a click on a tab opens it, and on the schemes tab a click previews.
+
+`Delete` on a keybinding puts that one action back to its shipped chord. Each list also ends in a
+**reset** row — bindings on the keys tab, everything the panel writes on the theme tab — which asks
+before it acts (Enter or a second click confirms, Escape cancels) and leaves settings the panel
+doesn't own, like `pr_refresh_secs`, untouched.
+
+Changes are
 written to `%APPDATA%\gmux\gmux.json` and applied live; `e` opens that file for anything the panel
 doesn't cover (colour schemes, per-workspace settings).
 
