@@ -310,6 +310,8 @@ const SET_TAB_GAP: f32 = 22.0;
 const SET_CHIP: f32 = 11.0;
 /// Width of the settings card's scrollbar, and the gutter the rows give up for it.
 const SET_BAR: f32 = 4.0;
+/// Where the settings card's top edge sits, as a fraction of the window height.
+const SET_TOP: f32 = 0.15;
 
 /// The settings card's laid-out rect plus its row metrics.
 struct Card {
@@ -332,9 +334,13 @@ fn settings_card(rows: usize, ch_cell: f32, fw: f32, fh: f32) -> Card {
     let pw = SET_W.min(fw - 24.0).max(160.0);
     let head = row_h + 10.0; // tab strip
     let ph = (SET_PAD * 2.0 + head + row_h * (rows as f32 + 1.0)).min(fh - 32.0);
+    // The top edge is PINNED, not centred: the card's height follows its row count, so centring it
+    // made the whole panel jump up and down as you switched between a five-row tab and a twelve-row
+    // one. Held at a fixed fraction of the window, clamped so a tall card still fits.
+    let top = (fh * SET_TOP).max(8.0);
     Card {
         px: ((fw - pw) / 2.0).max(0.0),
-        py: ((fh - ph) / 2.0).max(8.0),
+        py: top.min((fh - ph - 8.0).max(8.0)),
         pw,
         ph,
         row_h,
@@ -376,6 +382,23 @@ fn settings_tab_index(x: f32, y: f32, tabs: &[String], rows: usize, cw_cell: f32
         tx += tw + SET_TAB_GAP;
     }
     None
+}
+
+/// Cut `text` to at most `max` characters, at a word boundary, marking the cut with `…`. A hint
+/// line that stopped mid-word (`"esc can"`) reads as a bug rather than as "there is more". Text
+/// that already fits is returned unchanged. Pure/tested.
+fn clip_words(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    if max <= 1 {
+        return "…".repeat(max);
+    }
+    let head: String = text.chars().take(max - 1).collect();
+    // Back up to the last space so the ellipsis follows a whole word; if the first word alone is
+    // longer than the line, cut it rather than returning nothing at all.
+    let cut = head.rfind(' ').map_or(head.as_str(), |i| head[..i].trim_end());
+    format!("{}…", if cut.is_empty() { head.as_str() } else { cut })
 }
 
 /// A scrollbar thumb as `(offset from the track's top, height)`: the window's share of the list,
@@ -2034,7 +2057,7 @@ impl Renderer {
             // the tab you're on and the card doesn't, so an over-long line would spill onto the
             // pane behind it at a narrow window or a large font.
             let fit = ((pw - SET_PAD * 2.0) / cw_cell).max(0.0) as usize;
-            let footer: String = sv.footer.chars().take(fit).collect();
+            let footer = clip_words(&sv.footer, fit);
             self.text_run(&footer, px + SET_PAD, py + ph - SET_PAD - ch_cell, rgba(TEXT_DIM), fw, fh, &mut ogl);
         }
 
@@ -2281,6 +2304,40 @@ struct GlyphOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_settings_card_holds_its_top_edge_across_tabs() {
+        // The panel's height follows its row count. Its top must not: switching from a five-row
+        // tab to a twelve-row one used to move the whole card up the screen.
+        let (ch, fw, fh) = (20.0_f32, 1280.0_f32, 800.0_f32);
+        let small = settings_card(5, ch, fw, fh);
+        let large = settings_card(12, ch, fw, fh);
+        assert_eq!(small.py, large.py, "the top edge is pinned");
+        assert_eq!(small.px, large.px, "and so is the left one");
+        assert!(large.ph > small.ph, "only the height follows the rows");
+        // A card too tall to sit at the pin is pushed up rather than off the bottom of the window.
+        let tall = settings_card(60, ch, 640.0, 400.0);
+        assert!(tall.py >= 8.0 && tall.py + tall.ph <= 400.0, "{tall:?} escapes the window", tall = (tall.py, tall.ph));
+    }
+
+    #[test]
+    fn footer_hints_are_cut_at_a_word() {
+        // Text that fits is untouched.
+        assert_eq!(clip_words("enter confirms", 20), "enter confirms");
+        assert_eq!(clip_words("enter confirms", 14), "enter confirms");
+        // Too long: cut at a word boundary, marked — never a severed word like "esc can".
+        let cut = clip_words("reset every setting here? · enter confirms · esc cancels", 30);
+        assert!(cut.ends_with('…') && cut.chars().count() <= 30);
+        assert!(!cut.contains("canc"), "no half word survives: {cut}");
+        assert!(cut.trim_end_matches('…').ends_with(|c: char| c != ' '), "no space before the ellipsis");
+        // A single word longer than the line is cut rather than vanishing entirely.
+        let long = clip_words("supercalifragilistic", 8);
+        assert_eq!(long.chars().count(), 8);
+        assert!(long.ends_with('…'));
+        // Degenerate widths don't panic and don't overflow.
+        assert_eq!(clip_words("anything", 0), "");
+        assert_eq!(clip_words("anything", 1), "…");
+    }
 
     #[test]
     fn the_settings_thumb_spans_its_window_and_stays_inside_the_track() {
