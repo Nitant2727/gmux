@@ -400,6 +400,8 @@ pub struct SettingsView {
     pub selected: usize,
     /// Hint line along the bottom (changes while capturing a chord).
     pub footer: String,
+    /// The row filter, when open. Drawn at the tab strip's right end with a caret.
+    pub query: Option<String>,
 }
 
 /// The active pane's search overlay: a band drawn at the pane bottom. `current`/`total` are shown
@@ -1948,6 +1950,14 @@ impl Renderer {
                 let ink = if i == sv.tab { on_accent(accent()) } else { TEXT_DIM };
                 self.text_run(name, tx, py + SET_PAD, rgba(ink), fw, fh, &mut ogl);
                 tx += tw + SET_TAB_GAP;
+            }
+            // The filter shares the tab strip's line, right-aligned: it belongs to the whole list
+            // below it, and the footer is already carrying the hints.
+            if let Some(q) = &sv.query {
+                let text = format!("/{q}_");
+                let qw = text.chars().count() as f32 * cw_cell;
+                let qx = (px + pw - SET_PAD - qw).max(tx);
+                self.text_run(&text, qx, py + SET_PAD, rgba(accent()), fw, fh, &mut ogl);
             }
 
             let rows_y = py + SET_PAD + head;

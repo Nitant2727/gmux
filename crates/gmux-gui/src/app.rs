@@ -194,6 +194,8 @@ struct SettingsState {
     /// while the panel asks whether to take it; pressing the same chord again confirms.
     conflict: Option<String>,
     conflict_owner: Option<String>,
+    /// The row filter (`/`), or `None` when not filtering. Empty means "opened, nothing typed".
+    query: Option<String>,
     /// A reset waiting on confirmation. Throwing settings away is the one thing in this panel that
     /// can't be undone by pressing the same key again, so it always asks first.
     reset: Option<ResetScope>,
@@ -208,6 +210,12 @@ struct SettingsState {
 /// "system" follows Windows; the rest are common terminal accents, so the cycle is useful without
 /// a colour picker.
 const ACCENT_CYCLE: &[&str] = &["default", "system", "#3b8ae6", "#8f7ae6", "#4bb58a", "#d98a4b", "#c9566d"];
+
+/// Rows the panel acts on by name. Every dispatch matches these rather than a row index, because
+/// the filter renumbers rows but never renames them.
+const RESET_KEYS_ROW: &str = "reset all bindings";
+const RESET_ALL_ROW: &str = "reset all settings";
+const CUSTOM_HEX_ROW: &str = "custom hex";
 
 /// How much a "reset to defaults" row throws away.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -252,6 +260,12 @@ const SETTINGS_TABS: [&str; 5] = ["theme", "keys", "schemes", "accent", "font"];
 /// ones, and `Ctrl+=` / the config still reach any size in between.
 const FONT_SIZES: [f32; 12] =
     [10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 20.0, 22.0, 24.0];
+
+/// The size a font row stands for, read back from its own label (`"18 px"`). The label is what
+/// survives filtering, so it — not a position in the ladder — is what the picker acts on.
+fn font_px_from_label(label: &str) -> Option<f32> {
+    label.strip_suffix(" px")?.parse().ok()
+}
 
 /// The picker's sizes with `current` folded in, so a size reached by `Ctrl+=` or by hand still has
 /// a row to be marked on rather than the list looking like nothing is selected. Pure/tested.
@@ -301,11 +315,6 @@ pub(crate) fn key_rows_for_preview() -> Vec<SettingsRow> {
     rows
 }
 
-/// The prompt the preview dump renders in the footer, straight from the real one.
-#[cfg(test)]
-pub(crate) fn reset_prompt_for_preview() -> &'static str {
-    ResetScope::Keys.prompt()
-}
 
 /// Append typed text to a `#rrggbb` buffer: hex digits only, lowercased (the config's parser is
 /// case-insensitive, but a mixed-case echo looks like a typo), and stopping at six digits so a
@@ -402,7 +411,7 @@ enum ItemMeta {
 /// Whether a workspace row survives the sidebar filter. Matches the same fuzzy subsequence the
 /// command palette uses, against the workspace NAME and its git BRANCH — filtering by branch is
 /// the case that matters when several workspaces share a project name. Pure/tested.
-fn row_matches_filter(name: &str, branch: Option<&str>, query: &str) -> bool {
+pub(crate) fn row_matches_filter(name: &str, branch: Option<&str>, query: &str) -> bool {
     if query.is_empty() {
         return true;
     }
@@ -1901,6 +1910,7 @@ impl State {
                     hex: None,
                     conflict: None,
                     conflict_owner: None,
+                    query: None,
                     reset: None,
                     font_before: None,
                 });
@@ -2567,6 +2577,19 @@ impl State {
     /// what the panel edits — showing the resolved colour would make "default" and an explicit hex
     /// look identical.
     fn settings_rows(&self, tab: usize) -> Vec<SettingsRow> {
+        let all = self.settings_rows_unfiltered(tab);
+        let Some(q) = self.settings.as_ref().and_then(|s| s.query.as_deref()) else { return all };
+        if q.is_empty() {
+            return all;
+        }
+        // Label OR value, so "ctrl+shift" finds every chord with that prefix as readily as
+        // "palette" finds the action. Same fuzzy subsequence the sidebar filter uses.
+        let hit: Vec<SettingsRow> =
+            all.into_iter().filter(|r| row_matches_filter(&r.label, Some(&r.value), q)).collect();
+        hit
+    }
+
+    fn settings_rows_unfiltered(&self, tab: usize) -> Vec<SettingsRow> {
         let plain = |label: &str, value: String| SettingsRow {
             label: label.to_string(),
             value,
@@ -2776,8 +2799,16 @@ impl State {
 
         let tab = st.tab;
         let rows = self.settings_rows(tab).len().max(1);
+        // Resolved before the mutable borrow below: what the selection means, by name.
+        let label = self.selected_label();
         let Some(st) = self.settings.as_mut() else { return };
         match &event.logical_key {
+            // Escape backs out of the filter first, then closes: narrowing the list and closing
+            // the panel are two different intentions and shouldn't share one press.
+            Key::Named(NamedKey::Escape) if st.query.is_some() => {
+                st.query = None;
+                self.clamp_settings_selection();
+            }
             // On the schemes tab, Escape drops the scheme you were trying on and puts the config's
             // own palette back before it closes — a preview must never survive a cancel.
             Key::Named(NamedKey::Escape) => {
@@ -2786,9 +2817,8 @@ impl State {
             }
             // Delete puts one binding back to its shipped chord. No confirmation: it restores a
             // documented default and the row visibly changes, unlike the wholesale resets.
-            Key::Named(NamedKey::Delete) if tab == 1 && st.sel + 1 < rows => {
-                let sel = st.sel;
-                let action = self.settings_rows(1)[sel].label.clone();
+            Key::Named(NamedKey::Delete) if tab == 1 && label != RESET_KEYS_ROW => {
+                let action = label.clone();
                 self.write_config(|cfg| {
                     if let Some(keys) = cfg.get_mut("keys").and_then(|k| k.as_object_mut()) {
                         keys.remove(&action);
@@ -2816,29 +2846,43 @@ impl State {
                 self.enter_tab(next, 0); // leaving a picker abandons the try-on
             }
             Key::Named(NamedKey::Enter) => {
-                let sel = st.sel;
-                let last = sel + 1 == rows;
-                match tab {
+                match (tab, label.as_str()) {
                     // Both lists end in a reset row; Enter there stages the question.
-                    1 if last => st.reset = Some(ResetScope::Keys),
-                    0 if last => st.reset = Some(ResetScope::All),
-                    2 => self.commit_preview(),
-                    3 => self.commit_accent(),
-                    4 => self.commit_font(),
-                    1 => st.capturing = true,
-                    _ => self.apply_theme_row(sel),
+                    (1, RESET_KEYS_ROW) => st.reset = Some(ResetScope::Keys),
+                    (0, RESET_ALL_ROW) => st.reset = Some(ResetScope::All),
+                    (2, _) => self.commit_preview(),
+                    (3, _) => self.commit_accent(),
+                    (4, _) => self.commit_font(),
+                    (1, _) => st.capturing = true,
+                    _ => self.apply_theme_row(&label),
                 }
             }
-            // Backspace edits the custom hex; on any other row it does nothing.
-            Key::Named(NamedKey::Backspace) if tab == 3 => {
-                if let Some(h) = st.hex.as_mut() {
-                    h.pop();
+            // Backspace edits the filter, else the custom hex; on any other row it does nothing.
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(q) = st.query.as_mut() {
+                    q.pop();
+                    self.clamp_settings_selection();
+                } else if tab == 3 {
+                    if let Some(h) = st.hex.as_mut() {
+                        h.pop();
+                    }
+                    self.preview_selected_accent();
                 }
-                self.preview_selected_accent();
+            }
+            // '/' opens the filter, the way the sidebar's does. Explicit rather than "any letter
+            // starts typing", because plain letters are already the hex entry and the 'e' shortcut.
+            Key::Character(c) if c.as_str() == "/" && st.query.is_none() => {
+                st.query = Some(String::new());
+            }
+            Key::Character(c) if st.query.is_some() && !mods.control_key() && !mods.super_key() => {
+                if let Some(q) = st.query.as_mut() {
+                    q.push_str(c.as_str());
+                }
+                self.clamp_settings_selection();
             }
             // On the accent tab's custom row, hex digits type a colour. '#' is optional — it is
             // prepended so the buffer always reads back through the same parser the config uses.
-            Key::Character(c) if tab == 3 && st.sel == ACCENT_CYCLE.len() && is_hex_input(c.as_str()) => {
+            Key::Character(c) if tab == 3 && label == CUSTOM_HEX_ROW && is_hex_input(c.as_str()) => {
                 push_hex(st.hex.get_or_insert_with(|| "#".to_string()), c.as_str());
                 self.preview_selected_accent();
             }
@@ -2848,6 +2892,25 @@ impl State {
             _ => {}
         }
         self.window.request_redraw();
+    }
+
+    /// The selected row's label — how every action in the panel identifies its row. Indexes shift
+    /// when the filter narrows a list; labels don't.
+    fn selected_label(&self) -> String {
+        let Some(s) = self.settings.as_ref() else { return String::new() };
+        self.settings_rows(s.tab).get(s.sel).map(|r| r.label.clone()).unwrap_or_default()
+    }
+
+    /// Keep the selection inside the filtered list (typing can shrink it out from under the
+    /// cursor) and re-preview whatever is under it now.
+    fn clamp_settings_selection(&mut self) {
+        let n = self.settings.as_ref().map_or(0, |s| self.settings_rows(s.tab).len());
+        if let Some(st) = self.settings.as_mut() {
+            st.sel = st.sel.min(n.saturating_sub(1));
+        }
+        self.preview_selected_scheme();
+        self.preview_selected_accent();
+        self.preview_selected_font();
     }
 
     /// The rows the panel actually draws — windowed around the selection, because the keys tab
@@ -2900,12 +2963,15 @@ impl State {
                 st.sel = i;
                 st.capturing = false; // a click abandons a half-finished chord capture
             }
-            // The reset rows end their lists. A click stages the question; clicking the same row
-            // again answers it — the same "twice means yes" the pickers use, so the mouse never
-            // resets anything on one click.
-            let last = i + 1 == self.settings_rows(tab).len();
-            if last && matches!(tab, 0 | 1) {
-                let scope = if tab == 1 { ResetScope::Keys } else { ResetScope::All };
+            // The reset rows. A click stages the question; clicking the same row again answers it
+            // — the same "twice means yes" the pickers use, so the mouse never resets anything on
+            // one click.
+            let label = rows[w].label.clone();
+            if let Some(scope) = match label.as_str() {
+                RESET_KEYS_ROW => Some(ResetScope::Keys),
+                RESET_ALL_ROW => Some(ResetScope::All),
+                _ => None,
+            } {
                 match staged {
                     Some(s) if s == scope => self.do_reset(scope),
                     _ => {
@@ -2932,7 +2998,7 @@ impl State {
                 // The theme tab's ribbon is a shortcut into the picker behind it: click the colours
                 // to get to where colours can be tried on. Elsewhere on the row a click only
                 // selects, so a stray click can't silently cycle a setting.
-                0 if on_swatch => self.apply_theme_row(i),
+                0 if on_swatch => self.apply_theme_row(&label),
                 _ => {}
             }
             self.window.request_redraw();
@@ -2948,18 +3014,17 @@ impl State {
         if st.tab != 2 {
             return;
         }
-        let names = crate::config::preset_names();
-        let Some(name) = names.get(st.sel).copied() else { return };
-        if self.settings.as_ref().and_then(|s| s.preview.as_deref()) == Some(name) {
+        let name = self.selected_label();
+        if name.is_empty() || self.settings.as_ref().and_then(|s| s.preview.as_deref()) == Some(name.as_str()) {
             return;
         }
         // The preview must show what COMMITTING would look like, so it resolves through the real
         // config — a hand-set `theme.fg` still wins over the scheme after you keep it, too.
-        let p = Config::load().palette_with_preset(name);
+        let p = Config::load().palette_with_preset(&name);
         self.client.control(Call::SetPalette { fg: p.fg, bg: p.bg, ansi: p.ansi.to_vec() });
         self.force_full = true; // the daemon re-resolves colors but emits no damage for it
         if let Some(st) = self.settings.as_mut() {
-            st.preview = Some(name.to_string());
+            st.preview = Some(name);
         }
         self.window.request_redraw();
     }
@@ -2984,7 +3049,7 @@ impl State {
             return None;
         }
         let row = self.settings_rows(3).into_iter().nth(st.sel)?;
-        if st.sel < ACCENT_CYCLE.len() {
+        if row.label != CUSTOM_HEX_ROW {
             return Some(row.label);
         }
         let hex = row.value.trim_end_matches('_').to_string();
@@ -3065,15 +3130,14 @@ impl State {
         if st.tab != 4 {
             return;
         }
-        let Some(px) = self.font_rows().get(st.sel).copied() else { return };
+        let Some(px) = font_px_from_label(&self.selected_label()) else { return };
         self.apply_font_px(px);
         self.window.request_redraw();
     }
 
     /// Keep the size under the selection: apply it and write it, so it also survives a restart.
     fn commit_font(&mut self) {
-        let Some(st) = self.settings.as_ref() else { return };
-        let Some(px) = self.font_rows().get(st.sel).copied() else { return };
+        let Some(px) = font_px_from_label(&self.selected_label()) else { return };
         self.apply_font_px(px);
         self.write_config(|cfg| {
             cfg.as_object_mut().unwrap().insert("font_px".into(), serde_json::json!(px));
@@ -3119,9 +3183,10 @@ impl State {
     /// Keep the previewed scheme: write it to `gmux.json` (the palette is already live) and go
     /// back to the theme tab, where the colour-scheme row now shows it.
     fn commit_preview(&mut self) {
-        let Some(st) = self.settings.as_ref() else { return };
-        let names = crate::config::preset_names();
-        let Some(name) = names.get(st.sel).copied() else { return };
+        let name = self.selected_label();
+        if name.is_empty() {
+            return;
+        }
         self.write_config(|cfg| {
             let theme =
                 cfg.as_object_mut().unwrap().entry("theme").or_insert_with(|| serde_json::json!({}));
@@ -3149,9 +3214,9 @@ impl State {
     /// Enter on a theme row. The first three rows are doorways into the pickers that own those
     /// settings — each previews live, so a second way to change them from here would be a worse
     /// one. Only the boolean is flipped in place.
-    fn apply_theme_row(&mut self, sel: usize) {
-        match sel {
-            0 => {
+    fn apply_theme_row(&mut self, label: &str) {
+        match label {
+            "color scheme" => {
                 let cur = Config::load().theme.and_then(|t| t.preset);
                 let at = cur
                     .as_deref()
@@ -3159,7 +3224,7 @@ impl State {
                     .unwrap_or(0);
                 self.enter_tab(2, at);
             }
-            1 => {
+            "accent" => {
                 let cur = Config::load().theme.and_then(|t| t.accent);
                 let at = cur
                     .as_deref()
@@ -3167,7 +3232,7 @@ impl State {
                     .unwrap_or(if cur.is_some() { ACCENT_CYCLE.len() } else { 0 }); // a pinned hex = the custom row
                 self.enter_tab(3, at);
             }
-            2 => {
+            "font size" => {
                 let at = self
                     .font_rows()
                     .iter()
@@ -3175,7 +3240,7 @@ impl State {
                     .unwrap_or(0);
                 self.enter_tab(4, at);
             }
-            3 => {
+            "follow mouse focus" => {
                 let next = !self.focus_follows_mouse;
                 self.write_config(|cfg| {
                     cfg.as_object_mut()
@@ -4701,6 +4766,7 @@ impl State {
                 tabs: SETTINGS_TABS.iter().map(|s| (*s).to_string()).collect(),
                 tab: s.tab,
                 rows,
+                query: s.query.clone(),
                 selected: sel,
                 footer: if let Some(scope) = s.reset {
                     scope.prompt().to_string()
@@ -4715,9 +4781,9 @@ impl State {
                 } else if s.tab == 2 {
                     "click or arrow to try  ·  enter keeps  ·  esc restores".into()
                 } else if s.tab == 1 {
-                    "enter rebinds  ·  tab switches  ·  e opens gmux.json  ·  esc closes".into()
+                    "enter rebinds · del resets one · / filters · esc closes".into()
                 } else {
-                    "enter changes  ·  tab switches  ·  e opens gmux.json  ·  esc closes".into()
+                    "enter changes · / filters · e opens gmux.json · esc closes".into()
                 },
             }
         });
@@ -5225,6 +5291,32 @@ mod tests {
                 SidebarItem::Row(r) => r.name.clone(),
             })
             .collect()
+    }
+
+    #[test]
+    fn the_settings_filter_keeps_rows_addressable_by_name() {
+        // Filtering renumbers rows, so every action in the panel resolves its row by LABEL. These
+        // are the labels it matches on; a rename that forgot one would silently stop working.
+        let rows = key_rows_for_preview();
+        assert_eq!(rows.last().unwrap().label, RESET_KEYS_ROW);
+        assert!(font_ladder(18.0).iter().all(|px| font_px_from_label(&format!("{px:.0} px")) == Some(*px)));
+        assert_eq!(font_px_from_label("18 px"), Some(18.0));
+        assert_eq!(font_px_from_label(CUSTOM_HEX_ROW), None, "only a size row parses as a size");
+        assert_eq!(font_px_from_label("reset all settings"), None);
+
+        // The filter matches a row's label OR its value, so a chord finds its action and an action
+        // finds its chord — the two things you'd type when hunting a binding.
+        let matches = |q: &str| -> Vec<String> {
+            rows.iter()
+                .filter(|r| row_matches_filter(&r.label, Some(&r.value), q))
+                .map(|r| r.label.clone())
+                .collect()
+        };
+        assert_eq!(matches("split"), vec!["split_h", "split_v"], "by action name");
+        assert_eq!(matches("ctrl+shift+z"), vec!["toggle_zoom"], "by chord");
+        assert!(matches("pltt").contains(&"command_palette".to_string()), "fuzzy, like the sidebar");
+        assert!(matches("").len() == rows.len(), "an empty query hides nothing");
+        assert!(matches("zzzz").is_empty(), "no match is empty, not everything");
     }
 
     #[test]

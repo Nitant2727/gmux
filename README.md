@@ -64,7 +64,9 @@ both claim are drawn in red on the keys tab, including ones a hand-edited config
 works
 too: a click on a tab opens it, and on the schemes tab a click previews.
 
-`Delete` on a keybinding puts that one action back to its shipped chord. Each list also ends in a
+`/` filters the rows of whichever tab is open — fuzzily, against both the label and the value, so
+`palette` and `ctrl+shift+p` both find the same row. Escape clears the filter; a second Escape
+closes the panel. `Delete` on a keybinding puts that one action back to its shipped chord. Each list also ends in a
 **reset** row — bindings on the keys tab, everything the panel writes on the theme tab — which asks
 before it acts (Enter or a second click confirms, Escape cancels) and leaves settings the panel
 doesn't own, like `pr_refresh_secs`, untouched.
