@@ -290,6 +290,164 @@ fn is_hex_input(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c == '#' || c.is_ascii_hexdigit())
 }
 
+/// Every settings view the preview dump renders, as `(file suffix, view)`. Built here, beside the
+/// real row builders, so the images a release check looks at can't drift from the panel — the
+/// real rows come from `State`, which needs a window and a daemon.
+#[cfg(test)]
+pub(crate) fn settings_views_for_preview(
+    tabs: Vec<String>,
+) -> Vec<(&'static str, crate::renderer::SettingsView)> {
+    let view = |tab: usize, rows: Vec<SettingsRow>, selected: usize, query: Option<&str>, footer: &str| {
+        let total = rows.len();
+        let shown: Vec<SettingsRow> = rows.into_iter().take(12).collect();
+        crate::renderer::SettingsView {
+            tabs: tabs.clone(),
+            tab,
+            selected,
+            offset: 0,
+            total,
+            rows: shown,
+            query: query.map(|q| q.to_string()),
+            footer: footer.to_string(),
+        }
+    };
+    let theme_hint = "enter changes · / filters · e opens gmux.json · esc closes";
+    let try_hint = "click or arrow to try · enter keeps · esc restores";
+    let plain = |label: &str, value: &str| SettingsRow {
+        label: label.into(),
+        value: value.into(),
+        ..Default::default()
+    };
+    vec![
+        (
+            "theme",
+            view(
+                0,
+                vec![
+                    SettingsRow {
+                        swatch: swatch_rgb("tokyo-night"),
+                        label: "color scheme".into(),
+                        value: "tokyo-night".into(),
+                        warn: false,
+                    },
+                    SettingsRow {
+                        swatch: accent_swatch("#8f7ae6"),
+                        label: "accent".into(),
+                        value: "#8f7ae6".into(),
+                        warn: false,
+                    },
+                    plain("font size", "18 px"),
+                    plain("follow mouse focus", "off"),
+                    plain(RESET_ALL_ROW, ""),
+                ],
+                0,
+                None,
+                theme_hint,
+            ),
+        ),
+        // The keys tab is the one that overflows its card: 25 actions, 12 drawn, scrollbar shown.
+        (
+            "keys",
+            view(
+                1,
+                full_key_rows(),
+                3,
+                None,
+                "enter rebinds · del resets one · / filters · esc closes",
+            ),
+        ),
+        (
+            "keys_filtered",
+            view(
+                1,
+                key_rows_for_preview()
+                    .into_iter()
+                    .filter(|r| row_matches_filter(&r.label, Some(&r.value), "split"))
+                    .collect(),
+                0,
+                Some("split"),
+                "enter rebinds · del resets one · / filters · esc closes",
+            ),
+        ),
+        (
+            "keys_conflict",
+            view(1, key_rows_for_preview(), 2, None, "ctrl+shift+d runs split_h · press again to take · esc cancels"),
+        ),
+        (
+            "schemes",
+            view(
+                2,
+                crate::config::preset_names()
+                    .into_iter()
+                    .map(|name| SettingsRow {
+                        swatch: swatch_rgb(name),
+                        label: name.into(),
+                        value: if name == "nord" { "in use" } else { "" }.into(),
+                        warn: false,
+                    })
+                    .collect(),
+                4,
+                None,
+                try_hint,
+            ),
+        ),
+        (
+            "accent",
+            view(3, accent_rows_for_preview(), 3, None, "click or arrow to try · type a hex below · enter keeps"),
+        ),
+        ("font", view(4, font_rows_for_preview(), 8, None, try_hint)),
+        (
+            "reset",
+            view(0, vec![plain(RESET_ALL_ROW, "")], 0, None, ResetScope::All.prompt()),
+        ),
+    ]
+}
+
+/// The accent picker's rows as the preview dump draws them.
+#[cfg(test)]
+fn accent_rows_for_preview() -> Vec<SettingsRow> {
+    let mut rows: Vec<SettingsRow> = ACCENT_CYCLE
+        .iter()
+        .map(|name| SettingsRow {
+            swatch: accent_swatch(name),
+            label: (*name).to_string(),
+            value: if *name == "#8f7ae6" { "in use" } else { "" }.to_string(),
+            warn: false,
+        })
+        .collect();
+    rows.push(SettingsRow { label: CUSTOM_HEX_ROW.into(), value: "#c0f_".into(), ..Default::default() });
+    rows
+}
+
+/// The font picker's rows as the preview dump draws them.
+#[cfg(test)]
+fn font_rows_for_preview() -> Vec<SettingsRow> {
+    font_ladder(18.0)
+        .into_iter()
+        .map(|px| SettingsRow {
+            swatch: vec![crate::renderer::accent(); (px / 2.0).round() as usize],
+            label: format!("{px:.0} px"),
+            value: if px == 18.0 { "in use" } else { "" }.to_string(),
+            warn: false,
+        })
+        .collect()
+}
+
+/// Every real binding at its shipped chord — the list that actually overflows the card.
+#[cfg(test)]
+fn full_key_rows() -> Vec<SettingsRow> {
+    let mut rows: Vec<SettingsRow> = crate::config::default_bindings()
+        .iter()
+        .map(|(name, chord, _)| SettingsRow {
+            label: (*name).to_string(),
+            value: (*chord).to_string(),
+            ..Default::default()
+        })
+        .collect();
+    rows.push(SettingsRow { label: RESET_KEYS_ROW.into(), ..Default::default() });
+    rows
+}
+
 /// The keys tab's rows as the preview dump draws them, with one conflict staged (the real ones
 /// come from `State`, which needs a window and a daemon).
 #[cfg(test)]
@@ -1455,6 +1613,11 @@ impl ApplicationHandler for App {
                 let ctrl = self.mods.control_key();
                 if let Some(st) = self.state.as_mut() {
                     st.mark_activity();
+                    // The settings card is modal: a wheel over it scrolls its list, and never the
+                    // scrollback of the pane it happens to be covering.
+                    if st.settings.is_some() && st.settings_wheel(delta) {
+                        return;
+                    }
                     // Ctrl+wheel zooms the font (wheel up = larger) and consumes the event, before
                     // any scrollback / app-reporting handling.
                     if ctrl {
@@ -2925,6 +3088,40 @@ impl State {
         (all.into_iter().skip(start).take(12).collect(), sel - start, start)
     }
 
+    /// A wheel notch over the settings card: moves the selection, which is what scrolls the window
+    /// (the row window is derived from the selection, so there is no second scroll position to
+    /// drift out of sync). Returns whether the panel consumed the event.
+    ///
+    /// Deliberately one row per notch, like an arrow press: on the picker tabs the row under the
+    /// selection is applied live, so a notch that jumped three rows would push three palettes.
+    fn settings_wheel(&mut self, delta: MouseScrollDelta) -> bool {
+        let (x, y) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        let (sw, sh) = (self.config.width, self.config.height);
+        let (rows, _, _) = self.settings_window();
+        if !self.renderer.settings_hit(x, y, rows.len(), sw, sh) {
+            return false;
+        }
+        let dir = match delta {
+            MouseScrollDelta::LineDelta(_, dy) => dy,
+            MouseScrollDelta::PixelDelta(p) => p.y as f32,
+        };
+        let n = self.settings.as_ref().map_or(0, |s| self.settings_rows(s.tab).len());
+        if dir != 0.0 && n > 0 {
+            if let Some(st) = self.settings.as_mut() {
+                // Clamped, not wrapping: a wheel is a scroll, and scrolling past the end of a list
+                // shouldn't teleport you back to its top.
+                st.sel = if dir > 0.0 {
+                    st.sel.saturating_sub(1)
+                } else {
+                    (st.sel + 1).min(n - 1)
+                };
+            }
+            self.clamp_settings_selection();
+            self.window.request_redraw();
+        }
+        true
+    }
+
     /// A mouse press while the settings panel is open. Returns whether the panel consumed it —
     /// `true` for anything on the card (including its empty margins, which is what makes it
     /// modal), `false` for a click outside, which falls through to the app underneath.
@@ -2953,7 +3150,8 @@ impl State {
         }
         if let Some(w) = self.renderer.settings_row_at(x, y, rows.len(), sw, sh) {
             let chips = rows[w].swatch.len();
-            let on_swatch = self.renderer.settings_swatch_hit(x, chips, rows.len(), sw, sh);
+            let scrollable = self.settings_rows(tab).len() > rows.len();
+            let on_swatch = self.renderer.settings_swatch_hit(x, chips, rows.len(), scrollable, sw, sh);
             let i = start + w; // window index -> the row's index in the full list
             // Same row twice = keep it. Checked before moving the selection so the second click
             // commits rather than re-previewing what is already live.
@@ -4761,12 +4959,15 @@ impl State {
         // Settings overlay: rows for the open tab, windowed around the selection like the palette
         // (the keys tab lists every action, which is taller than any window).
         let settings_view = self.settings.as_ref().map(|s| {
-            let (rows, sel, _) = self.settings_window();
+            let (rows, sel, start) = self.settings_window();
+            let total = self.settings_rows(s.tab).len();
             SettingsView {
                 tabs: SETTINGS_TABS.iter().map(|s| (*s).to_string()).collect(),
                 tab: s.tab,
                 rows,
                 query: s.query.clone(),
+                total,
+                offset: start,
                 selected: sel,
                 footer: if let Some(scope) = s.reset {
                     scope.prompt().to_string()

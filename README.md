@@ -64,6 +64,7 @@ both claim are drawn in red on the keys tab, including ones a hand-edited config
 works
 too: a click on a tab opens it, and on the schemes tab a click previews.
 
+A list taller than the card gets a scrollbar down its right edge, and the wheel moves through it.
 `/` filters the rows of whichever tab is open — fuzzily, against both the label and the value, so
 `palette` and `ctrl+shift+p` both find the same row. Escape clears the filter; a second Escape
 closes the panel. `Delete` on a keybinding puts that one action back to its shipped chord. Each list also ends in a
