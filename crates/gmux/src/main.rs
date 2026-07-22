@@ -170,6 +170,8 @@ USAGE:
                                        browser (--pane targets the in-app WebView2 pane)
   gmux new-window [--cwd <dir>]        open a tab; --cwd anchors it as a workspace (every pane
                                        in it, splits included, opens in that directory)
+  gmux rename -t @<win> <name...>      rename a workspace (empty name = the derived one)
+  gmux close-window -t @<win>          close a workspace (no busy prompt; see `window-busy`)
   gmux workspace -t @<win> <dir>       re-anchor an existing workspace (--clear unpins it)
   gmux import <dir> [--all]            open a workspace per project folder inside <dir> (git
                                        projects only unless --all); skips ones already open

@@ -266,6 +266,24 @@ mod tests {
     }
 
     #[test]
+    fn close_button_hit_is_where_it_is_drawn() {
+        // The hover close button sits at the row's right edge on the first text line; clicks
+        // elsewhere in the row must fall through to selecting the workspace.
+        let Some(r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
+            return;
+        };
+        let sw = r.sidebar_width();
+        let (cw, ch) = (r.cell_w() as f32, r.cell_h() as f32);
+        let top = 100.0;
+        let line1 = top + 8.0; // ROW_PAD_V
+        let right = sw as f32 - 6.0 - 10.0; // ROW_OUTER_PAD + ROW_PAD_H
+        assert!(r.close_button_hit(right - cw / 2.0, line1 + ch / 2.0, top, sw), "centre hits");
+        assert!(!r.close_button_hit(right - 3.0 * cw, line1 + ch / 2.0, top, sw), "left of it misses");
+        assert!(!r.close_button_hit(right - cw / 2.0, line1 + ch + 8.0, top, sw), "second line misses");
+        assert!(!r.close_button_hit(right - cw / 2.0, top - 6.0, top, sw), "above the row misses");
+    }
+
+    #[test]
     fn pr_chip_hit_matches_where_it_is_drawn() {
         // The clickable chip must be exactly the drawn chip: on the row's SECOND line, starting at
         // the text column, and shifted right when a color rail is present.

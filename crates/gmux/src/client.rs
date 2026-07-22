@@ -100,6 +100,22 @@ fn parse_pane(s: &str) -> Option<u64> {
     s.trim_start_matches('%').parse().ok()
 }
 
+/// Everything after the `-t <id>` pair that isn't a flag, joined — the free-text tail of verbs
+/// like `rename` and `group`. Pure/tested.
+fn words_after_target(args: &[String]) -> String {
+    let mut words = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-t" => i += 1, // skip the id too
+            w if !w.starts_with('-') => words.push(w.to_string()),
+            _ => {}
+        }
+        i += 1;
+    }
+    words.join(" ")
+}
+
 /// `@3` / `3` -> a stable window id (the `@N` column `list-panes` prints).
 fn parse_window(s: &str) -> Option<u64> {
     s.trim_start_matches('@').parse().ok()
@@ -476,23 +492,9 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
                 eprintln!("usage: gmux group -t @<window-id> <name...> | --clear");
                 return Some(2);
             };
-            let clear = args.iter().any(|a| a == "--clear");
-            let name = if clear {
-                String::new()
-            } else {
-                // Everything that isn't the flag pair is the group name.
-                let mut words = Vec::new();
-                let mut i = 0;
-                while i < args.len() {
-                    match args[i].as_str() {
-                        "-t" => i += 1, // skip the id too
-                        w if !w.starts_with('-') => words.push(w.to_string()),
-                        _ => {}
-                    }
-                    i += 1;
-                }
-                words.join(" ")
-            };
+            // Everything that isn't the flag pair is the group name; --clear ungroups.
+            let name =
+                if args.iter().any(|a| a == "--clear") { String::new() } else { words_after_target(args) };
             Some(run(Call::GroupWindow { id, group: name }))
         }
         "color" => {
@@ -587,6 +589,25 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
             let all = args.iter().any(|a| a == "--all");
             Some(import_workspaces(dir, all))
         }
+        "rename" => {
+            // `gmux rename -t @2 <name...>`; an empty name clears back to the derived one.
+            let id = args.iter().position(|a| a == "-t").and_then(|i| args.get(i + 1)).and_then(|s| parse_window(s));
+            let Some(id) = id else {
+                eprintln!("usage: gmux rename -t @<window-id> <name...>   (empty name = derived)");
+                return Some(2);
+            };
+            Some(run(Call::RenameWindow { id, name: words_after_target(args) }))
+        }
+        "close-window" => {
+            // Deliberately unguarded: the busy confirmation is a GUI gesture, and a scripted close
+            // that stopped to ask would just hang. `gmux window-busy` is there to check first.
+            let id = args.iter().position(|a| a == "-t").and_then(|i| args.get(i + 1)).and_then(|s| parse_window(s));
+            let Some(id) = id else {
+                eprintln!("usage: gmux close-window -t @<window-id>");
+                return Some(2);
+            };
+            Some(run(Call::CloseWindow { id }))
+        }
         "workspace" => {
             // `gmux workspace -t @<win> <dir>` re-anchors an existing workspace; `--clear` unpins.
             let id = args.iter().position(|a| a == "-t").and_then(|i| args.get(i + 1)).and_then(|s| parse_window(s));
@@ -673,6 +694,19 @@ mod tests {
         assert_eq!(parse_pane("%5"), Some(5));
         assert_eq!(parse_pane("5"), Some(5));
         assert_eq!(parse_pane("nope"), None);
+    }
+
+    #[test]
+    fn free_text_tail_skips_the_target_pair_and_flags() {
+        use super::words_after_target;
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // The id after -t is not part of the name, and neither are flags.
+        assert_eq!(words_after_target(&args(&["-t", "@2", "my", "api"])), "my api");
+        assert_eq!(words_after_target(&args(&["-t", "2", "--clear"])), "");
+        // Order-independent: the target pair can come last.
+        assert_eq!(words_after_target(&args(&["backend", "-t", "@7"])), "backend");
+        // No name at all is an empty string (which clears a rename/group).
+        assert_eq!(words_after_target(&args(&["-t", "@2"])), "");
     }
 
     #[test]

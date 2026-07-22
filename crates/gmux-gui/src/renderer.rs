@@ -1120,6 +1120,20 @@ impl Renderer {
         top
     }
 
+    /// Whether `(x, y)` lands on the close button of a hovered row whose top edge is `row_top`.
+    /// Mirrors exactly where `build_sidebar` draws the 'x', with a small padding so the target is
+    /// comfortable rather than one glyph wide. Only meaningful while the row is hovered — that is
+    /// the only time the button is drawn.
+    pub fn close_button_hit(&self, x: f32, y: f32, row_top: f32, sidebar_w: u32) -> bool {
+        let ch = self.cell_h() as f32;
+        let cw = self.cell_w() as f32;
+        let pad_v = ROW_PAD_V.min(((ROW_H - 2.0 * ch) / 2.0).max(2.0));
+        let line1 = row_top + pad_v;
+        let right = sidebar_w as f32 - ROW_OUTER_PAD - ROW_PAD_H;
+        // A 4px cushion on each side of the glyph; still inside the row's own padding.
+        x >= right - cw - 4.0 && x <= right + 4.0 && y >= line1 - 2.0 && y < line1 + ch + 2.0
+    }
+
     /// Whether `(x, y)` lands on the PR chip of a row whose top edge is `row_top`. `has_color` is
     /// whether the row also draws a tag rail (which shifts the chip right). Mirrors exactly what
     /// `build_sidebar` lays out, so the clickable area is the drawn area.
@@ -1293,9 +1307,15 @@ impl Renderer {
                 self.text_run(&format!("git:{b}"), sub_x, line2, sub_col, fw, fh, &mut gl);
             }
 
-            // Right-aligned indicators on line 1: progress text (PROGRESS / ERROR), then the
-            // attention dot (a round SDF chip) to its left.
+            // Hovering a row reveals a close button at its right edge — closing a workspace was
+            // previously middle-click only, which nothing on screen suggested. It takes the
+            // indicators' place while hovering rather than squeezing them further left.
             let mut cursor_right = right_edge;
+            if r.hover {
+                let ink = if r.active { on_accent(accent()) } else { TEXT_DIM };
+                self.text_run("x", cursor_right - cw, line1, rgba(ink), fw, fh, &mut gl);
+                cursor_right -= cw + 6.0;
+            }
             if r.progress_error || r.progress.is_some() {
                 let (txt, col) = if r.progress_error {
                     ("!".to_string(), ERROR)
