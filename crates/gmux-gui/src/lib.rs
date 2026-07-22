@@ -203,7 +203,7 @@ mod tests {
             progress: None,
             progress_error: false,
         }];
-        r.render_frame(&view, &items(rows), sw, &[], w, h, "", false, None, None, None, None, None, None);
+        r.render_frame(&view, &items(rows), sw, &[], w, h, "", false, None, None, None, None, None, None, None);
         let px = read_rgba(&r, &tex, w, h).expect("readback");
         // The active row is a solid accent pill (cmux blue #0091ff) inset ROW_OUTER_PAD from the
         // panel edge. x=1 is outside the pill entirely (neutral panel gray); the centre is accent.
@@ -348,7 +348,7 @@ mod tests {
             progress: None,
             progress_error: false,
         }];
-        r.render_frame(&view, &items(rows), sw, &[], w, h, "", false, None, None, None, None, None, None);
+        r.render_frame(&view, &items(rows), sw, &[], w, h, "", false, None, None, None, None, None, None, None);
         let px = read_rgba(&r, &tex, w, h).expect("readback");
         let top = pixel(&px, w, 2, 2);
         let bottom = pixel(&px, w, 2, h - 3);
@@ -475,9 +475,9 @@ mod tests {
             n
         };
         let sb = SearchBar { label: "find:".into(), query: "foo".into(), current: 1, total: 5, overlay_only: false };
-        r.render_frame(&view, &[], 0, &[pv()], w, h, "", false, None, None, Some(&sb), None, None, None);
+        r.render_frame(&view, &[], 0, &[pv()], w, h, "", false, None, None, Some(&sb), None, None, None, None);
         let with = white_in_band(&read_rgba(&r, &tex, w, h).expect("readback"));
-        r.render_frame(&view, &[], 0, &[pv()], w, h, "", false, None, None, None, None, None, None);
+        r.render_frame(&view, &[], 0, &[pv()], w, h, "", false, None, None, None, None, None, None, None);
         let without = white_in_band(&read_rgba(&r, &tex, w, h).expect("readback"));
         assert!(with > 3, "search band should draw the query text ({with} white px)");
         assert_eq!(without, 0, "no search bar → no band text ({without} white px)");
@@ -670,7 +670,7 @@ mod tests {
                 drop_target: false,
                 dragging: false,
             };
-            r.render_frame(&view, &rows, sw, &[pane], w, h, "", false, drop_at, Some("ag"), Some(&sb), None, None, Some(&sv));
+            r.render_frame(&view, &rows, sw, &[pane], w, h, "", false, drop_at, Some("ag"), Some(&sb), None, None, Some(&sv), None);
             let px = read_rgba(&r, &tex, w, h).expect("readback");
             let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
             for p in px.chunks(4) {

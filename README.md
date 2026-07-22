@@ -160,9 +160,12 @@ supplies one).
 
 `Ctrl+Shift+B` toggles an embedded browser panel down the right-hand side (needs a
 `--features browser` build); the terminal panes reflow around it, and `gmux browse --pane <url>`
-opens the panel and loads the page there. It opens on a start page with a search box, keyboard
-focus stays with your terminal, and the toggle still works while the page itself has focus.
-Hiding the panel keeps the page and its login session loaded, so toggling back is instant.
+opens the panel and loads the page there. The panel carries browser chrome across its top —
+back / forward / reload and an address bar that tracks the page (links included). Click the
+address bar and type a URL or a search (Enter navigates; words go to DuckDuckGo). It opens on a
+start page with a search box, keyboard focus stays with your terminal, and the toggle still works
+while the page itself has focus. Hiding the panel keeps the page and its login session loaded, so
+toggling back is instant.
 
 Auto-refresh is **opt-in**: set `"pr_refresh_secs": 300` in `%APPDATA%\gmux\gmux.json` and the
 daemon re-resolves badges on that cadence — one workspace per cycle, on a worker thread, using each

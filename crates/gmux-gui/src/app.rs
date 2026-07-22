@@ -309,6 +309,33 @@ fn swatch_rgb(name: &str) -> Vec<Rgb> {
     crate::config::preset_swatch(name).into_iter().map(|[r, g, b]| Rgb { r, g, b }).collect()
 }
 
+/// What Enter in the address bar means: a URL when it reads as one (a scheme, or a dotted host
+/// with no spaces), a DuckDuckGo search otherwise — the same split `gmux browse` makes on the
+/// CLI. Pure/tested.
+#[cfg_attr(not(feature = "browser"), allow(dead_code))]
+fn navigate_target(input: &str) -> String {
+    let s = input.trim();
+    // "://" for the ordinary schemes, plus the two scheme-only forms worth typing by hand.
+    // (Not a general scheme check: "localhost:8080" would parse as a scheme and go nowhere.)
+    if s.contains("://") || s.starts_with("data:") || s.starts_with("about:") {
+        return s.to_string();
+    }
+    if !s.contains(' ') && s.contains('.') {
+        return format!("https://{s}");
+    }
+    let mut q = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                q.push(b as char)
+            }
+            b' ' => q.push('+'),
+            _ => q.push_str(&format!("%{b:02X}")),
+        }
+    }
+    format!("https://duckduckgo.com/?q={q}")
+}
+
 /// Whether typed text belongs in the custom-hex buffer: `#` and hex digits only. Note this claims
 /// `e`, `d` and friends, which is why the hex arm is matched before the panel's `e` shortcut —
 /// on the custom row a hex digit is a hex digit. Pure/tested.
@@ -1244,6 +1271,12 @@ struct State {
     /// Width of the browser panel in px; `0` = hidden. Subtracted from the content area in
     /// [`State::areas`], so the terminal panes reflow around it.
     dock_w: u32,
+    /// The browser bar's address field while it is being edited (clicked), else `None`.
+    url_edit: Option<String>,
+    /// The URL last drawn in the bar; compared each event-loop pass so an in-page navigation
+    /// (a clicked link) redraws the bar without polling timers. (Browser builds only.)
+    #[cfg_attr(not(feature = "browser"), allow(dead_code))]
+    last_bar_url: String,
 }
 
 /// Run the gmux GUI. `_shell` is currently unused (the daemon picks its shell); kept for the CLI
@@ -1441,6 +1474,8 @@ impl ApplicationHandler for App {
             #[cfg(feature = "browser")]
             browser: None,
             dock_w: 0,
+            url_edit: None,
+            last_bar_url: String::new(),
         };
         // sync_size + palette are sent from `poll_connect` once the daemon answers.
         self.state = Some(st);
@@ -1572,6 +1607,10 @@ impl ApplicationHandler for App {
                     // The settings panel is modal: a press on its card acts on the panel and never
                     // reaches the sidebar or a pane behind it.
                     if pressed && st.settings.is_some() && st.settings_click(button) {
+                        return;
+                    }
+                    // The browser bar (dock chrome): nav buttons and the address field.
+                    if pressed && button == MouseButton::Left && st.browser_bar_click() {
                         return;
                     }
                     // Ctrl+left-click on a detected URL opens it and consumes the click — checked
@@ -1738,6 +1777,14 @@ impl ApplicationHandler for App {
                 if let Some(st) = self.state.as_mut() {
                     if st.settings.is_some() {
                         st.settings_key(&event, self.mods);
+                        return;
+                    }
+                }
+                // The browser bar's address field, opened by clicking it: typed keys build the
+                // URL instead of reaching the pane.
+                if let Some(st) = self.state.as_mut() {
+                    if st.url_edit.is_some() {
+                        st.url_edit_key(&event, self.mods);
                         return;
                     }
                 }
@@ -2360,14 +2407,109 @@ impl State {
     /// the keyboard and the app's keymap never sees the chord — the panel could be opened but not
     /// closed by key. The embedded browser reports it through its accelerator event instead, and
     /// this drains that. Polled every event-loop pass (the COM callback wakes the loop).
+    ///
+    /// The same pass watches the page's URI: a link clicked inside the page changes it with no
+    /// winit event at all, and the address bar must follow.
     #[cfg(feature = "browser")]
     fn poll_browser_toggle(&mut self) {
         if self.browser.as_ref().is_some_and(|b| b.take_toggle_request()) {
             self.toggle_browser_dock();
         }
+        if self.dock_w > 0 {
+            if let Some(url) = self.browser.as_ref().map(|b| b.current_url()) {
+                if url != self.last_bar_url {
+                    self.last_bar_url = url;
+                    self.window.request_redraw();
+                }
+            }
+        }
     }
     #[cfg(not(feature = "browser"))]
     fn poll_browser_toggle(&mut self) {}
+
+    /// What the bar draws: the page's URI and back/forward availability.
+    #[cfg(feature = "browser")]
+    fn browser_bar_state(&self) -> (String, (bool, bool)) {
+        self.browser.as_ref().map(|b| (b.current_url(), b.nav_state())).unwrap_or_default()
+    }
+    #[cfg(not(feature = "browser"))]
+    fn browser_bar_state(&self) -> (String, (bool, bool)) {
+        Default::default()
+    }
+
+    /// The content column's width (what the panes share after the sidebar and dock take theirs).
+    fn content_w(&self) -> u32 {
+        self.areas().1
+    }
+
+    /// A left press on the browser bar: nav buttons act on the page, the address field starts an
+    /// edit. Returns whether the press was on the bar (and so consumed).
+    #[cfg(feature = "browser")]
+    fn browser_bar_click(&mut self) -> bool {
+        if self.dock_w == 0 {
+            return false;
+        }
+        let (x, y) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        let bx = (self.areas().0 + self.content_w()) as f32;
+        let Some(hit) = crate::renderer::browser_bar_hit(x, y, bx, self.dock_w as f32) else {
+            return false;
+        };
+        use crate::renderer::BarHit;
+        match hit {
+            BarHit::Back => self.browser.as_ref().map(|b| b.go_back()),
+            BarHit::Forward => self.browser.as_ref().map(|b| b.go_forward()),
+            BarHit::Reload => self.browser.as_ref().map(|b| b.reload()),
+            // An empty buffer, not the current URL pre-filled: the common act is typing a NEW
+            // address, and there is no text selection to "replace all" with. Escape restores.
+            BarHit::Url => {
+                self.url_edit = Some(String::new());
+                Some(())
+            }
+        };
+        if hit != BarHit::Url {
+            self.url_edit = None;
+        }
+        self.window.request_redraw();
+        true
+    }
+    #[cfg(not(feature = "browser"))]
+    fn browser_bar_click(&mut self) -> bool {
+        false
+    }
+
+    /// A key while the address field is being edited: printable keys build the URL, Enter
+    /// navigates (URL or web search, see [`navigate_target`]), Escape cancels.
+    fn url_edit_key(&mut self, event: &KeyEvent, mods: ModifiersState) {
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.url_edit = None,
+            Key::Named(NamedKey::Enter) => {
+                let buf = self.url_edit.take().unwrap_or_default();
+                if !buf.trim().is_empty() {
+                    #[cfg(feature = "browser")]
+                    if let Some(b) = &self.browser {
+                        b.navigate(&navigate_target(&buf));
+                    }
+                }
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(b) = self.url_edit.as_mut() {
+                    b.pop();
+                }
+            }
+            Key::Named(NamedKey::Space) => {
+                if let Some(b) = self.url_edit.as_mut() {
+                    b.push(' ');
+                }
+            }
+            Key::Character(c) if !mods.control_key() && !mods.super_key() => {
+                if let Some(b) = self.url_edit.as_mut() {
+                    b.push_str(c.as_str());
+                }
+            }
+            _ => {}
+        }
+        self.window.request_redraw();
+    }
 
     /// Keep the panel glued to its column after a window resize.
     #[cfg(feature = "browser")]
@@ -4498,7 +4640,10 @@ impl State {
     #[cfg(feature = "browser")]
     fn dock_rect(&self) -> (i32, i32, i32, i32) {
         let (sidebar_w, content_w, h) = self.areas();
-        ((sidebar_w + content_w) as i32, 0, self.dock_w as i32, h as i32)
+        // The WebView2 sits BELOW the chrome strip the renderer draws (nav buttons + address
+        // bar); it owns its rect and would paint over anything the app drew inside it.
+        let bar = crate::renderer::BROWSER_BAR_H as i32;
+        ((sidebar_w + content_w) as i32, bar, self.dock_w as i32, (h as i32 - bar).max(1))
     }
 
     /// Scroll the active pane's viewport by `lines` (positive = deeper into history), clamped
@@ -5042,6 +5187,19 @@ impl State {
                 },
             }
         });
+        // The browser panel's chrome strip, whenever the dock is open. The URL and history state
+        // come straight from the WebView2 so in-page navigation is reflected.
+        let browser_bar = (self.dock_w > 0).then(|| {
+            let (url, (can_back, can_fwd)) = self.browser_bar_state();
+            crate::renderer::BrowserBar {
+                x: (sidebar_w + self.content_w()) as f32,
+                w: self.dock_w as f32,
+                url,
+                editing: self.url_edit.clone(),
+                can_back,
+                can_fwd,
+            }
+        });
         self.renderer.render_frame(
             &view,
             &items,
@@ -5057,6 +5215,7 @@ impl State {
             self.preedit.as_deref(),
             palette_view.as_ref(),
             settings_view.as_ref(),
+            browser_bar.as_ref(),
         );
         // Present explicitly: dropping a SurfaceTexture does NOT present it — unpresented frames
         // exhaust the swapchain and every later acquire times out (window stays white/stale).
@@ -5687,6 +5846,37 @@ mod tests {
         for px in font_ladder(19.0) {
             assert_eq!(clamp_font_px(px), px);
         }
+    }
+
+    #[test]
+    fn the_address_bar_reads_urls_as_urls_and_words_as_searches() {
+        // A scheme is taken verbatim — including non-http ones.
+        assert_eq!(navigate_target("https://example.com/a?b=c"), "https://example.com/a?b=c");
+        assert_eq!(navigate_target("data:text/html,hi"), "data:text/html,hi");
+        // A dotted host with no spaces is a URL missing its scheme.
+        assert_eq!(navigate_target("example.com"), "https://example.com");
+        assert_eq!(navigate_target("  docs.rs/winit  "), "https://docs.rs/winit");
+        // Words are a search, space-joined with '+', everything else percent-encoded.
+        assert_eq!(navigate_target("rust conpty"), "https://duckduckgo.com/?q=rust+conpty");
+        assert_eq!(navigate_target("a&b"), "https://duckduckgo.com/?q=a%26b");
+        // A dotted phrase WITH spaces is still a search, not a mangled URL.
+        assert!(navigate_target("what is example.com").starts_with("https://duckduckgo.com/"));
+    }
+
+    #[test]
+    fn browser_bar_clicks_land_on_their_controls() {
+        use crate::renderer::{browser_bar_hit, BarHit, BROWSER_BAR_H};
+        let (x, w) = (800.0, 480.0);
+        // Each control answers inside its own strip; order is back, forward, reload, url.
+        assert_eq!(browser_bar_hit(x + 12.0, 20.0, x, w), Some(BarHit::Back));
+        assert_eq!(browser_bar_hit(x + 40.0, 20.0, x, w), Some(BarHit::Forward));
+        assert_eq!(browser_bar_hit(x + 68.0, 20.0, x, w), Some(BarHit::Reload));
+        assert_eq!(browser_bar_hit(x + 200.0, 20.0, x, w), Some(BarHit::Url));
+        assert_eq!(browser_bar_hit(x + w - 9.0, 20.0, x, w), Some(BarHit::Url), "field runs to the pad");
+        // Below the bar is the WebView2's territory; left of the dock is the panes'.
+        assert_eq!(browser_bar_hit(x + 200.0, BROWSER_BAR_H, x, w), None);
+        assert_eq!(browser_bar_hit(x - 1.0, 20.0, x, w), None);
+        assert_eq!(browser_bar_hit(x + w, 20.0, x, w), None);
     }
 
     #[test]

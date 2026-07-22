@@ -12,6 +12,16 @@
 //!   gmux shell-integration       print (or --install into $PROFILE) the PowerShell snippet
 //!
 //! Role dispatch (`--daemon` / more subcommands) grows with later milestones (ARCHITECTURE §3).
+//!
+//! `windows` subsystem, not `console`: double-clicking gmux.exe must open ONLY the app — a
+//! console-subsystem binary gets a terminal window from the OS before `main` even runs, which no
+//! amount of hiding after the fact fully undoes (Windows Terminal hosts it in its own process).
+//! The CLI still works from a shell: [`gmux_pty::attach_parent_console`] reattaches to the
+//! invoking terminal so output lands there, and redirected/piped handles are always honoured, so
+//! scripts and agents capturing output see no difference. The one visible change: an interactive
+//! shell prompt returns immediately rather than waiting for gmux to exit (pipe the output, or use
+//! `start /wait`, where exit-timing matters).
+#![windows_subsystem = "windows"]
 
 mod client;
 mod crash;
@@ -21,6 +31,9 @@ mod shell_integration;
 use std::io::{Read, Write};
 
 fn main() {
+    // Before anything can print: a windows-subsystem process has no console, so hook back up to
+    // the terminal this was typed into (no-op for an Explorer launch, which has none).
+    gmux_pty::attach_parent_console();
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         None => launch_gui(default_shell()),

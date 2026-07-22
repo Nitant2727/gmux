@@ -30,9 +30,9 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadFile, WriteFile, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::Console::{
-    AllocConsole, ClosePseudoConsole, CreatePseudoConsole, GetConsoleMode, GetConsoleWindow,
-    GetStdHandle, ResizePseudoConsole, SetStdHandle, COORD, HPCON, STD_ERROR_HANDLE,
-    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    AllocConsole, AttachConsole, ClosePseudoConsole, CreatePseudoConsole, GetConsoleMode,
+    GetConsoleWindow, GetStdHandle, ResizePseudoConsole, SetStdHandle, ATTACH_PARENT_PROCESS,
+    COORD, HPCON, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, SetInformationJobObject, TerminateJobObject,
@@ -137,6 +137,58 @@ pub fn ensure_console() {
         }
         repoint_std_handles();
     });
+}
+
+/// Attach to the parent process's console, if it has one — how a `windows`-subsystem gmux gets
+/// its CLI output back to the terminal the user typed into. A GUI-subsystem process starts with
+/// no console at all, so `gmux list-panes` would otherwise print into the void.
+///
+/// Std handles that are already valid are left alone: a redirected handle (`gmux list-panes |
+/// findstr x`, an agent capturing output) is a pipe the caller set up on purpose, and repointing
+/// it at the console would steal the output back from them. Only missing handles are filled in.
+/// No parent console (an Explorer double-click) is the GUI path: the call fails and nothing
+/// happens, which is exactly right — there is nowhere to print to.
+pub fn attach_parent_console() {
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            return;
+        }
+        let share = FILE_SHARE_READ | FILE_SHARE_WRITE;
+        let missing = |h: HANDLE| h.is_null() || h == INVALID_HANDLE_VALUE;
+        if missing(GetStdHandle(STD_OUTPUT_HANDLE)) || missing(GetStdHandle(STD_ERROR_HANDLE)) {
+            let conout = CreateFileW(
+                wide("CONOUT$").as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                share,
+                null(),
+                OPEN_EXISTING,
+                0,
+                null_mut(),
+            );
+            if conout != INVALID_HANDLE_VALUE {
+                if missing(GetStdHandle(STD_OUTPUT_HANDLE)) {
+                    SetStdHandle(STD_OUTPUT_HANDLE, conout);
+                }
+                if missing(GetStdHandle(STD_ERROR_HANDLE)) {
+                    SetStdHandle(STD_ERROR_HANDLE, conout);
+                }
+            }
+        }
+        if missing(GetStdHandle(STD_INPUT_HANDLE)) {
+            let conin = CreateFileW(
+                wide("CONIN$").as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                share,
+                null(),
+                OPEN_EXISTING,
+                0,
+                null_mut(),
+            );
+            if conin != INVALID_HANDLE_VALUE {
+                SetStdHandle(STD_INPUT_HANDLE, conin);
+            }
+        }
+    }
 }
 
 /// Point the std handles at the process's console (`CONOUT$`/`CONIN$`).
