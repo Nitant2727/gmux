@@ -41,8 +41,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetMessageW,
     GetWindowLongPtrW, PostMessageW, RegisterClassW, SetWindowLongPtrW, ShowWindow, TranslateMessage,
-    CW_USEDEFAULT, GWLP_USERDATA, MSG, SW_SHOW, WM_APP, WM_DESTROY, WM_SIZE, WNDCLASSW,
-    WS_OVERLAPPEDWINDOW,
+    CW_USEDEFAULT, GWLP_USERDATA, MSG, SW_SHOW, SW_SHOWNA, WM_APP, WM_DESTROY, WM_SIZE, WNDCLASSW,
+    WS_CHILD, WS_CLIPSIBLINGS, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 /// A command sent from the GUI thread to a browser pane's own thread.
@@ -50,6 +50,12 @@ enum Cmd {
     Navigate(String),
     /// Run `script` in the WebView2 and send the JSON result (or an error) back over `reply`.
     Eval { script: String, reply: Sender<Result<String, String>> },
+    /// Move/resize an embedded pane's host window (client coords of the parent) and refit the
+    /// WebView2 to it. Ignored by a top-level pane, which the user positions themselves.
+    Bounds { x: i32, y: i32, w: i32, h: i32 },
+    /// Show or hide an embedded pane without tearing down the WebView2 (a toggle keeps the page,
+    /// its scroll position, and any login session alive).
+    Visible(bool),
     Close,
 }
 
@@ -92,6 +98,61 @@ impl BrowserPane {
             Ok(Err(e)) => Err(e),
             Err(_) => Err("browser thread exited before signalling readiness".into()),
         }
+    }
+
+    /// Open a browser pane **embedded in `parent`** (the GUI's window) at client-rect `(x, y, w, h)`
+    /// — the M12 stage-2 panel. The WebView2 lives in a child window, so it composites over the
+    /// wgpu surface without the renderer having to know anything about it; the caller reserves the
+    /// rect in its own layout and calls [`set_bounds`] whenever that rect moves.
+    ///
+    /// Threading is unchanged from [`open`]: the child window and its message pump live on the
+    /// browser thread. A child owned by another thread has its input queue attached to the parent's,
+    /// which is why the GUI loop must never block for long (it doesn't — it is a poll loop).
+    ///
+    /// [`set_bounds`]: BrowserPane::set_bounds
+    /// [`open`]: BrowserPane::open
+    pub fn embed(parent: isize, x: i32, y: i32, w: i32, h: i32, url: &str) -> Result<BrowserPane, String> {
+        let queue: Arc<Mutex<Vec<Cmd>>> = Arc::new(Mutex::new(Vec::new()));
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<HwndSend, String>>();
+        let url = url.to_string();
+        let thread_queue = Arc::clone(&queue);
+        let host = HostRect { parent, x, y, w, h };
+
+        std::thread::Builder::new()
+            .name("gmux-browser".into())
+            .spawn(move || browser_thread_in(url, thread_queue, ready_tx, Some(host)))
+            .map_err(|e| format!("spawn browser thread: {e}"))?;
+
+        match ready_rx.recv() {
+            Ok(Ok(hwnd)) => Ok(BrowserPane { hwnd, queue }),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err("browser thread exited before signalling readiness".into()),
+        }
+    }
+
+    /// Move/resize an embedded pane (client coords of its parent). No-op once the window is gone.
+    pub fn set_bounds(&self, x: i32, y: i32, w: i32, h: i32) {
+        self.post(Cmd::Bounds { x, y, w, h });
+    }
+
+    /// Show the embedded child **from the caller's thread**, which must be the thread that owns the
+    /// parent window.
+    ///
+    /// This is not redundant with the `ShowWindow` the browser thread already does: a child window
+    /// created on a different thread from its parent does not reliably take `WS_VISIBLE` from that
+    /// thread (measured — the style stayed `WS_CHILD|WS_CLIPSIBLINGS`, no `WS_VISIBLE`, and the
+    /// panel never appeared). Showing it from the parent's own thread is what actually applies.
+    /// `SW_SHOWNA` so the panel never steals focus from the terminal.
+    pub fn show_from_parent_thread(&self) {
+        use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNA};
+        unsafe {
+            let _ = ShowWindow(self.hwnd.0, SW_SHOWNA);
+        }
+    }
+
+    /// Show or hide an embedded pane, keeping the page (and its session) loaded.
+    pub fn set_visible(&self, visible: bool) {
+        self.post(Cmd::Visible(visible));
     }
 
     /// Navigate the existing pane to `url`. Returns `false` if the pane's window is gone (the user
@@ -168,11 +229,35 @@ struct WindowState {
 
 const CLASS_NAME: PCWSTR = w!("gmux-browser");
 
-/// The browser thread: init COM, create the window + WebView2, navigate, then run the message loop.
+/// Where an embedded pane's child window goes: a parent HWND plus a client-coords rect.
+#[derive(Clone, Copy)]
+struct HostRect {
+    parent: isize,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+// Same reasoning as `HwndSend`: the raw parent handle is only ever passed to CreateWindowExW on
+// the browser thread. The window it names is owned by the GUI thread and never dereferenced here.
+unsafe impl Send for HostRect {}
+
+/// The browser thread for a top-level pane (see [`browser_thread_in`]).
 fn browser_thread(
     url: String,
     queue: Arc<Mutex<Vec<Cmd>>>,
     ready_tx: Sender<Result<HwndSend, String>>,
+) {
+    browser_thread_in(url, queue, ready_tx, None)
+}
+
+/// The browser thread: init COM, create the window (top-level, or a child of `host`) + WebView2,
+/// navigate, then run the message loop.
+fn browser_thread_in(
+    url: String,
+    queue: Arc<Mutex<Vec<Cmd>>>,
+    ready_tx: Sender<Result<HwndSend, String>>,
+    host: Option<HostRect>,
 ) {
     unsafe {
         // WebView2 requires an STA (single-threaded apartment) on its host thread.
@@ -181,7 +266,7 @@ fn browser_thread(
             return;
         }
 
-        let hwnd = match create_window(&queue) {
+        let hwnd = match create_window(&queue, host) {
             Ok(h) => h,
             Err(e) => {
                 let _ = ready_tx.send(Err(e));
@@ -193,7 +278,9 @@ fn browser_thread(
         // the window is up and the pump will run either way.
         let _ = ready_tx.send(Ok(HwndSend(hwnd)));
 
-        let _ = ShowWindow(hwnd, SW_SHOW);
+        // An embedded child needs SW_SHOWNA: SW_SHOW activates, which would steal focus from the
+        // terminal every time a `gmux browse` lands.
+        let _ = ShowWindow(hwnd, if host.is_some() { SW_SHOWNA } else { SW_SHOW });
 
         // Create the WebView2 environment then a controller parented to our window. Both are async
         // COM calls; `wait_for_async_operation` pumps messages until each completes.
@@ -227,8 +314,10 @@ fn browser_thread(
 }
 
 /// Register the class (idempotent — a duplicate registration just fails harmlessly) and create the
-/// top-level `gmux browser` window, stashing `WindowState` behind `GWLP_USERDATA`.
-unsafe fn create_window(queue: &Arc<Mutex<Vec<Cmd>>>) -> Result<HWND, String> {
+/// pane's window, stashing `WindowState` behind `GWLP_USERDATA`. With `host`, that is a CHILD of
+/// the GUI's window at the given client rect (the embedded panel); without, a top-level
+/// `gmux browser` window.
+unsafe fn create_window(queue: &Arc<Mutex<Vec<Cmd>>>, host: Option<HostRect>) -> Result<HWND, String> {
     let hinstance: HINSTANCE = GetModuleHandleW(None)
         .map(|h| HINSTANCE(h.0))
         .map_err(|e| format!("GetModuleHandleW: {e}"))?;
@@ -245,16 +334,29 @@ unsafe fn create_window(queue: &Arc<Mutex<Vec<Cmd>>>) -> Result<HWND, String> {
     let state = Box::new(WindowState { controller: None, queue: Arc::clone(queue), pending: None });
     let state_ptr = Box::into_raw(state);
 
+    let (style, x, y, w_, h_, parent) = match host {
+        // The panel: a child clipped to the GUI's client area. WS_CLIPSIBLINGS keeps it from
+        // fighting other children for the same pixels.
+        Some(r) => (
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+            r.x,
+            r.y,
+            r.w,
+            r.h,
+            Some(HWND(r.parent as *mut _)),
+        ),
+        None => (WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 1024, 768, None),
+    };
     let hwnd = CreateWindowExW(
         Default::default(),
         CLASS_NAME,
         w!("gmux browser"),
-        WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT,
-        CW_USEDEFAULT,
-        1024,
-        768,
-        None,
+        style,
+        x,
+        y,
+        w_,
+        h_,
+        parent,
         None,
         Some(hinstance),
         Some(state_ptr as *const _),
@@ -266,7 +368,11 @@ unsafe fn create_window(queue: &Arc<Mutex<Vec<Cmd>>>) -> Result<HWND, String> {
     })?;
 
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
-    scale_to_dpi(hwnd);
+    // Only the top-level window needs the DPI fix-up; the panel's rect comes from the GUI, which
+    // already works in physical pixels.
+    if host.is_none() {
+        scale_to_dpi(hwnd);
+    }
     Ok(hwnd)
 }
 
@@ -362,8 +468,18 @@ unsafe fn eval_on_thread(
 /// outside the process, which is what made the "it silently did nothing" bug so hard to pin down;
 /// the title makes the current target observable to a human and to a test.
 unsafe fn set_title(hwnd: HWND, url: &str) {
-    use windows::Win32::UI::WindowsAndMessaging::SetWindowTextW;
-    let title = pcwstr(&format!("gmux browser - {url}"));
+    use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowLongW, SetWindowTextW, GWL_STYLE};
+    // The title also carries the host geometry + style: the panel has no other externally visible
+    // state, and this is what made the embed verifiable without a screenshot.
+    let mut r = RECT::default();
+    let _ = GetClientRect(hwnd, &mut r);
+    let style = GetWindowLongW(hwnd, GWL_STYLE);
+    let title = pcwstr(&format!(
+        "gmux browser [{}x{} style=0x{:X}] - {url}",
+        r.right - r.left,
+        r.bottom - r.top,
+        style
+    ));
     let _ = SetWindowTextW(hwnd, title.as_pcwstr());
 }
 
@@ -414,6 +530,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         },
                         Cmd::Navigate(_) => {} // the keep-alive hint from post(); ignore
                         Cmd::Eval { script, reply } => eval_on_thread(&state.controller, &script, reply),
+                        Cmd::Bounds { x, y, w, h } => {
+                            use windows::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOACTIVATE, SWP_NOZORDER};
+                            let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+                            // WM_SIZE refits the controller, but resize it here too: a move-only
+                            // SetWindowPos sends no WM_SIZE.
+                            if let Some(ctl) = &state.controller {
+                                resize_to_client(ctl, hwnd);
+                            }
+                        }
+                        Cmd::Visible(show) => {
+                            use windows::Win32::UI::WindowsAndMessaging::{SW_HIDE, SW_SHOWNA};
+                            let _ = ShowWindow(hwnd, if show { SW_SHOWNA } else { SW_HIDE });
+                            // Tell WebView2 as well, so a hidden panel stops rendering entirely
+                            // rather than just being covered.
+                            if let Some(ctl) = &state.controller {
+                                let _ = ctl.SetIsVisible(show);
+                            }
+                        }
                         Cmd::Close => {
                             let _ = DestroyWindow(hwnd);
                         }
