@@ -85,10 +85,15 @@ clicking a header folds the group away — a folded header keeps showing its mem
 workspaces' unread total. Grouping is persisted, so it survives a daemon restart.
 
 A workspace can carry a pull-request badge: `gmux pr -t @2 --resolve` reads the current branch's PR
-with `gh` and pushes it, or set it by hand with `gmux pr -t @2 128 open` (`open`/`draft`/`merged`/
-`closed`; `--clear` removes it). The chip shows `#128` in GitHub's state colors next to the branch.
-The daemon never talks to GitHub — `--resolve` shells `gh` in the CLI process you just ran, so
-there is no polling and no background network.
+with `gh` and pushes it, or set it by hand with `gmux pr -t @2 128 open [url]` (`open`/`draft`/
+`merged`/`closed`; `--clear` removes it). The chip shows `#128` in GitHub's state colors next to the
+branch, and **clicking it opens the pull request** when the badge carries a URL (`--resolve` always
+supplies one).
+
+Auto-refresh is **opt-in**: set `"pr_refresh_secs": 300` in `%APPDATA%\gmux\gmux.json` and the
+daemon re-resolves badges on that cadence — one workspace per cycle, on a worker thread, using each
+pane's own directory. Left at its default of `0` it never runs, and gmux makes no network calls at
+all. Values below 30 s are clamped up.
 
 Tag a workspace with a color via `gmux color -t @2 #e0533d` (a left rail on the row, brightened so
 it reads on the dark sidebar; `--clear` removes it). A workspace running something — a build, an

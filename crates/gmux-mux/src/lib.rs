@@ -126,8 +126,8 @@ impl Window {
     }
 
     /// This workspace's pull-request badge, if one is set.
-    pub fn pr(&self) -> Option<workspace::PrBadge> {
-        self.pr
+    pub fn pr(&self) -> Option<&workspace::PrBadge> {
+        self.pr.as_ref()
     }
 
     /// Whether any pane in this window has running children (a build, an agent) — the sidebar

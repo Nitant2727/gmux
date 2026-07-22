@@ -172,7 +172,8 @@ USAGE:
                                        removes it); ids come from `gmux list-panes`
   gmux color -t @<win> #rrggbb         tag a workspace row with a color (--clear removes it)
   gmux pr -t @<win> --resolve          badge a workspace with its branch's PR (via `gh`); or set
-                                       it by hand: <number> <open|draft|merged|closed>, --clear
+                                       it by hand: <number> <open|draft|merged|closed> [url],
+                                       --clear. Click the chip to open the PR.
   gmux wait-for -t <pane> ...          block until --text <substr> appears, the pane --exit s,
                                        or its screen is --idle <secs>; [--timeout <secs>]
   gmux screenshot -t <pane> [-o F.bmp] render the pane's live grid to an image (headless GPU)

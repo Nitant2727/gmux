@@ -266,6 +266,34 @@ mod tests {
     }
 
     #[test]
+    fn pr_chip_hit_matches_where_it_is_drawn() {
+        // The clickable chip must be exactly the drawn chip: on the row's SECOND line, starting at
+        // the text column, and shifted right when a color rail is present.
+        let Some(r) = Renderer::new_headless(wgpu::TextureFormat::Rgba8Unorm, 18.0) else {
+            return;
+        };
+        let (cw, ch) = (r.cell_w() as f32, r.cell_h() as f32);
+        let top = 100.0;
+        let line2 = top + 8.0 + ch; // ROW_PAD_V + one line
+        let x0 = 6.0 + 10.0; // ROW_OUTER_PAD + ROW_PAD_H
+        // "#42" is 3 cells wide plus 5px padding each side.
+        let mid = x0 + (3.0 * cw + 10.0) / 2.0;
+        assert!(r.pr_chip_hit(mid, line2 + ch / 2.0, top, false, 42), "centre of the chip hits");
+        assert!(!r.pr_chip_hit(x0 - 4.0, line2 + ch / 2.0, top, false, 42), "left of the chip misses");
+        assert!(!r.pr_chip_hit(mid, top + 2.0, top, false, 42), "the first line is not the chip");
+        assert!(
+            !r.pr_chip_hit(x0 + 3.0 * cw + 30.0, line2 + ch / 2.0, top, false, 42),
+            "right of the chip misses"
+        );
+        // With a color rail the chip shifts right by the rail width + inset, so the old x misses.
+        assert!(!r.pr_chip_hit(x0 + 1.0, line2 + ch / 2.0, top, true, 42));
+        assert!(r.pr_chip_hit(mid + 7.0, line2 + ch / 2.0, top, true, 42));
+        // A wider number makes a wider chip.
+        assert!(r.pr_chip_hit(x0 + 5.0 * cw, line2 + ch / 2.0, top, false, 12345));
+        assert!(!r.pr_chip_hit(x0 + 5.0 * cw, line2 + ch / 2.0, top, false, 4));
+    }
+
+    #[test]
     fn sidebar_panel_is_top_lit() {
         // The chrome gradients run token-color-at-top to darker-at-bottom. Sample the panel's own
         // column (x=2, left of any row content) near the top and near the bottom.

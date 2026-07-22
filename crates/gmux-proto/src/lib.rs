@@ -152,6 +152,9 @@ pub enum Call {
         number: u32,
         #[serde(default)]
         status: String,
+        /// The PR page, so a click on the chip can open it. Optional.
+        #[serde(default)]
+        url: Option<String>,
     },
     /// Focus a specific pane by id, activating its window too (a pane click). Unknown ids are
     /// ignored server-side.
@@ -399,10 +402,9 @@ pub struct TabWire {
     /// activity indicator while true. `#[serde(default)]` so an old daemon reads as idle.
     #[serde(default)]
     pub busy: bool,
-    /// A pull-request badge `(number, status)` where status is `open`/`draft`/`merged`/`closed`;
-    /// `None` = no PR. `#[serde(default)]` so an old daemon reads as none.
+    /// A pull-request badge; `None` = no PR. `#[serde(default)]` so an old daemon reads as none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pr: Option<(u32, String)>,
+    pub pr: Option<PrWire>,
     pub active: bool,
     /// Aggregate agent progress across the window's panes: `Some(pct)` = the least-done active
     /// agent's percentage, `None` = no pane reporting progress. Indeterminate/paused panes count
@@ -412,6 +414,17 @@ pub struct TabWire {
     /// A pane in the window reported an OSC 9;4 error state (takes visual precedence over `progress`).
     #[serde(default)]
     pub progress_error: bool,
+}
+
+/// A workspace's pull-request badge on the wire.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrWire {
+    pub number: u32,
+    /// `open` / `draft` / `merged` / `closed`.
+    pub status: String,
+    /// The PR page; `None` for a hand-set badge with no URL (the chip then isn't clickable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// The active window's layout + the tab list.
@@ -553,7 +566,7 @@ mod tests {
             Call::RenameWindow { id: 5, name: "backend".into() },
             Call::GroupWindow { id: 5, group: "api".into() },
             Call::ColorWindow { id: 5, color: "#ff8800".into() },
-            Call::SetPr { id: 5, number: 42, status: "open".into() },
+            Call::SetPr { id: 5, number: 42, status: "open".into(), url: Some("https://x.test/pull/42".into()) },
             Call::FocusPaneId { pane: 7 },
             Call::MoveWindow { from: 3, to: 1 },
             Call::SetPalette {
@@ -599,7 +612,7 @@ mod tests {
             active_pane: 1,
             tabs: vec![
                 TabWire { index: 0, id: 10, name: "a".into(), branch: Some("main".into()), attention: false, unread: 0, group: None, color: None, busy: false, pr: None, active: true, progress: Some(42), progress_error: false },
-                TabWire { index: 1, id: 11, name: "b".into(), branch: None, attention: true, unread: 7, group: Some("api".into()), color: Some("#ff8800".into()), busy: true, pr: Some((42, "open".into())), active: false, progress: None, progress_error: true },
+                TabWire { index: 1, id: 11, name: "b".into(), branch: None, attention: true, unread: 7, group: Some("api".into()), color: Some("#ff8800".into()), busy: true, pr: Some(PrWire { number: 42, status: "open".into(), url: Some("https://x.test/pull/42".into()) }), active: false, progress: None, progress_error: true },
             ],
             panes: Vec::new(),
         };

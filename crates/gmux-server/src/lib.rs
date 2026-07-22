@@ -9,6 +9,7 @@ pub mod remote;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufReader};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use std::path::PathBuf;
@@ -50,12 +51,22 @@ pub struct Server {
     /// M7 privacy: whether session snapshots persist each pane's screen text. Read once from
     /// `gmux.json` at daemon start (default true); `false` writes snapshots with empty screens.
     persist_screen: bool,
+    /// How often to re-resolve PR badges via `gh`, in ticks (0 = disabled). Read from `gmux.json`
+    /// as `pr_refresh_secs`; the default is off, because it shells out to the network.
+    pr_refresh_ticks: u32,
+    /// Round-robin cursor over windows, so one refresh cycle probes ONE window rather than
+    /// spawning a `gh` per window at once.
+    pr_cursor: usize,
+    /// Results from the refresh worker threads: `(window id, badge or None to clear)`.
+    pr_rx: Receiver<(u64, Option<gmux_mux::PrBadge>)>,
+    pr_tx: Sender<(u64, Option<gmux_mux::PrBadge>)>,
 }
 
 impl Server {
     /// Create a server whose session's first window runs `shell`.
     pub fn new(shell: String) -> io::Result<Server> {
         let pane = Pane::spawn(&shell, DEFAULT_SIZE)?;
+        let (pr_tx, pr_rx) = channel();
         Ok(Server {
             session: Session::start("gmux", pane),
             shell,
@@ -67,6 +78,10 @@ impl Server {
             progress: HashMap::new(),
             palette: Palette::default(),
             persist_screen: load_persist_screen(),
+            pr_refresh_ticks: load_pr_refresh_ticks(),
+            pr_cursor: 0,
+            pr_rx,
+            pr_tx,
         })
     }
 
@@ -81,6 +96,7 @@ impl Server {
             if let Ok(session) = restored {
                 if session.pane_count() > 0 {
                     eprintln!("gmux daemon: restored {} pane(s) from last session", session.pane_count());
+                    let (pr_tx, pr_rx) = channel();
                     return Ok(Server {
                         session,
                         shell,
@@ -92,6 +108,10 @@ impl Server {
                         progress: HashMap::new(),
                         palette: Palette::default(),
                         persist_screen: load_persist_screen(),
+                        pr_refresh_ticks: load_pr_refresh_ticks(),
+                        pr_cursor: 0,
+                        pr_rx,
+                        pr_tx,
                     });
                 }
             }
@@ -206,7 +226,42 @@ impl Server {
         if self.ticks % 20 == 0 {
             self.save();
         }
+        self.pump_pr_refresh();
         batch
+    }
+
+    /// Apply any finished PR probes, then (on the configured cadence) start one more.
+    ///
+    /// Deliberately **one window per cycle, on a worker thread**: `gh` is a network call, so the
+    /// tick loop must never block on it, and N windows must not mean N concurrent processes. With
+    /// the default `pr_refresh_secs: 0` this whole path is inert — no threads, no `gh`, no network.
+    fn pump_pr_refresh(&mut self) {
+        // Results first, so a probe started last cycle lands even if refresh was since disabled.
+        while let Ok((win, badge)) = self.pr_rx.try_recv() {
+            if let Some(w) = self.session.window_mut(WindowId(win)) {
+                w.set_pr(badge);
+            }
+        }
+        if self.pr_refresh_ticks == 0 || self.ticks % self.pr_refresh_ticks != 0 {
+            return;
+        }
+        // Round-robin: probe the next window that has a cwd to run `gh` in.
+        let windows = self.session.windows();
+        if windows.is_empty() {
+            return;
+        }
+        for step in 0..windows.len() {
+            let idx = (self.pr_cursor + step) % windows.len();
+            let win = &windows[idx];
+            let Some(cwd) = win.active_pane().cwd() else { continue };
+            let id = win.id.0;
+            let tx = self.pr_tx.clone();
+            self.pr_cursor = (idx + 1) % windows.len();
+            std::thread::spawn(move || {
+                let _ = tx.send((id, probe_pr(&cwd)));
+            });
+            return;
+        }
     }
 
     fn spawn_pane(&self, command: &Option<String>) -> io::Result<Pane> {
@@ -474,11 +529,14 @@ impl Server {
                 }
                 Response::ok(id, ResultBody::Done)
             }
-            Call::SetPr { id: win, number, status } => {
+            Call::SetPr { id: win, number, status, url } => {
                 if let Some(w) = self.session.window_mut(WindowId(*win)) {
                     // An unparseable/empty status clears the badge.
-                    let badge = gmux_mux::PrStatus::parse(status)
-                        .map(|status| gmux_mux::PrBadge { number: *number, status });
+                    let badge = gmux_mux::PrStatus::parse(status).map(|status| gmux_mux::PrBadge {
+                        number: *number,
+                        status,
+                        url: url.clone(),
+                    });
                     w.set_pr(badge);
                 }
                 Response::ok(id, ResultBody::Done)
@@ -560,7 +618,11 @@ impl Server {
                     group: win.group().map(str::to_string),
                     color: win.color().map(str::to_string),
                     busy: win.is_busy(),
-                    pr: win.pr().map(|b| (b.number, b.status.as_str().to_string())),
+                    pr: win.pr().map(|b| gmux_proto::PrWire {
+                        number: b.number,
+                        status: b.status.as_str().to_string(),
+                        url: b.url.clone(),
+                    }),
                     active: i == active_idx,
                     progress,
                     progress_error,
@@ -832,6 +894,51 @@ fn load_persist_screen() -> bool {
     persist_screen_from_json(&text)
 }
 
+/// Ask `gh` for the PR of the branch checked out in `cwd`. Returns `None` when `gh` is missing,
+/// unauthenticated, or the directory has no PR — which CLEARS the badge, so a merged-and-deleted
+/// branch doesn't keep advertising a stale PR. Runs on a worker thread (see `pump_pr_refresh`).
+fn probe_pr(cwd: &str) -> Option<gmux_mux::PrBadge> {
+    let out = std::process::Command::new("gh")
+        .args(["pr", "view", "--json", "number,state,isDraft,url"])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let number = json.get("number")?.as_u64()? as u32;
+    let state = json.get("state")?.as_str()?;
+    let is_draft = json.get("isDraft").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let status = gmux_mux::PrStatus::from_github(state, is_draft)?;
+    let url = json.get("url").and_then(serde_json::Value::as_str).map(str::to_string);
+    Some(gmux_mux::PrBadge { number, status, url })
+}
+
+/// Read `pr_refresh_secs` from the same config, as a tick count (the daemon ticks at 100 ms).
+/// `0` (the default) disables auto-refresh entirely — it shells out to the network, so it is
+/// opt-in. Values are floored at 30 s so a typo can't turn the daemon into a `gh` firehose.
+fn load_pr_refresh_ticks() -> u32 {
+    let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
+    let path = PathBuf::from(base).join("gmux").join("gmux.json");
+    let Ok(text) = std::fs::read_to_string(&path) else { return 0 };
+    pr_refresh_ticks_from_json(&text)
+}
+
+/// The pure parse half of [`load_pr_refresh_ticks`]. Pure/tested.
+fn pr_refresh_ticks_from_json(text: &str) -> u32 {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let secs = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| v.get("pr_refresh_secs").and_then(serde_json::Value::as_u64))
+        .unwrap_or(0);
+    if secs == 0 {
+        return 0;
+    }
+    // 10 ticks per second, floored at 30 s.
+    (secs.max(30) as u32).saturating_mul(10)
+}
+
 /// The pure parse half of [`load_persist_screen`]: BOM-strip, read the top-level `persist_screen`
 /// bool, default `true` when the file is malformed or the key is absent/non-bool.
 fn persist_screen_from_json(text: &str) -> bool {
@@ -1007,6 +1114,7 @@ mod tests {
         use gmux_mux::{Pane, Session};
         // Build a Server with a console-free remote pane so no ConPTY is bound.
         let pane = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        let (pr_tx, pr_rx) = channel();
         let mut server = Server {
             session: Session::start("t", pane),
             shell: "pwsh".into(),
@@ -1018,6 +1126,10 @@ mod tests {
             progress: HashMap::new(),
             palette: Palette::default(),
             persist_screen: true,
+            pr_refresh_ticks: 0,
+            pr_cursor: 0,
+            pr_rx,
+            pr_tx,
         };
 
         let b1 = server.handle(&Request { id: 1, call: Call::Browse { url: "https://a.test".into() } });
@@ -1043,6 +1155,7 @@ mod tests {
         // Pane ids are auto-allocated (the first arg is the remote id), so capture them.
         let a = Pane::remote(1, 80, 24, Box::new(|_| {}));
         let ida = a.id;
+        let (pr_tx, pr_rx) = channel();
         let mut server = Server {
             session: Session::start("t", a),
             shell: "pwsh".into(),
@@ -1054,6 +1167,10 @@ mod tests {
             progress: HashMap::new(),
             palette: Palette::default(),
             persist_screen: true,
+            pr_refresh_ticks: 0,
+            pr_cursor: 0,
+            pr_rx,
+            pr_tx,
         };
         // A second remote pane in its own window -> two tabs.
         let b = Pane::remote(2, 80, 24, Box::new(|_| {}));
@@ -1089,6 +1206,7 @@ mod tests {
         use gmux_mux::{Pane, Session};
         let pane = Pane::remote(1, 80, 24, Box::new(|_| {}));
         let pid = pane.id.0;
+        let (pr_tx, pr_rx) = channel();
         let mut server = Server {
             session: Session::start("t", pane),
             shell: "pwsh".into(),
@@ -1100,6 +1218,10 @@ mod tests {
             progress: HashMap::new(),
             palette: Palette::default(),
             persist_screen: true,
+            pr_refresh_ticks: 0,
+            pr_cursor: 0,
+            pr_rx,
+            pr_tx,
         };
         let p = server.session.pane(PaneId(pid)).unwrap();
         p.push_output(b"\x1b]133;A\x07p1> build\r\nok\r\n\x1b]133;A\x07p2> ");
@@ -1122,6 +1244,7 @@ mod tests {
         use gmux_mux::{Pane, Session};
         let pane = Pane::remote(1, 80, 24, Box::new(|_| {}));
         let pid = pane.id.0;
+        let (pr_tx, pr_rx) = channel();
         let mut server = Server {
             session: Session::start("t", pane),
             shell: "pwsh".into(),
@@ -1133,6 +1256,10 @@ mod tests {
             progress: HashMap::new(),
             palette: Palette::default(),
             persist_screen: true,
+            pr_refresh_ticks: 0,
+            pr_cursor: 0,
+            pr_rx,
+            pr_tx,
         };
         let resp = server.handle(&Request { id: 1, call: Call::PaneBusy { pane: pid } });
         assert_eq!(resp.result, Some(ResultBody::Busy(false)), "remote panes are never busy");
@@ -1151,6 +1278,7 @@ mod tests {
     fn set_palette_applies_to_existing_panes() {
         let pane = Pane::remote(1, 80, 24, Box::new(|_| {}));
         let pid = pane.id.0;
+        let (pr_tx, pr_rx) = channel();
         let mut server = Server {
             session: Session::start("t", pane),
             shell: "pwsh".into(),
@@ -1162,6 +1290,10 @@ mod tests {
             progress: HashMap::new(),
             palette: Palette::default(),
             persist_screen: true,
+            pr_refresh_ticks: 0,
+            pr_cursor: 0,
+            pr_rx,
+            pr_tx,
         };
 
         // Custom red in ANSI slot 1; other slots left at their defaults on the wire (short vec).
@@ -1269,6 +1401,21 @@ mod tests {
         assert!(persist_screen_from_json(r#"{"persist_screen": "no"}"#));
     }
 
+    /// PR auto-refresh is opt-in and rate-floored: absent/0/malformed means OFF (no `gh`, no
+    /// network), and any enabled value is clamped up to 30 s so a typo can't spawn a probe storm.
+    #[test]
+    fn pr_refresh_config_parse() {
+        assert_eq!(pr_refresh_ticks_from_json(r#"{}"#), 0, "absent key = off");
+        assert_eq!(pr_refresh_ticks_from_json(r#"{"pr_refresh_secs": 0}"#), 0, "0 = off");
+        assert_eq!(pr_refresh_ticks_from_json("not json"), 0, "malformed = off");
+        assert_eq!(pr_refresh_ticks_from_json(r#"{"pr_refresh_secs": "5m"}"#), 0, "non-number = off");
+        // 300 s at a 100 ms tick = 3000 ticks.
+        assert_eq!(pr_refresh_ticks_from_json(r#"{"pr_refresh_secs": 300}"#), 3000);
+        // Below the floor clamps up rather than hammering `gh` every second.
+        assert_eq!(pr_refresh_ticks_from_json(r#"{"pr_refresh_secs": 1}"#), 300);
+        assert_eq!(pr_refresh_ticks_from_json("\u{feff}{\"pr_refresh_secs\": 60}"), 600, "BOM stripped");
+    }
+
     /// `pane_title` never returns blank: it falls back to `%id` with no title/cwd, and an OSC 2
     /// title wins once set. (cwd fallback needs OSC 7 plumbing; the never-blank guarantee is the
     /// point.) Uses a console-free remote pane, so it runs under the default headless `cargo test`.
@@ -1348,6 +1495,7 @@ mod tests {
         let name =
             format!("gmux-subtest-serve-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
 
+        let (pr_tx, pr_rx) = channel();
         let server = Arc::new(Mutex::new(Server {
             session: Session::start("t", Pane::remote(1, 80, 24, Box::new(|_| {}))),
             shell: "pwsh".into(),
@@ -1359,6 +1507,10 @@ mod tests {
             progress: HashMap::new(),
             palette: Palette::default(),
             persist_screen: true,
+            pr_refresh_ticks: 0,
+            pr_cursor: 0,
+            pr_rx,
+            pr_tx,
         }));
         let subs: Arc<Mutex<Vec<(PipeStream, bool)>>> = Arc::new(Mutex::new(Vec::new()));
         let hs = server.clone();
@@ -1492,6 +1644,7 @@ mod tests {
         use gmux_mux::{Pane, Session};
         let pane = Pane::remote(1, 80, 24, Box::new(|_| {}));
         let pid = pane.id.0;
+        let (pr_tx, pr_rx) = channel();
         let mut server = Server {
             session: Session::start("t", pane),
             shell: "pwsh".into(),
@@ -1503,6 +1656,10 @@ mod tests {
             progress: HashMap::new(),
             palette: Palette::default(),
             persist_screen: true,
+            pr_refresh_ticks: 0,
+            pr_cursor: 0,
+            pr_rx,
+            pr_tx,
         };
         // Fill past the 24-row screen so the live bottom is real content (line "s29"), not blank
         // padding, giving representative offsets: "s29" is the live bottom (0), "s27" is 2 above.
@@ -1569,6 +1726,7 @@ mod tests {
     fn rename_window_sets_and_clears_custom_name() {
         use gmux_mux::{Pane, Session};
         let pane = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        let (pr_tx, pr_rx) = channel();
         let mut server = Server {
             session: Session::start("t", pane),
             shell: "pwsh".into(),
@@ -1580,6 +1738,10 @@ mod tests {
             progress: HashMap::new(),
             palette: Palette::default(),
             persist_screen: true,
+            pr_refresh_ticks: 0,
+            pr_cursor: 0,
+            pr_rx,
+            pr_tx,
         };
         let wid = server.session.windows()[0].id.0;
         assert_eq!(server.layout(800, 600).tabs[0].name, "shell", "derived name before rename");
@@ -1618,11 +1780,21 @@ mod tests {
         assert_eq!(resp.result, Some(ResultBody::Done));
         assert_eq!(server.layout(800, 600).tabs[0].color, None);
 
-        // SetPr sets a badge; an empty/unparseable status clears it.
-        let resp = server.handle(&Request { id: 9, call: Call::SetPr { id: wid, number: 42, status: "open".into() } });
+        // SetPr sets a badge (carrying the URL a click opens); an unparseable status clears it.
+        let url = Some("https://x.test/pull/42".to_string());
+        let resp = server.handle(&Request {
+            id: 9,
+            call: Call::SetPr { id: wid, number: 42, status: "open".into(), url: url.clone() },
+        });
         assert_eq!(resp.result, Some(ResultBody::Done));
-        assert_eq!(server.layout(800, 600).tabs[0].pr, Some((42, "open".into())));
-        let resp = server.handle(&Request { id: 10, call: Call::SetPr { id: wid, number: 42, status: "bogus".into() } });
+        assert_eq!(
+            server.layout(800, 600).tabs[0].pr,
+            Some(gmux_proto::PrWire { number: 42, status: "open".into(), url })
+        );
+        let resp = server.handle(&Request {
+            id: 10,
+            call: Call::SetPr { id: wid, number: 42, status: "bogus".into(), url: None },
+        });
         assert_eq!(resp.result, Some(ResultBody::Done));
         assert_eq!(server.layout(800, 600).tabs[0].pr, None, "an unparseable status clears the badge");
     }
@@ -1636,6 +1808,7 @@ mod tests {
         use gmux_mux::{Pane, Session};
         let pane = Pane::remote(1, 80, 24, Box::new(|_| {}));
         let pid = pane.id.0;
+        let (pr_tx, pr_rx) = channel();
         let mut server = Server {
             session: Session::start("t", pane),
             shell: "pwsh".into(),
@@ -1647,6 +1820,10 @@ mod tests {
             progress: HashMap::new(),
             palette: Palette::default(),
             persist_screen: true,
+            pr_refresh_ticks: 0,
+            pr_cursor: 0,
+            pr_rx,
+            pr_tx,
         };
         // OSC 52 set-clipboard: selection "c", base64("hello") == "aGVsbG8=".
         server.session.pane(PaneId(pid)).unwrap().push_output(b"\x1b]52;c;aGVsbG8=\x07");

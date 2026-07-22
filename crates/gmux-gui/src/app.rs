@@ -682,6 +682,9 @@ struct State {
     item_heights: Vec<f32>,
     /// Group headers the user has collapsed (by name; a group that disappears just drops out).
     collapsed_groups: HashSet<String>,
+    /// Per visible row: `(pr number, pr url, has a color rail)` from the last render — what a
+    /// click on the PR chip needs, since the rows themselves aren't kept.
+    row_pr: HashMap<usize, (u32, Option<String>, bool)>,
     /// Active sidebar tab rename (double-click a row), or `None`. While `Some`, all keyboard input
     /// edits the buffer instead of reaching the pane — mutually exclusive with `search`.
     rename: Option<RenameState>,
@@ -936,6 +939,7 @@ impl ApplicationHandler for App {
             item_meta: Vec::new(),
             item_heights: Vec::new(),
             collapsed_groups: HashSet::new(),
+            row_pr: HashMap::new(),
             rename: None,
             notifier,
             taskbar,
@@ -1782,6 +1786,10 @@ impl State {
                 self.sync_size();
                 self.window.request_redraw();
             } else if let Some(vi) = self.hit_row(cy) {
+                // A click on the PR chip opens the pull request instead of selecting the tab.
+                if self.open_pr_at(cx, cy, vi) {
+                    return;
+                }
                 let idx = self.real_tab(vi);
                 // A second click on the same row within CLICK_INTERVAL starts renaming that tab.
                 let now = Instant::now();
@@ -2569,6 +2577,30 @@ impl State {
         }
     }
 
+    /// If `(x, y)` landed on visible row `vi`'s PR chip and that badge carries a URL, open it and
+    /// report `true` (the caller then skips tab selection). A chip with no URL — a hand-set badge
+    /// — falls through to the normal row click rather than doing nothing surprising.
+    fn open_pr_at(&mut self, x: f64, y: f64, vi: usize) -> bool {
+        let Some((number, url, has_color)) = self.row_pr.get(&vi).cloned() else { return false };
+        let Some(url) = url else { return false };
+        let Some(item) = self
+            .item_meta
+            .iter()
+            .position(|m| matches!(m, ItemMeta::Row(i) if *i == vi))
+        else {
+            return false;
+        };
+        let top = self.renderer.sidebar_item_top(item, &self.item_heights);
+        if !self.renderer.pr_chip_hit(x as f32, y as f32, top, has_color, number) {
+            return false;
+        }
+        // Same scheme guard as OSC-8 links: only http(s) reaches explorer.exe.
+        if link_scheme_ok(&url) {
+            open_url(&url);
+        }
+        true
+    }
+
     /// The group name whose header sits under `y`, if any.
     fn hit_header(&self, y: f64) -> Option<String> {
         match self.renderer.sidebar_item_at(y as f32, &self.item_heights).and_then(|i| self.item_meta.get(i)) {
@@ -3029,7 +3061,7 @@ impl State {
                         Some(r) if r.id == t.id => format!("{}_", r.buffer),
                         _ => t.name.clone(),
                     };
-                    SidebarRow { name, branch: t.branch.clone(), attention: t.attention, unread: t.unread, color: t.color.clone(), busy: t.busy, pr: t.pr.clone(), active: t.active, progress: t.progress, progress_error: t.progress_error, hover: false }
+                    SidebarRow { name, branch: t.branch.clone(), attention: t.attention, unread: t.unread, color: t.color.clone(), busy: t.busy, pr: t.pr.as_ref().map(|p| (p.number, p.status.clone())), active: t.active, progress: t.progress, progress_error: t.progress_error, hover: false }
                 })
                 .collect();
             // Tab overflow: window the rows to what fits (wheel over the sidebar scrolls). The
@@ -3042,6 +3074,17 @@ impl State {
             groups = layout.tabs.iter().skip(off).take(cap).map(|t| t.group.clone()).collect();
             // Drives the spinner's wake cadence in `about_to_wait` — see `any_busy`.
             self.any_busy = layout.tabs.iter().any(|t| t.busy);
+            // What a click on a PR chip needs, keyed by VISIBLE row index (see `open_pr_at`).
+            self.row_pr = layout
+                .tabs
+                .iter()
+                .skip(off)
+                .take(cap)
+                .enumerate()
+                .filter_map(|(i, t)| {
+                    t.pr.as_ref().map(|p| (i, (p.number, p.url.clone(), t.color.is_some())))
+                })
+                .collect();
 
             // Update the taskbar attention badge / progress based on overall attention.
             if let Some(tb) = &self.taskbar {
