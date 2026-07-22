@@ -211,6 +211,23 @@ struct SettingsState {
 /// a colour picker.
 const ACCENT_CYCLE: &[&str] = &["default", "system", "#3b8ae6", "#8f7ae6", "#4bb58a", "#d98a4b", "#c9566d"];
 
+/// Choose the swapchain format: a **non-sRGB** one when the surface offers it.
+///
+/// The design tokens are authored as sRGB hex (`#0b0b0d`) and the shaders hand those bytes to the
+/// GPU as-is. On an `*Srgb` target the GPU treats them as *linear* and encodes them on the way out,
+/// which lifts every colour: `#0b0b0d` renders as mid-grey and the `#3b8ae6` accent as a pale
+/// `#84c2f4`. A plain UNORM target writes the bytes through untouched, which is what the tokens
+/// mean — and what the headless preview dumps (`Rgba8Unorm`) have always shown, so this also makes
+/// the previews an honest picture of the window. Pure/tested.
+fn pick_surface_format(formats: &[wgpu::TextureFormat]) -> wgpu::TextureFormat {
+    formats
+        .iter()
+        .copied()
+        .find(|f| !f.is_srgb())
+        .or_else(|| formats.first().copied())
+        .unwrap_or(wgpu::TextureFormat::Bgra8Unorm)
+}
+
 /// Rows the panel acts on by name. Every dispatch matches these rather than a row index, because
 /// the filter renumbers rows but never renames them.
 const RESET_KEYS_ROW: &str = "reset all bindings";
@@ -1264,7 +1281,7 @@ impl ApplicationHandler for App {
         .expect("request device");
 
         let caps = surface.get_capabilities(&adapter);
-        let format = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
+        let format = pick_surface_format(&caps.formats);
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .expect("surface default config");
@@ -5492,6 +5509,23 @@ mod tests {
                 SidebarItem::Row(r) => r.name.clone(),
             })
             .collect()
+    }
+
+    #[test]
+    fn the_swapchain_is_not_srgb_so_tokens_render_as_written() {
+        use wgpu::TextureFormat as F;
+        // Both offered (the normal DX12 case): take the UNORM one. On an sRGB target the GPU
+        // encodes the shader's output, so #0b0b0d would reach the screen as a mid-grey — which is
+        // exactly what shipped before this, and why the window never looked like the previews.
+        assert_eq!(pick_surface_format(&[F::Bgra8UnormSrgb, F::Bgra8Unorm]), F::Bgra8Unorm);
+        assert_eq!(pick_surface_format(&[F::Rgba8Unorm, F::Rgba8UnormSrgb]), F::Rgba8Unorm);
+        // Only sRGB on offer: use it rather than failing to configure a surface at all.
+        assert_eq!(pick_surface_format(&[F::Bgra8UnormSrgb]), F::Bgra8UnormSrgb);
+        // Empty capabilities (a driver reporting nothing) still yields a configurable format.
+        assert_eq!(pick_surface_format(&[]), F::Bgra8Unorm);
+        // The preview dumps render to this format; live and headless must agree, or every colour
+        // judgement made from a dump is a judgement about a different picture.
+        assert!(!pick_surface_format(&[F::Bgra8UnormSrgb, F::Bgra8Unorm]).is_srgb());
     }
 
     #[test]
