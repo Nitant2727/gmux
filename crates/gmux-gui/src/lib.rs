@@ -670,9 +670,13 @@ mod tests {
         let sv = crate::renderer::SettingsView {
             tabs: ["theme", "keys", "schemes", "accent", "font"].iter().map(|s| s.to_string()).collect(),
             tab: 1,
-            rows: crate::app::key_rows_for_preview(),
-            selected: 6, // the reset row, with its question staged
-            footer: crate::app::reset_prompt_for_preview().into(),
+            rows: crate::app::key_rows_for_preview()
+                .into_iter()
+                .filter(|r| crate::app::row_matches_filter(&r.label, Some(&r.value), "split"))
+                .collect(),
+            selected: 0,
+            query: Some("split".into()),
+            footer: "enter rebinds · del resets one · / filters · esc closes".into(),
         };
         r.render_frame(&view, &rows, sw, &[pane], w, h, "", false, drop_at, Some("ag"), Some(&sb), None, None, Some(&sv));
         let px = read_rgba(&r, &tex, w, h).expect("readback");
