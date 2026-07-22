@@ -168,6 +168,9 @@ USAGE:
                                        --command <raw> overrides the transport command line
   gmux browse <url | search terms...>  open a url — or web-search free text — in the system
                                        browser (--pane targets the in-app WebView2 pane)
+  gmux new-window [--cwd <dir>]        open a tab; --cwd anchors it as a workspace (every pane
+                                       in it, splits included, opens in that directory)
+  gmux workspace -t @<win> <dir>       re-anchor an existing workspace (--clear unpins it)
   gmux group -t @<win> <name...>       file a window under a collapsible sidebar group (--clear
                                        removes it); ids come from `gmux list-panes`
   gmux color -t @<win> #rrggbb         tag a workspace row with a color (--clear removes it)

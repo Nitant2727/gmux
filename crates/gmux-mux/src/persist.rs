@@ -46,6 +46,9 @@ pub struct WindowSnapshot {
     /// without one.
     #[serde(default)]
     pub pr: Option<PrRecord>,
+    /// The workspace's directory (every new pane opens here), reapplied on restore.
+    #[serde(default)]
+    pub workspace_dir: Option<String>,
 }
 
 /// A persisted pull-request badge.
@@ -163,6 +166,7 @@ impl WindowSnapshot {
             name: window.name().map(str::to_string),
             group: window.group().map(str::to_string),
             color: window.color().map(str::to_string),
+            workspace_dir: window.workspace_dir().map(str::to_string),
             pr: window.pr().map(|b| PrRecord {
                 number: b.number,
                 status: b.status.as_str().to_string(),
@@ -197,6 +201,9 @@ impl WindowSnapshot {
         }
         if let Some(color) = &self.color {
             window.set_color(color.clone());
+        }
+        if let Some(dir) = &self.workspace_dir {
+            window.set_workspace_dir(dir.clone());
         }
         if let Some(rec) = &self.pr {
             if let Some(status) = crate::PrStatus::parse(&rec.status) {
@@ -274,6 +281,7 @@ mod tests {
                 group: Some("api".into()),
                 color: Some("#ff8800".into()),
                 pr: Some(PrRecord { number: 42, status: "open".into(), url: None }),
+                workspace_dir: Some(r"C:\\proj".into()),
             }],
         };
         let json = serde_json::to_string(&snap).unwrap();

@@ -1371,7 +1371,8 @@ impl Renderer {
         if plus_hover {
             push_rounded(&mut rd, ROW_OUTER_PAD, plus_top, sw - ROW_OUTER_PAD, plus_top + ROW_H, RADIUS, rgba(SIDEBAR_ROW_HOVER), fw, fh);
         }
-        self.text_run("+ new tab", text_x, plus_top + (ROW_H - ch) / 2.0, rgba(TEXT_DIM), fw, fh, &mut gl);
+        // Says what it does: clicking it asks for a directory and opens it as a workspace.
+        self.text_run("+ open workspace", text_x, plus_top + (ROW_H - ch) / 2.0, rgba(TEXT_DIM), fw, fh, &mut gl);
 
         (bg, rd, gl)
     }
