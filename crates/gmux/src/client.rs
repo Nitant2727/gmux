@@ -50,9 +50,37 @@ fn print_result(body: &ResultBody) {
         ResultBody::Text(t) => println!("{t}"),
         ResultBody::PaneId(id) => println!("%{id}"),
         ResultBody::Busy(b) => println!("{b}"),
+        ResultBody::Imported { created, already_open, capped } => {
+            println!("imported {created} workspace(s)");
+            if *already_open > 0 {
+                println!("  {already_open} already open, skipped");
+            }
+            if *capped > 0 {
+                println!("  {capped} left out (import opens at most {MAX_IMPORT_HINT} at a time)");
+            }
+        }
         ResultBody::Layout(_) | ResultBody::Grid(_) | ResultBody::Notifications(_) | ResultBody::Browses(_) | ResultBody::Matches(_) => {} // not for the CLI
         ResultBody::Done => {}
     }
+}
+
+/// Mirrors the daemon's `MAX_IMPORT`, for the message only — the daemon enforces the real cap.
+const MAX_IMPORT_HINT: usize = 24;
+
+/// `gmux import <dir>`: ask the daemon to open a workspace per project folder, and report what it
+/// did. A non-existent directory is caught here so the user gets a clear message instead of a
+/// silent "imported 0".
+fn import_workspaces(dir: String, all: bool) -> i32 {
+    let path = std::path::Path::new(&dir);
+    if !path.is_dir() {
+        eprintln!("gmux import: not a directory: {dir}");
+        return 2;
+    }
+    // Absolute, so the daemon (whose cwd is its own) resolves the same folder the user meant.
+    let dir = std::fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().trim_start_matches(r"\\?\").to_string())
+        .unwrap_or(dir);
+    run(Call::ImportWorkspaces { dir, all })
 }
 
 fn print_panes(panes: &[PaneInfo]) {
@@ -548,6 +576,16 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
             // `--cwd <dir>` opens the window as a workspace anchored to that directory.
             let cwd = args.iter().position(|a| a == "--cwd").and_then(|i| args.get(i + 1)).cloned();
             Some(run(Call::NewWindow { command, cwd }))
+        }
+        "import" => {
+            // `gmux import <parent-dir> [--all]` opens one workspace per project folder inside.
+            let dir = args.iter().find(|a| !a.starts_with('-')).cloned();
+            let Some(dir) = dir else {
+                eprintln!("usage: gmux import <directory> [--all]   (default: only folders with a .git)");
+                return Some(2);
+            };
+            let all = args.iter().any(|a| a == "--all");
+            Some(import_workspaces(dir, all))
         }
         "workspace" => {
             // `gmux workspace -t @<win> <dir>` re-anchors an existing workspace; `--clear` unpins.
