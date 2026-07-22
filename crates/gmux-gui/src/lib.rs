@@ -408,6 +408,8 @@ mod tests {
             title: String::new(),
             selection: Some(((1, 0), (1, 0))),
             show_close: false,
+            drop_target: false,
+            dragging: false,
         };
         r.render_panes(&view, &[pv], w, h);
         let px = read_rgba(&r, &tex, w, h).expect("readback");
@@ -455,6 +457,8 @@ mod tests {
             title: String::new(),
             selection: None,
             show_close: false,
+            drop_target: false,
+            dragging: false,
         };
         // Band spans y in [h-31, h-9] (cy=MARGIN=8, border=1, SEARCH_BAR=22). Count TEXT-white
         // pixels there (the query glyphs) — none appear without a SearchBar.
@@ -649,6 +653,8 @@ mod tests {
             title: "powershell — build".into(),
             selection: None,
             show_close: true,
+            drop_target: false,
+            dragging: false,
         };
         let sb = SearchBar {
             label: "find:".into(),

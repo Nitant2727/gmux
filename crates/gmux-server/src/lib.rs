@@ -506,6 +506,14 @@ impl Server {
                 }
                 Response::ok(id, ResultBody::Done)
             }
+            Call::SwapPanes { a, b } => {
+                // Local layout only: a remote mirror's tree is owned by the remote tmux, and a
+                // local swap would be undone by its next %layout-change.
+                if let Some(w) = self.session.active_window_mut() {
+                    w.swap_panes(PaneId(*a), PaneId(*b));
+                }
+                Response::ok(id, ResultBody::Done)
+            }
             Call::ClosePaneId { pane } => {
                 // Focus it, then reuse the ClosePane path verbatim — including the remote-mirror
                 // round-trip and the "last pane closes the window" rule.
@@ -1496,6 +1504,52 @@ mod tests {
         assert!(!persist_screen_from_json("\u{feff}{\"persist_screen\": false}"), "BOM is stripped");
         // A non-bool value is ignored (defaults true), not coerced.
         assert!(persist_screen_from_json(r#"{"persist_screen": "no"}"#));
+    }
+
+    /// `SwapPanes` exchanges two panes' slots in the active window and leaves everything else
+    /// alone; unknown ids are a no-op. Console-free remote panes, so it runs headless.
+    #[test]
+    fn swap_panes_exchanges_slots() {
+        use gmux_mux::{Pane, Session};
+        let first = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        let first_id = first.id.0;
+        let (pr_tx, pr_rx) = channel();
+        let mut server = Server {
+            session: Session::start("t", first),
+            shell: "pwsh".into(),
+            last_view: (800, 600),
+            notifications: Vec::new(),
+            browse_requests: Vec::new(),
+            ticks: 0,
+            remotes: Vec::new(),
+            progress: HashMap::new(),
+            palette: Palette::default(),
+            persist_screen: true,
+            pr_refresh_ticks: 0,
+            pr_cursor: 0,
+            pr_rx,
+            pr_tx,
+        };
+        let second = Pane::remote(2, 80, 24, Box::new(|_| {}));
+        let second_id = second.id.0;
+        server.session.active_window_mut().unwrap().split(SplitDir::Horizontal, second);
+
+        // Pane order before: the split put `second` after `first`.
+        let order = |s: &Server| {
+            let mut ids = Vec::new();
+            s.session.active_window().unwrap().root().leaves(&mut ids);
+            ids.into_iter().map(|i| i.0).collect::<Vec<_>>()
+        };
+        assert_eq!(order(&server), vec![first_id, second_id]);
+
+        let resp = server.handle(&Request { id: 1, call: Call::SwapPanes { a: first_id, b: second_id } });
+        assert_eq!(resp.result, Some(ResultBody::Done));
+        assert_eq!(order(&server), vec![second_id, first_id], "the two traded places");
+        assert_eq!(server.session.pane_count(), 2, "and nothing was lost");
+
+        // An unknown id changes nothing.
+        server.handle(&Request { id: 2, call: Call::SwapPanes { a: first_id, b: 999_999 } });
+        assert_eq!(order(&server), vec![second_id, first_id]);
     }
 
     /// `ClosePaneId` closes the pane it names — not whichever happens to be active — and an

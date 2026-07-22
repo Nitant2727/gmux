@@ -176,6 +176,16 @@ struct Selection {
     end: (u16, u16),
 }
 
+/// A press on a pane's title strip that may become a pane rearrange once the cursor moves past the
+/// threshold. Dropping on another pane swaps the two.
+struct PaneDrag {
+    from: u64,
+    start: (f64, f64),
+    dragging: bool,
+    /// Pane currently under the cursor (the swap partner), if it isn't the dragged one.
+    over: Option<u64>,
+}
+
 /// A sidebar row press that may become a tab reorder once the cursor moves past the threshold.
 struct SidebarDrag {
     from_row: usize,
@@ -740,6 +750,8 @@ struct State {
     last_sidebar_click: Option<(usize, Instant)>,
     /// A sidebar row press that may turn into a tab reorder, or `None`.
     sidebar_drag: Option<SidebarDrag>,
+    /// A pane title-strip press that may turn into a pane rearrange, or `None`.
+    pane_drag: Option<PaneDrag>,
     /// The active window's pane rectangles from the last rendered layout (content-area coords, i.e.
     /// before the sidebar-width offset), cached each frame for mouse hit-testing.
     last_panes: Vec<PaneRectWire>,
@@ -1021,6 +1033,7 @@ impl ApplicationHandler for App {
             last_click: None,
             last_sidebar_click: None,
             sidebar_drag: None,
+            pane_drag: None,
             last_panes: Vec::new(),
             tab_count: 0,
             tab_ids: Vec::new(),
@@ -2070,6 +2083,15 @@ impl State {
         if self.close_pane_button_at(cx, cy) {
             return;
         }
+        // A press on the title strip itself arms a pane rearrange: dragging it onto another pane
+        // swaps the two. Selection must not start here — the strip is chrome, not cells.
+        if let Some(pane) = self.title_strip_at(cx, cy) {
+            self.clear_selection();
+            self.pane_drag = Some(PaneDrag { from: pane, start: (cx, cy), dragging: false, over: None });
+            self.client.control(Call::FocusPaneId { pane });
+            self.window.request_redraw();
+            return;
+        }
         // Content area: cached rects are in content-area coords, so shift the click by the sidebar.
         let content_x = cx - sidebar_w as f64;
         // A split gap starts a drag-resize instead of a selection/focus. A DOUBLE-click on the
@@ -2179,6 +2201,24 @@ impl State {
         }
         self.update_hover();
         let cy = self.cursor.1;
+        // A pane rearrange in flight: past the threshold, track which pane would receive the swap.
+        if self.pane_drag.is_some() {
+            let (cx, cy) = self.cursor;
+            let over = self.pane_under_cursor();
+            if let Some(pd) = self.pane_drag.as_mut() {
+                if !pd.dragging
+                    && ((cx - pd.start.0).abs() > 8.0 || (cy - pd.start.1).abs() > 8.0)
+                {
+                    pd.dragging = true;
+                }
+                let target = (pd.dragging && over != pd.from).then_some(over);
+                if pd.over != target {
+                    pd.over = target;
+                    self.window.request_redraw();
+                }
+            }
+            return;
+        }
         if self.sidebar_drag.is_some() {
             // Resolve the drop target on the way through so the indicator tracks the cursor; the
             // move itself still fires on release.
@@ -2244,6 +2284,16 @@ impl State {
     fn on_release(&mut self) {
         self.drag = None;
         self.scrollbar_drag = false;
+        // A pane dropped on another pane swaps the two; dropped anywhere else it just stays put
+        // (the press already focused it, which is the sensible no-op).
+        if let Some(pd) = self.pane_drag.take() {
+            if let Some(b) = pd.over.filter(|b| *b != pd.from) {
+                self.client.control(Call::SwapPanes { a: pd.from, b });
+                self.sync_size();
+                self.force_full = true;
+                self.window.request_redraw();
+            }
+        }
         if let Some(sd) = self.sidebar_drag.take() {
             if sd.reordering {
                 // `over` is what the indicator was showing; fall back to the cursor for a drag
@@ -2901,6 +2951,20 @@ impl State {
             open_url(&url);
         }
         true
+    }
+
+    /// The pane whose title strip contains `(x, y)`, if any. The strip is the band between the
+    /// pane's top border and its cell area — pressing it grabs the pane rather than its text.
+    fn title_strip_at(&self, x: f64, y: f64) -> Option<u64> {
+        let (sidebar_w, _, surf_h) = self.areas();
+        let surf_w = self.config.width;
+        self.last_panes
+            .iter()
+            .find(|p| {
+                let rect = Rect { x: p.x + sidebar_w, y: p.y, w: p.w, h: p.h };
+                self.renderer.title_strip_hit(x as f32, y as f32, rect, sidebar_w, surf_w, surf_h)
+            })
+            .map(|p| p.id)
     }
 
     /// If `(x, y)` landed on a pane's title-strip close button, close THAT pane and report `true`.
@@ -3665,6 +3729,8 @@ impl State {
                     // The active pane always offers its close button; others only while hovered,
                     // so a four-way split isn't four x's competing for attention.
                     show_close: *active || hovered_pane == Some(*id),
+                    drop_target: self.pane_drag.as_ref().and_then(|d| d.over) == Some(*id),
+                    dragging: self.pane_drag.as_ref().is_some_and(|d| d.dragging && d.from == *id),
                 }
             })
             .collect();

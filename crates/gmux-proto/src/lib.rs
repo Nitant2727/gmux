@@ -112,6 +112,14 @@ pub enum Call {
     FocusPane { dir: String },
     /// Close the active pane.
     ClosePane,
+    /// Swap two panes' positions in the active window's split tree (a pane drag-and-drop). The
+    /// split shape is unchanged — only which pane occupies which slot. Unknown ids are a no-op.
+    SwapPanes {
+        #[serde(default)]
+        a: u64,
+        #[serde(default)]
+        b: u64,
+    },
     /// Close a SPECIFIC pane by id (a click on that pane's close button). Focuses it first, so the
     /// daemon's close path and the layout that follows are the same ones `ClosePane` produces.
     /// An unknown id is a harmless no-op.
@@ -594,6 +602,7 @@ mod tests {
             Call::FocusPane { dir: "right".into() },
             Call::ClosePane,
             Call::ClosePaneId { pane: 9 },
+            Call::SwapPanes { a: 3, b: 4 },
             Call::ToggleZoom,
             Call::ResizeSplit { pane: 4, dx: 0.5, dy: -0.25 },
             Call::SwitchWindow { next: true },
