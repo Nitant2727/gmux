@@ -190,6 +190,10 @@ struct SettingsState {
     accent_preview: Option<String>,
     /// Inline `#rrggbb` entry on the accent tab's custom row, or `None` when not typing.
     hex: Option<String>,
+    /// A captured chord that already belongs to another action, and that action's name. Held
+    /// while the panel asks whether to take it; pressing the same chord again confirms.
+    conflict: Option<String>,
+    conflict_owner: Option<String>,
     /// Font size in force when the font picker started trying sizes on. Restored on Escape — the
     /// config's own value would undo a live `Ctrl+=` zoom the user made before opening the panel.
     font_before: Option<f32>,
@@ -234,17 +238,26 @@ fn is_hex_input(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c == '#' || c.is_ascii_hexdigit())
 }
 
-/// The font picker's rows as the preview dump draws them (the real ones come from `State`, which
-/// needs a window and a daemon). Kept beside `FONT_SIZES` so the two can't drift.
+/// The keys tab's rows as the preview dump draws them, with one conflict staged (the real ones
+/// come from `State`, which needs a window and a daemon).
 #[cfg(test)]
-pub(crate) fn font_rows_for_preview() -> Vec<SettingsRow> {
-    font_ladder(18.0)
+pub(crate) fn key_rows_for_preview() -> Vec<SettingsRow> {
+    let pairs: Vec<(String, String)> = [
+        ("split_h", "ctrl+shift+d"),
+        ("split_v", "ctrl+shift+e"),
+        ("close_pane", "ctrl+shift+d"), // the clash
+        ("toggle_zoom", "ctrl+shift+z"),
+        ("new_window", "ctrl+shift+t"),
+        ("command_palette", "ctrl+shift+p"),
+    ]
+    .iter()
+    .map(|(a, c)| (a.to_string(), c.to_string()))
+    .collect();
+    let clash = crate::config::conflict_flags(&pairs);
+    pairs
         .into_iter()
-        .map(|px| SettingsRow {
-            swatch: vec![crate::renderer::accent(); (px / 2.0).round() as usize],
-            label: format!("{px:.0} px"),
-            value: if px == 18.0 { "in use" } else { "" }.to_string(),
-        })
+        .zip(clash)
+        .map(|((label, value), warn)| SettingsRow { label, value, swatch: Vec::new(), warn })
         .collect()
 }
 
@@ -339,49 +352,6 @@ enum ItemMeta {
     Row(usize),
 }
 
-/// Format a pressed chord the way `gmux.json` writes it (`ctrl+shift+d`, `alt+left`), for the
-/// settings panel's rebinding capture. Returns `None` for a chord the config parser would reject —
-/// notably one with no modifier, which would swallow that key before it reached the pane. Mirrors
-/// the token vocabulary of `config::parse_chord`. Pure/tested.
-fn chord_string(mods: ModifiersState, key: &Key) -> Option<String> {
-    let mut parts = Vec::new();
-    if mods.control_key() {
-        parts.push("ctrl");
-    }
-    if mods.shift_key() {
-        parts.push("shift");
-    }
-    if mods.alt_key() {
-        parts.push("alt");
-    }
-    if mods.super_key() {
-        parts.push("super");
-    }
-    if parts.is_empty() {
-        return None; // a bare key would eat normal typing
-    }
-    let name = match key {
-        Key::Named(NamedKey::ArrowLeft) => "left".to_string(),
-        Key::Named(NamedKey::ArrowRight) => "right".to_string(),
-        Key::Named(NamedKey::ArrowUp) => "up".to_string(),
-        Key::Named(NamedKey::ArrowDown) => "down".to_string(),
-        Key::Named(NamedKey::PageUp) => "pageup".to_string(),
-        Key::Named(NamedKey::PageDown) => "pagedown".to_string(),
-        Key::Named(NamedKey::Home) => "home".to_string(),
-        Key::Named(NamedKey::End) => "end".to_string(),
-        Key::Character(c) => {
-            let c = c.to_lowercase();
-            // Only single characters are bindable; the parser reads one char per token.
-            if c.chars().count() != 1 {
-                return None;
-            }
-            c
-        }
-        _ => return None,
-    };
-    parts.push(&name);
-    Some(parts.join("+"))
-}
 
 /// Whether a workspace row survives the sidebar filter. Matches the same fuzzy subsequence the
 /// command palette uses, against the workspace NAME and its git BRANCH — filtering by branch is
@@ -1883,6 +1853,8 @@ impl State {
                     preview: None,
                     accent_preview: None,
                     hex: None,
+                    conflict: None,
+                    conflict_owner: None,
                     font_before: None,
                 });
                 self.window.request_redraw();
@@ -2552,6 +2524,7 @@ impl State {
             label: label.to_string(),
             value,
             swatch: Vec::new(),
+            warn: false,
         };
         let cfg = Config::load();
         if tab == 4 {
@@ -2565,6 +2538,7 @@ impl State {
                     swatch: vec![crate::renderer::accent(); (px / 2.0).round() as usize],
                     label: format!("{px:.0} px"),
                     value: if (px - self.font_px).abs() < 0.01 { "in use" } else { "" }.to_string(),
+                    warn: false,
                 })
                 .collect();
         }
@@ -2582,6 +2556,7 @@ impl State {
                     swatch: accent_swatch(name),
                     label: (*name).to_string(),
                     value: if name.eq_ignore_ascii_case(&cur) { "in use" } else { "" }.to_string(),
+                    warn: false,
                 })
                 .collect();
             // The custom row carries whatever hex is being typed, else the config's own accent when
@@ -2602,6 +2577,7 @@ impl State {
                 swatch,
                 label: "custom hex".to_string(),
                 value: if typing.is_some() { format!("{value}_") } else { value },
+                warn: false,
             });
             return rows;
         }
@@ -2619,6 +2595,7 @@ impl State {
                     swatch: swatch_rgb(name),
                     label: name.to_string(),
                     value: if name.eq_ignore_ascii_case(&current) { "in use" } else { "" }.to_string(),
+                    warn: false,
                 })
                 .collect();
         }
@@ -2638,6 +2615,7 @@ impl State {
                     swatch: swatch_rgb(&preset),
                     label: "color scheme".to_string(),
                     value: preset,
+                    warn: false,
                 },
                 plain("accent", accent),
                 plain("font size", format!("{:.0} px", self.font_px)),
@@ -2647,14 +2625,21 @@ impl State {
                 ),
             ]
         } else {
-            // Every bindable action with its CURRENT chord (config override, else the default).
+            // Every bindable action with its CURRENT chord (config override, else the default),
+            // with any chord two actions both claim marked — only one of them can fire.
             let overrides = cfg.keys.unwrap_or_default();
-            crate::config::default_bindings()
+            let pairs: Vec<(String, String)> = crate::config::default_bindings()
                 .iter()
                 .map(|(name, chord, _)| {
                     let cur = overrides.get(*name).cloned().unwrap_or_else(|| chord.to_string());
-                    plain(name, cur)
+                    ((*name).to_string(), cur)
                 })
+                .collect();
+            let clash = crate::config::conflict_flags(&pairs);
+            pairs
+                .into_iter()
+                .zip(clash)
+                .map(|((name, cur), warn)| SettingsRow { label: name, value: cur, swatch: Vec::new(), warn })
                 .collect()
         }
     }
@@ -2669,6 +2654,8 @@ impl State {
             if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
                 if let Some(st) = self.settings.as_mut() {
                     st.capturing = false;
+                    st.conflict = None;
+                    st.conflict_owner = None;
                 }
                 self.window.request_redraw();
                 return;
@@ -2680,24 +2667,43 @@ impl State {
                 return;
             }
             let (tab, sel) = (st.tab, st.sel);
-            if let Some(chord) = chord_string(mods, &event.logical_key) {
+            let staged = st.conflict.clone();
+            if let Some(chord) = crate::config::chord_string(mods, &event.logical_key) {
                 let rows = self.settings_rows(tab);
                 if let Some(row) = rows.get(sel) {
                     let action = row.label.clone();
-                    self.write_config(|cfg| {
-                        let keys = cfg
-                            .as_object_mut()
-                            .unwrap()
-                            .entry("keys")
-                            .or_insert_with(|| serde_json::json!({}));
-                        if let Some(map) = keys.as_object_mut() {
-                            map.insert(action, serde_json::Value::String(chord));
+                    let pairs: Vec<(String, String)> =
+                        rows.iter().map(|r| (r.label.clone(), r.value.clone())).collect();
+                    let owner = crate::config::chord_owner(&pairs, &chord, &action);
+                    // Only one action can own a chord, so taking it silently would leave the other
+                    // dead with nothing on screen saying so. Name it and wait for the same chord
+                    // again — the second press is the confirmation.
+                    match owner {
+                        Some(other) if staged.as_deref() != Some(chord.as_str()) => {
+                            if let Some(st) = self.settings.as_mut() {
+                                st.conflict = Some(chord);
+                                st.conflict_owner = Some(other);
+                            }
+                            self.window.request_redraw();
+                            return; // stay in capture: the next press decides
                         }
-                    });
+                        _ => self.write_config(|cfg| {
+                            let keys = cfg
+                                .as_object_mut()
+                                .unwrap()
+                                .entry("keys")
+                                .or_insert_with(|| serde_json::json!({}));
+                            if let Some(map) = keys.as_object_mut() {
+                                map.insert(action, serde_json::Value::String(chord));
+                            }
+                        }),
+                    }
                 }
             }
             if let Some(st) = self.settings.as_mut() {
                 st.capturing = false;
+                st.conflict = None;
+                st.conflict_owner = None;
             }
             self.window.request_redraw();
             return;
@@ -4578,7 +4584,9 @@ impl State {
                 tab: s.tab,
                 rows,
                 selected: sel,
-                footer: if s.capturing {
+                footer: if let (Some(c), Some(owner)) = (&s.conflict, &s.conflict_owner) {
+                    format!("{c} runs {owner} · press again to take · esc cancels")
+                } else if s.capturing {
                     "press the new chord  ·  esc cancels".into()
                 } else if s.tab == 4 {
                     "click or arrow to try  ·  enter keeps  ·  esc restores".into()
@@ -5168,18 +5176,18 @@ mod tests {
         use winit::keyboard::{Key, NamedKey};
         let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
         assert_eq!(
-            chord_string(ctrl_shift, &Key::Character("D".into())).as_deref(),
+            crate::config::chord_string(ctrl_shift, &Key::Character("D".into())).as_deref(),
             Some("ctrl+shift+d"),
             "captured chords are lowercased, like the config writes them"
         );
         assert_eq!(
-            chord_string(ModifiersState::ALT, &Key::Named(NamedKey::ArrowLeft)).as_deref(),
+            crate::config::chord_string(ModifiersState::ALT, &Key::Named(NamedKey::ArrowLeft)).as_deref(),
             Some("alt+left")
         );
         // A bare key is refused: binding it would swallow that key before the pane ever saw it.
-        assert_eq!(chord_string(ModifiersState::empty(), &Key::Character("q".into())), None);
+        assert_eq!(crate::config::chord_string(ModifiersState::empty(), &Key::Character("q".into())), None);
         // Keys the config parser has no token for are refused rather than written unparseably.
-        assert_eq!(chord_string(ctrl_shift, &Key::Named(NamedKey::F7)), None);
+        assert_eq!(crate::config::chord_string(ctrl_shift, &Key::Named(NamedKey::F7)), None);
 
         // The real contract: anything captured must parse back to the same binding.
         for (mods, key) in [
@@ -5187,7 +5195,7 @@ mod tests {
             (ModifiersState::ALT | ModifiersState::SHIFT, Key::Named(NamedKey::ArrowUp)),
             (ModifiersState::CONTROL, Key::Named(NamedKey::PageDown)),
         ] {
-            let chord = chord_string(mods, &key).expect("captured");
+            let chord = crate::config::chord_string(mods, &key).expect("captured");
             let km = crate::config::Keymap::build(&crate::config::Config {
                 keys: Some([("split_h".to_string(), chord.clone())].into_iter().collect()),
                 ..Default::default()

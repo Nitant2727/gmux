@@ -585,6 +585,81 @@ impl ChordKey {
     }
 }
 
+/// Format a pressed chord the way `gmux.json` writes it (`ctrl+shift+d`, `alt+left`), for the
+/// settings panel's rebinding capture. Returns `None` for a chord [`parse_chord`] would reject —
+/// notably one with no modifier, which would swallow that key before it reached the pane. Lives
+/// beside the parser so the two vocabularies cannot drift. Pure/tested.
+pub fn chord_string(mods: ModifiersState, key: &Key) -> Option<String> {
+    let mut parts = Vec::new();
+    if mods.control_key() {
+        parts.push("ctrl");
+    }
+    if mods.shift_key() {
+        parts.push("shift");
+    }
+    if mods.alt_key() {
+        parts.push("alt");
+    }
+    if mods.super_key() {
+        parts.push("super");
+    }
+    if parts.is_empty() {
+        return None; // a bare key would eat normal typing
+    }
+    let name = match key {
+        Key::Named(NamedKey::ArrowLeft) => "left".to_string(),
+        Key::Named(NamedKey::ArrowRight) => "right".to_string(),
+        Key::Named(NamedKey::ArrowUp) => "up".to_string(),
+        Key::Named(NamedKey::ArrowDown) => "down".to_string(),
+        Key::Named(NamedKey::PageUp) => "pageup".to_string(),
+        Key::Named(NamedKey::PageDown) => "pagedown".to_string(),
+        Key::Named(NamedKey::Home) => "home".to_string(),
+        Key::Named(NamedKey::End) => "end".to_string(),
+        Key::Character(c) => {
+            let c = c.to_lowercase();
+            // Only single characters are bindable; the parser reads one char per token.
+            if c.chars().count() != 1 {
+                return None;
+            }
+            c
+        }
+        _ => return None,
+    };
+    parts.push(&name);
+    Some(parts.join("+"))
+}
+
+/// A chord in canonical form: `"Shift+CTRL+D"` and `"ctrl+shift+d"` are the same binding, and
+/// comparing the raw strings would miss it. `None` for anything the parser rejects.
+pub fn normalize_chord(s: &str) -> Option<String> {
+    let (mods, key) = parse_chord(s)?;
+    chord_string(mods, &key)
+}
+
+/// Which of `bindings` (`(action, chord)`, in row order) collide: index-aligned flags, `true` where
+/// this row's chord is claimed by another row too. Only ONE of them can actually fire — the map is
+/// keyed by chord — so both ends of a collision are flagged; the panel paints them, and a capture
+/// asks before creating one. Unparseable chords are never flagged as colliding, since they bind
+/// nothing at all. Pure/tested.
+pub fn conflict_flags(bindings: &[(String, String)]) -> Vec<bool> {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let norm: Vec<Option<String>> = bindings.iter().map(|(_, c)| normalize_chord(c)).collect();
+    for chord in norm.iter().flatten() {
+        *seen.entry(chord.clone()).or_default() += 1;
+    }
+    norm.iter().map(|c| c.as_ref().is_some_and(|c| seen[c] > 1)).collect()
+}
+
+/// The action a chord already runs, other than `except`. What the panel warns with before a
+/// rebind takes a chord away from something else.
+pub fn chord_owner(bindings: &[(String, String)], chord: &str, except: &str) -> Option<String> {
+    let want = normalize_chord(chord)?;
+    bindings
+        .iter()
+        .find(|(name, c)| name != except && normalize_chord(c).as_deref() == Some(want.as_str()))
+        .map(|(name, _)| name.clone())
+}
+
 /// The compiled-in default bindings — `(action_name, chord, action)` — for the command palette's
 /// action list. ponytail: the palette shows DEFAULT chords even when a user rebound one (the
 /// action still runs; only the hint could be stale).
@@ -799,6 +874,33 @@ mod tests {
         let theme = cfg.theme.as_ref().unwrap();
         assert!(theme.fg.is_none() && theme.bg.is_none() && theme.preset.is_none());
         assert_eq!(cfg.palette(), DEFAULT_PALETTE);
+    }
+
+    #[test]
+    fn chords_that_collide_are_found_however_they_are_written() {
+        let b = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs.iter().map(|(a, c)| (a.to_string(), c.to_string())).collect()
+        };
+
+        // The defaults ship clean — this is the regression guard for adding a new binding.
+        let defaults = b(&DEFAULTS.iter().map(|(n, c, _)| (*n, *c)).collect::<Vec<_>>());
+        assert!(!conflict_flags(&defaults).contains(&true), "the built-in bindings must not clash");
+
+        // Both ends of a collision are flagged, not just the loser: only one can fire, and which
+        // one is not something the user should have to know.
+        let rows = b(&[("split_h", "ctrl+shift+d"), ("split_v", "ctrl+shift+e"), ("close_pane", "CTRL+Shift+D")]);
+        assert_eq!(conflict_flags(&rows), vec![true, false, true], "order and case don't hide a clash");
+
+        // Unparseable chords bind nothing, so two of them are not "the same binding".
+        let junk = b(&[("split_h", "nonsense"), ("split_v", "nonsense")]);
+        assert_eq!(conflict_flags(&junk), vec![false, false]);
+
+        // What the capture warning names — the OTHER action holding the chord, never the one being
+        // rebound (which would warn about a chord conflicting with itself).
+        assert_eq!(chord_owner(&rows, "ctrl+shift+d", "close_pane").as_deref(), Some("split_h"));
+        assert_eq!(chord_owner(&rows, "Shift+Ctrl+D", "close_pane").as_deref(), Some("split_h"));
+        assert_eq!(chord_owner(&rows, "ctrl+shift+e", "split_v"), None, "a row never owns against itself");
+        assert_eq!(chord_owner(&rows, "ctrl+alt+9", "split_h"), None, "a free chord has no owner");
     }
 
     #[test]

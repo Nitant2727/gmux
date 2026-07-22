@@ -669,10 +669,10 @@ mod tests {
         // Settings panel over the frame, as Ctrl+, shows it.
         let sv = crate::renderer::SettingsView {
             tabs: ["theme", "keys", "schemes", "accent", "font"].iter().map(|s| s.to_string()).collect(),
-            tab: 4,
-            rows: crate::app::font_rows_for_preview(),
-            selected: 8,
-            footer: "click or arrow to try  ·  enter keeps  ·  esc restores".into(),
+            tab: 1,
+            rows: crate::app::key_rows_for_preview(),
+            selected: 2,
+            footer: "ctrl+shift+d runs split_h · press again to take · esc cancels".into(),
         };
         r.render_frame(&view, &rows, sw, &[pane], w, h, "", false, drop_at, Some("ag"), Some(&sb), None, None, Some(&sv));
         let px = read_rgba(&r, &tex, w, h).expect("readback");

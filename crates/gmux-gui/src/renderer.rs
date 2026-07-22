@@ -378,11 +378,14 @@ fn settings_tab_index(x: f32, y: f32, tabs: &[String], rows: usize, cw_cell: f32
 
 /// One settings row: a label on the left, a value on the right, and an optional colour ribbon
 /// previewing what the value means (a terminal scheme's background, six ANSI colours, foreground).
+#[derive(Default)]
 pub struct SettingsRow {
     pub label: String,
     pub value: String,
     /// Colours to draw as a ribbon at the row's right edge. Empty = a plain value row.
     pub swatch: Vec<Rgb>,
+    /// Draw the value as a problem (a chord two actions both claim), not as a setting.
+    pub warn: bool,
 }
 
 /// The settings overlay (Ctrl+,): a centered panel with a tab strip and a list of
@@ -1974,7 +1977,15 @@ impl Renderer {
                     right = x0 - 10.0;
                 }
                 let vw = row.value.chars().count() as f32 * cw_cell;
-                let ink = if i == sv.selected { accent() } else { TEXT_DIM };
+                // A conflicting chord stays red even under the selection: it is a problem with the
+                // row, not a property of which row you happen to be on.
+                let ink = if row.warn {
+                    ERROR
+                } else if i == sv.selected {
+                    accent()
+                } else {
+                    TEXT_DIM
+                };
                 self.text_run(&row.value, (right - vw).max(px + SET_PAD), ry + 4.0, rgba(ink), fw, fh, &mut ogl);
             }
             // Footer hints, pinned to the card's bottom edge. Clipped to the card: hints grow with
