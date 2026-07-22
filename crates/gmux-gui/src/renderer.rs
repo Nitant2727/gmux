@@ -1111,6 +1111,32 @@ impl Renderer {
         items.iter().map(SidebarItem::height).collect()
     }
 
+    /// The top edge of item `index`, walking the same sequence the hit-tests do.
+    pub fn sidebar_item_top(&self, index: usize, heights: &[f32]) -> f32 {
+        let mut top = SIDEBAR_PAD_TOP + self.cell_h() as f32 + 8.0;
+        for h in heights.iter().take(index) {
+            top += h + ROW_GAP;
+        }
+        top
+    }
+
+    /// Whether `(x, y)` lands on the PR chip of a row whose top edge is `row_top`. `has_color` is
+    /// whether the row also draws a tag rail (which shifts the chip right). Mirrors exactly what
+    /// `build_sidebar` lays out, so the clickable area is the drawn area.
+    pub fn pr_chip_hit(&self, x: f32, y: f32, row_top: f32, has_color: bool, number: u32) -> bool {
+        let ch = self.cell_h() as f32;
+        let cw = self.cell_w() as f32;
+        let pad_v = ROW_PAD_V.min(((ROW_H - 2.0 * ch) / 2.0).max(2.0));
+        let line2 = row_top + pad_v + ch;
+        let mut x0 = ROW_OUTER_PAD + ROW_PAD_H;
+        if has_color {
+            x0 += COLOR_RAIL_W + COLOR_RAIL_INSET;
+        }
+        let w = (format!("#{number}").chars().count() as f32) * cw + 2.0 * BADGE_PAD_H;
+        let (y0, y1) = (line2 - BADGE_PAD_V, line2 + ch + BADGE_PAD_V);
+        x >= x0 && x < x0 + w && y >= y0 && y < y1
+    }
+
     pub fn sidebar_width(&self) -> u32 {
         SIDEBAR_W
     }

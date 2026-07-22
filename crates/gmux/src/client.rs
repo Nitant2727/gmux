@@ -82,9 +82,9 @@ fn parse_window(s: &str) -> Option<u64> {
 /// daemon — so the daemon stays free of network calls and timers. `None` if `gh` is missing/
 /// unauthenticated, there's no PR, or the JSON can't be parsed. The parse is dependency-free
 /// (serde isn't a dep of the gmux binary): it scavenges the three fields from the flat object.
-fn resolve_pr_via_gh() -> Option<(u32, String)> {
+fn resolve_pr_via_gh() -> Option<(u32, String, Option<String>)> {
     let out = std::process::Command::new("gh")
-        .args(["pr", "view", "--json", "number,state,isDraft"])
+        .args(["pr", "view", "--json", "number,state,isDraft,url"])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -95,7 +95,7 @@ fn resolve_pr_via_gh() -> Option<(u32, String)> {
     let state = json_string(&json, "state")?;
     let is_draft = json.contains("\"isDraft\":true") || json.contains("\"isDraft\": true");
     let status = gmux_status_from_github(&state, is_draft)?;
-    Some((number, status.to_string()))
+    Some((number, status.to_string(), json_string(&json, "url")))
 }
 
 /// Extract `"key":<digits>` from a flat JSON object.
@@ -508,11 +508,11 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
                 return Some(2);
             };
             if args.iter().any(|a| a == "--clear") {
-                return Some(run(Call::SetPr { id, number: 0, status: String::new() }));
+                return Some(run(Call::SetPr { id, number: 0, status: String::new(), url: None }));
             }
             if args.iter().any(|a| a == "--resolve") {
                 return Some(match resolve_pr_via_gh() {
-                    Some((number, status)) => run(Call::SetPr { id, number, status }),
+                    Some((number, status, url)) => run(Call::SetPr { id, number, status, url }),
                     None => {
                         eprintln!("gmux pr: no PR found for the current branch (is `gh` installed and authenticated?)");
                         1
@@ -534,7 +534,9 @@ pub fn dispatch(cmd: &str, args: &[String]) -> Option<i32> {
                 eprintln!("gmux pr: status must be open, draft, merged, or closed");
                 return Some(2);
             }
-            Some(run(Call::SetPr { id, number: num, status: status.to_string() }))
+            // An optional third word is the PR page, so a hand-set badge can be clickable too.
+            let url = words.get(2).map(|u| u.to_string());
+            Some(run(Call::SetPr { id, number: num, status: status.to_string(), url }))
         }
         "split-pane" => {
             let dir = if args.iter().any(|a| a == "-v") { "v" } else { "h" }.to_string();

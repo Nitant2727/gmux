@@ -42,10 +42,21 @@ pub struct WindowSnapshot {
     /// Workspace tag color (`#rrggbb`), reapplied on restore. `#[serde(default)]` for older files.
     #[serde(default)]
     pub color: Option<String>,
-    /// A pull-request badge `(number, status_token)`, reapplied on restore. `#[serde(default)]` so
-    /// older snapshots load without one.
+    /// A pull-request badge, reapplied on restore. `#[serde(default)]` so older snapshots load
+    /// without one.
     #[serde(default)]
-    pub pr: Option<(u32, String)>,
+    pub pr: Option<PrRecord>,
+}
+
+/// A persisted pull-request badge.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PrRecord {
+    pub number: u32,
+    /// `open` / `draft` / `merged` / `closed`.
+    pub status: String,
+    /// The PR page, when the badge was resolved with one.
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -152,7 +163,11 @@ impl WindowSnapshot {
             name: window.name().map(str::to_string),
             group: window.group().map(str::to_string),
             color: window.color().map(str::to_string),
-            pr: window.pr().map(|b| (b.number, b.status.as_str().to_string())),
+            pr: window.pr().map(|b| PrRecord {
+                number: b.number,
+                status: b.status.as_str().to_string(),
+                url: b.url.clone(),
+            }),
         })
     }
 
@@ -183,9 +198,13 @@ impl WindowSnapshot {
         if let Some(color) = &self.color {
             window.set_color(color.clone());
         }
-        if let Some((number, status)) = &self.pr {
-            if let Some(status) = crate::PrStatus::parse(status) {
-                window.set_pr(Some(crate::PrBadge { number: *number, status }));
+        if let Some(rec) = &self.pr {
+            if let Some(status) = crate::PrStatus::parse(&rec.status) {
+                window.set_pr(Some(crate::PrBadge {
+                    number: rec.number,
+                    status,
+                    url: rec.url.clone(),
+                }));
             }
         }
         Ok(window)
@@ -254,7 +273,7 @@ mod tests {
                 name: Some("backend".into()),
                 group: Some("api".into()),
                 color: Some("#ff8800".into()),
-                pr: Some((42, "open".into())),
+                pr: Some(PrRecord { number: 42, status: "open".into(), url: None }),
             }],
         };
         let json = serde_json::to_string(&snap).unwrap();
@@ -280,7 +299,7 @@ mod tests {
         win.set_name("backend".to_string());
         win.set_group("api".to_string());
         win.set_color("#ff8800".to_string());
-        win.set_pr(Some(crate::PrBadge { number: 42, status: crate::PrStatus::Draft }));
+        win.set_pr(Some(crate::PrBadge { number: 42, status: crate::PrStatus::Draft, url: Some("https://x.test/pull/42".into()) }));
         let session = Session::from_windows("s", vec![win], 0);
 
         let snap = SessionSnapshot::capture(&session);
@@ -304,8 +323,12 @@ mod tests {
         assert_eq!(restored.windows()[0].color(), Some("#ff8800"), "and so does the tag color");
         assert_eq!(
             restored.windows()[0].pr(),
-            Some(crate::PrBadge { number: 42, status: crate::PrStatus::Draft }),
-            "and the PR badge, so it need not be re-resolved every launch"
+            Some(&crate::PrBadge {
+                number: 42,
+                status: crate::PrStatus::Draft,
+                url: Some("https://x.test/pull/42".into()),
+            }),
+            "the PR badge survives too — including its URL, so the chip stays clickable"
         );
 
         // A window with no override captures None and restores to the derived name ("shell").

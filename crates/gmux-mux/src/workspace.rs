@@ -49,11 +49,13 @@ impl PrStatus {
     }
 }
 
-/// A pull request badge for a workspace: its number and state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A pull request badge for a workspace: its number, state, and (when known) the page to open when
+/// the chip is clicked. `url` is `None` for a hand-set badge that didn't supply one.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrBadge {
     pub number: u32,
     pub status: PrStatus,
+    pub url: Option<String>,
 }
 
 /// A snapshot of a window's sidebar metadata.
