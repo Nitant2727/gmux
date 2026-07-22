@@ -89,6 +89,10 @@ No more splitting into whatever directory the daemon happened to start in.
 From the CLI: `gmux new-window --cwd <dir>` opens one, and `gmux workspace -t @2 <dir>` re-anchors
 an existing workspace (`--clear` unpins it). `Ctrl+Shift+T` still opens a plain unanchored tab.
 
+**Reordering.** Drag a sidebar row to move it: a line shows where it will land and the dragged row
+fades while it's in flight. Dropping onto a row inside a group (or onto the group's header) files
+the workspace into that group; dropping it among the ungrouped rows takes it back out.
+
 **Renaming and closing.** Double-click a sidebar row to rename it inline (`Ctrl+Shift+R` renames
 the active one); the name is persisted. Hovering a row reveals a close button at its right edge —
 click it, middle-click the row, or press `Ctrl+Shift+Q`. Closing a workspace whose panes are
