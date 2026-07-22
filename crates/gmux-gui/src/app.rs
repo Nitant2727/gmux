@@ -181,6 +181,9 @@ struct SidebarDrag {
     from_row: usize,
     start_y: f64,
     reordering: bool,
+    /// Sidebar item index the drop would land on (`item_meta.len()` = past the end), tracked while
+    /// dragging so the renderer can show the indicator before the user commits.
+    over: Option<usize>,
 }
 
 /// The pane id from a toast launch arg ("pane=5" -> 5); `None` for non-pane args ("welcome").
@@ -233,6 +236,37 @@ enum ItemMeta {
     Header(String),
     /// A workspace row, carrying its index among the VISIBLE rows (already windowed).
     Row(usize),
+}
+
+/// What a reorder drop onto sidebar item `over` means: `(visible row index to move to, the group
+/// to file the dragged window under)`.
+///
+/// Grouping reorders rows visually, so "where it looks like it will land" and "the daemon's tab
+/// order" are different things — the drop target's own group is what the gesture should mean.
+/// Dropping on a header files the window into that group and lands it on the group's first member,
+/// stopping at the next header so an EMPTY group can't borrow a neighbour's row. Past the end
+/// appends, ungrouped. Pure/tested.
+fn drop_decision(
+    meta: &[ItemMeta],
+    row_groups: &[Option<String>],
+    row_count: usize,
+    over: usize,
+) -> (usize, Option<String>) {
+    match meta.get(over) {
+        Some(ItemMeta::Row(vi)) => (*vi, row_groups.get(*vi).cloned().flatten()),
+        Some(ItemMeta::Header(g)) => {
+            let first = meta[over + 1..]
+                .iter()
+                .take_while(|m| matches!(m, ItemMeta::Row(_)))
+                .find_map(|m| match m {
+                    ItemMeta::Row(vi) => Some(*vi),
+                    ItemMeta::Header(_) => None,
+                })
+                .unwrap_or(row_count.saturating_sub(1));
+            (first, Some(g.clone()))
+        }
+        None => (row_count.saturating_sub(1), None),
+    }
 }
 
 /// Fold `rows` (with each row's group) into the renderer's item list plus the parallel meta list.
@@ -707,6 +741,8 @@ struct State {
     tab_names: Vec<String>,
     /// Index of the active tab from the last layout — what the keyboard rename/close act on.
     active_tab: usize,
+    /// Each visible row's group from the last render, so a drop can tell which group it landed in.
+    row_groups: Vec<Option<String>>,
     /// What each rendered sidebar item was, from the last render — mouse handlers run between
     /// renders, so they hit-test against this rather than rebuilding the list.
     item_meta: Vec<ItemMeta>,
@@ -973,6 +1009,7 @@ impl ApplicationHandler for App {
             tab_ids: Vec::new(),
             tab_names: Vec::new(),
             active_tab: 0,
+            row_groups: Vec::new(),
             item_meta: Vec::new(),
             item_heights: Vec::new(),
             collapsed_groups: HashSet::new(),
@@ -1980,7 +2017,8 @@ impl State {
                 self.set_scroll(self.active_pane, 0);
                 self.client.control(Call::SelectWindow { index: idx });
                 // Arm a tab reorder: a >8px vertical drag before release turns into a MoveWindow.
-                self.sidebar_drag = Some(SidebarDrag { from_row: idx, start_y: cy, reordering: false });
+                self.sidebar_drag =
+                    Some(SidebarDrag { from_row: idx, start_y: cy, reordering: false, over: None });
                 self.window.request_redraw();
             } else if let Some(group) = self.hit_header(cy) {
                 // A click on a group header folds/unfolds it. Collapse state is GUI-local: the
@@ -2101,9 +2139,18 @@ impl State {
         }
         self.update_hover();
         let cy = self.cursor.1;
-        if let Some(sd) = self.sidebar_drag.as_mut() {
-            if !sd.reordering && (cy - sd.start_y).abs() > 8.0 {
-                sd.reordering = true; // no visual feedback required; MoveWindow fires on release
+        if self.sidebar_drag.is_some() {
+            // Resolve the drop target on the way through so the indicator tracks the cursor; the
+            // move itself still fires on release.
+            let over = self.drop_target(cy);
+            if let Some(sd) = self.sidebar_drag.as_mut() {
+                if !sd.reordering && (cy - sd.start_y).abs() > 8.0 {
+                    sd.reordering = true;
+                }
+                if sd.reordering && sd.over != over {
+                    sd.over = over;
+                    self.window.request_redraw();
+                }
             }
             return;
         }
@@ -2159,14 +2206,10 @@ impl State {
         self.scrollbar_drag = false;
         if let Some(sd) = self.sidebar_drag.take() {
             if sd.reordering {
-                let target = self.hit_row(self.cursor.1).map(|vi| self.real_tab(vi));
-                if let Some(to) = target {
-                    if to != sd.from_row {
-                        self.client.control(Call::MoveWindow { from: sd.from_row, to });
-                        self.sync_size();
-                        self.window.request_redraw();
-                    }
-                }
+                // `over` is what the indicator was showing; fall back to the cursor for a drag
+                // that never produced a move event after crossing the threshold.
+                let target = sd.over.or_else(|| self.drop_target(self.cursor.1));
+                self.finish_reorder(sd.from_row, target);
             }
         }
         if self.sel_dragging {
@@ -2814,6 +2857,56 @@ impl State {
         true
     }
 
+    /// Which sidebar item a drop at `y` would land on: an item index, `item_meta.len()` for a drop
+    /// past the last item, or `None` above the list. Gaps between items resolve to the item below,
+    /// so the indicator never blinks out while the cursor crosses a boundary.
+    fn drop_target(&self, y: f64) -> Option<usize> {
+        if self.item_meta.is_empty() {
+            return None;
+        }
+        if let Some(i) = self.renderer.sidebar_item_at(y as f32, &self.item_heights) {
+            return Some(i);
+        }
+        let top = self.renderer.sidebar_item_top(0, &self.item_heights);
+        if (y as f32) < top {
+            return None; // above the first row (the "WORKSPACES" label)
+        }
+        let end = self.renderer.sidebar_item_top(self.item_meta.len(), &self.item_heights);
+        if (y as f32) >= end {
+            return Some(self.item_meta.len()); // past the last item: append
+        }
+        // In a gap: the item whose top edge is the next one down.
+        (0..self.item_meta.len())
+            .find(|i| self.renderer.sidebar_item_top(*i, &self.item_heights) > y as f32)
+            .or(Some(self.item_meta.len()))
+    }
+
+    /// Apply a finished reorder drag: move the window and, if it was dropped into (or out of) a
+    /// group, re-file it. Grouping reorders rows visually, so "where it looks like it will land"
+    /// and "the daemon's tab index" are different things — the target's own group is what the drop
+    /// should mean.
+    fn finish_reorder(&mut self, from_row: usize, over: Option<usize>) {
+        let Some(over) = over else { return };
+        let Some(&win) = self.tab_ids.get(from_row) else { return };
+        let from_group = self.row_groups.get(from_row).cloned().flatten();
+
+        let (to_vi, to_group) =
+            drop_decision(&self.item_meta, &self.row_groups, self.row_groups.len(), over);
+        let to_row = self.real_tab(to_vi);
+
+        if to_group != from_group {
+            self.client.control(Call::GroupWindow {
+                id: win,
+                group: to_group.unwrap_or_default(),
+            });
+        }
+        if to_row != from_row {
+            self.client.control(Call::MoveWindow { from: from_row, to: to_row });
+        }
+        self.sync_size();
+        self.window.request_redraw();
+    }
+
     /// The group name whose header sits under `y`, if any.
     fn hit_header(&self, y: f64) -> Option<String> {
         match self.renderer.sidebar_item_at(y as f32, &self.item_heights).and_then(|i| self.item_meta.get(i)) {
@@ -3271,7 +3364,7 @@ impl State {
                         Some(r) if r.id == t.id => format!("{}_", r.buffer),
                         _ => t.name.clone(),
                     };
-                    SidebarRow { name, branch: t.branch.clone(), attention: t.attention, unread: t.unread, color: t.color.clone(), busy: t.busy, pr: t.pr.as_ref().map(|p| (p.number, p.status.clone())), active: t.active, progress: t.progress, progress_error: t.progress_error, hover: false }
+                    SidebarRow { name, branch: t.branch.clone(), attention: t.attention, unread: t.unread, color: t.color.clone(), busy: t.busy, dragging: false, pr: t.pr.as_ref().map(|p| (p.number, p.status.clone())), active: t.active, progress: t.progress, progress_error: t.progress_error, hover: false }
                 })
                 .collect();
             // Tab overflow: window the rows to what fits (wheel over the sidebar scrolls). The
@@ -3282,6 +3375,7 @@ impl State {
                 rows = rows.into_iter().skip(off).take(cap).collect();
             }
             groups = layout.tabs.iter().skip(off).take(cap).map(|t| t.group.clone()).collect();
+            self.row_groups = groups.clone();
             // Drives the spinner's wake cadence in `about_to_wait` — see `any_busy`.
             self.any_busy = layout.tabs.iter().any(|t| t.busy);
             // What a click on a PR chip needs, keyed by VISIBLE row index (see `open_pr_at`).
@@ -3451,6 +3545,14 @@ impl State {
                 row.hover = true;
             }
         }
+        // Fade the row being dragged so the drop indicator reads as its destination. `from_row` is
+        // a real tab index; the rows here are the scrolled window of them.
+        if let Some(from) = self.sidebar_drag.as_ref().filter(|d| d.reordering).map(|d| d.from_row) {
+            let off = self.sidebar_window().0;
+            if let Some(row) = from.checked_sub(off).and_then(|vi| rows.get_mut(vi)) {
+                row.dragging = true;
+            }
+        }
         // Fold the rows under their group headers, then cache what was drawn so the mouse handlers
         // (which run between renders) hit-test the same list.
         let (items, meta) = sidebar_items(rows, &groups, &self.collapsed_groups, hover_item);
@@ -3551,6 +3653,7 @@ impl State {
             h,
             empty_msg,
             plus_hover,
+            self.sidebar_drag.as_ref().filter(|d| d.reordering).and_then(|d| d.over),
             search_bar.as_ref(),
             self.preedit.as_deref(),
             palette_view.as_ref(),
@@ -4026,6 +4129,7 @@ mod tests {
             unread,
             color: None,
             busy: false,
+            dragging: false,
             pr: None,
             active: false,
             hover: false,
@@ -4042,6 +4146,37 @@ mod tests {
                 SidebarItem::Row(r) => r.name.clone(),
             })
             .collect()
+    }
+
+    #[test]
+    fn drop_target_carries_the_group_it_landed_in() {
+        // Sidebar: [a] [#api] [b] — a is ungrouped, b is in "api".
+        let meta = vec![ItemMeta::Row(0), ItemMeta::Header("api".into()), ItemMeta::Row(1)];
+        let groups = vec![None, Some("api".to_string())];
+
+        // Dropping on a grouped row files the dragged window into that group...
+        assert_eq!(drop_decision(&meta, &groups, 2, 2), (1, Some("api".into())));
+        // ...dropping on the header does too, landing on its first member.
+        assert_eq!(drop_decision(&meta, &groups, 2, 1), (1, Some("api".into())));
+        // ...and dropping on an ungrouped row takes it back out of the group.
+        assert_eq!(drop_decision(&meta, &groups, 2, 0), (0, None));
+        // Past the end appends, ungrouped.
+        assert_eq!(drop_decision(&meta, &groups, 2, 3), (1, None));
+    }
+
+    #[test]
+    fn drop_on_an_empty_group_header_does_not_borrow_a_foreign_row() {
+        // [#api (empty)] [#web] [row in web]: the header's "first member" lookup must stop at the
+        // next header instead of walking into web's row.
+        let meta = vec![
+            ItemMeta::Header("api".into()),
+            ItemMeta::Header("web".into()),
+            ItemMeta::Row(0),
+        ];
+        let groups = vec![Some("web".to_string())];
+        let (to, group) = drop_decision(&meta, &groups, 1, 0);
+        assert_eq!(group, Some("api".into()), "the drop still files it under the empty group");
+        assert_eq!(to, 0, "and falls back to the last row rather than web's member by accident");
     }
 
     #[test]

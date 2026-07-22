@@ -57,6 +57,8 @@ const BADGE_PAD_V: f32 = 1.0;
 const RADIUS: f32 = 6.0; // rounded corner radius for sidebar rows + pane chrome
 const GLOW_W: f32 = 4.0; // accent focus glow around the active pane (must stay < MARGIN)
 const PROGRESS_RAIL: f32 = 3.0; // progress bar height along a sidebar row's bottom edge
+const DROP_LINE: f32 = 2.0; // reorder drop indicator, drawn at the target item's top edge
+const DRAG_FADE: f32 = 0.45; // how much of the dragged row's ink survives while it is in flight
 // cmux's leading rail for a color-tagged workspace: a 3px capsule inset 4px, 5px in from the ends.
 const COLOR_RAIL_W: f32 = 3.0;
 const COLOR_RAIL_INSET: f32 = 4.0;
@@ -219,6 +221,9 @@ pub struct SidebarRow {
     pub color: Option<String>,
     /// A pane here has running children — spins the activity indicator.
     pub busy: bool,
+    /// This row is the one being dragged: drawn faded, so the drop indicator reads as "where it
+    /// will land" rather than "where a second copy appears".
+    pub dragging: bool,
     /// A pull-request badge: `(number, status)` where status is `open`/`draft`/`merged`/`closed`.
     pub pr: Option<(u32, String)>,
     pub active: bool,
@@ -1211,7 +1216,7 @@ impl Renderer {
         }
     }
 
-    fn build_sidebar(&self, items: &[SidebarItem], sidebar_w: u32, plus_hover: bool, fw: f32, fh: f32) -> (Vec<BgVertex>, Vec<RoundedVertex>, Vec<GlyphVertex>) {
+    fn build_sidebar(&self, items: &[SidebarItem], sidebar_w: u32, plus_hover: bool, drop_at: Option<usize>, fw: f32, fh: f32) -> (Vec<BgVertex>, Vec<RoundedVertex>, Vec<GlyphVertex>) {
         let mut bg = Vec::new();
         let mut rd = Vec::new(); // rounded chrome (row fills, accent bar, attention dot)
         let mut gl = Vec::new();
@@ -1243,7 +1248,12 @@ impl Renderer {
         // Items are laid out top to bottom with per-item heights (a header is shorter than a row),
         // so a running cursor replaces the old index * stride — `sidebar_item_at` walks the same way.
         let mut top = rows_y0;
-        for item in items {
+        for (i, item) in items.iter().enumerate() {
+            // Drop indicator: an accent line at the top edge of the item the drag would land on,
+            // drawn before the item so a row fill can't cover it.
+            if drop_at == Some(i) {
+                push_rounded(&mut rd, ROW_OUTER_PAD, top - DROP_LINE, sw - ROW_OUTER_PAD, top, DROP_LINE / 2.0, rgba(accent()), fw, fh);
+            }
             let r = match item {
                 SidebarItem::Header(h) => {
                     self.draw_group_header(h, top, sw, cw, ch, fw, fh, &mut rd, &mut gl);
@@ -1285,6 +1295,12 @@ impl Renderer {
                 (rgba(on), rgba_a(on, 0.72))
             } else {
                 (rgba(self.text), rgba(TEXT_DIM))
+            };
+            // The row in flight fades, so the drop line reads as its destination.
+            let (label_col, sub_col) = if r.dragging {
+                ([label_col[0], label_col[1], label_col[2], DRAG_FADE], [sub_col[0], sub_col[1], sub_col[2], DRAG_FADE])
+            } else {
+                (label_col, sub_col)
             };
             self.text_run(&r.name, text_x, line1, label_col, fw, fh, &mut gl);
             // PR badge on the second line, before the branch: a small "#42" chip in the state
@@ -1386,6 +1402,11 @@ impl Renderer {
             top += ROW_H + ROW_GAP;
         }
 
+        // A drop past the last item lands at the end of the list; the indicator goes there.
+        if drop_at == Some(items.len()) {
+            push_rounded(&mut rd, ROW_OUTER_PAD, top - DROP_LINE, sw - ROW_OUTER_PAD, top, DROP_LINE / 2.0, rgba(accent()), fw, fh);
+        }
+
         // '+ new tab' row, immediately after the last item (matches sidebar_new_tab_at).
         let plus_top = top;
         if plus_hover {
@@ -1409,6 +1430,9 @@ impl Renderer {
         surf_h: u32,
         empty_msg: &str,
         plus_hover: bool,
+        // `drop_at`: index of the sidebar item a reorder drag would land on (`items.len()` = the
+        // end of the list); `None` when nothing is being dragged.
+        drop_at: Option<usize>,
         search: Option<&SearchBar>,
         preedit: Option<&str>,
         palette: Option<&PaletteView>,
@@ -1417,7 +1441,7 @@ impl Renderer {
         // `sbg` is the opaque sidebar panel; `srd` is the rounded chrome (sidebar rows + pane
         // fills/borders); `sgl` is the sidebar text plus any empty-state message. `obg`/`ogl` are
         // the scroll-badge overlay, drawn last so they sit above the pane cells.
-        let (sbg, mut srd, mut sgl) = self.build_sidebar(sidebar, sidebar_w, plus_hover, fw, fh);
+        let (sbg, mut srd, mut sgl) = self.build_sidebar(sidebar, sidebar_w, plus_hover, drop_at, fw, fh);
         let mut obg: Vec<RoundedVertex> = Vec::new();
         let mut ogl: Vec<GlyphVertex> = Vec::new();
         let (cw_cell, ch_cell) = (self.atlas.cell_w as f32, self.atlas.cell_h as f32);
@@ -2126,7 +2150,7 @@ mod tests {
             selection: None,
         };
         let sb = SearchBar { label: "find:".into(), query: "hi".into(), current: 1, total: 1, overlay_only: false };
-        r.render_frame(&view, &[], 0, &[pv], 1, 1, "", false, Some(&sb), None, None);
+        r.render_frame(&view, &[], 0, &[pv], 1, 1, "", false, None, Some(&sb), None, None);
         let _ = r.device.poll(wgpu::PollType::wait_indefinitely());
     }
 }
