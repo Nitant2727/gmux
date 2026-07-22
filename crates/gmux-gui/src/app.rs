@@ -179,9 +179,12 @@ struct Selection {
 
 /// The settings overlay's state (Ctrl+,).
 struct SettingsState {
-    /// 0 = theme, 1 = keys.
+    /// 0 = theme, 1 = keys, 2 = schemes.
     tab: usize,
     sel: usize,
+    /// A colour scheme being tried on: its palette is live in every pane but nothing is written to
+    /// disk yet. Enter keeps it, Escape (or leaving the tab) restores the config's own palette.
+    preview: Option<String>,
     /// Rebinding: the next chord pressed becomes this action's binding.
     capturing: bool,
 }
@@ -190,6 +193,14 @@ struct SettingsState {
 /// "system" follows Windows; the rest are common terminal accents, so the cycle is useful without
 /// a colour picker.
 const ACCENT_CYCLE: &[&str] = &["default", "system", "#3b8ae6", "#8f7ae6", "#4bb58a", "#d98a4b", "#c9566d"];
+
+/// The settings panel's sections, in tab-strip order (`SettingsState::tab` indexes this).
+const SETTINGS_TABS: [&str; 3] = ["theme", "keys", "schemes"];
+
+/// A colour scheme's preview ribbon, in the renderer's colour type.
+fn swatch_rgb(name: &str) -> Vec<Rgb> {
+    crate::config::preset_swatch(name).into_iter().map(|[r, g, b]| Rgb { r, g, b }).collect()
+}
 
 /// A press on a pane's title strip that may become a pane rearrange once the cursor moves past the
 /// threshold. Dropping on another pane swaps the two.
@@ -1284,6 +1295,11 @@ impl ApplicationHandler for App {
                     if pressed && st.search.is_some() && st.cursor_in_search_band() {
                         return;
                     }
+                    // The settings panel is modal: a press on its card acts on the panel and never
+                    // reaches the sidebar or a pane behind it.
+                    if pressed && st.settings.is_some() && st.settings_click(button) {
+                        return;
+                    }
                     // Ctrl+left-click on a detected URL opens it and consumes the click — checked
                     // before mouse reporting and before selection/focus.
                     if pressed && ctrl && button == MouseButton::Left && st.open_url_at_cursor() {
@@ -1794,7 +1810,9 @@ impl State {
                 self.search = None;
                 self.rename = None;
                 self.palette = None;
-                self.settings = Some(SettingsState { tab: 0, sel: 0, capturing: false });
+                self.cancel_preview(); // reopening mid-preview must not strand the try-on palette
+                self.settings =
+                    Some(SettingsState { tab: 0, sel: 0, capturing: false, preview: None });
                 self.window.request_redraw();
             }
             Action::Search => self.enter_search(),
@@ -2464,6 +2482,23 @@ impl State {
             swatch: Vec::new(),
         };
         let cfg = Config::load();
+        if tab == 2 {
+            // Every scheme, each drawn in its own colours: the list IS the preview.
+            let current = self.settings.as_ref().and_then(|s| s.preview.clone()).unwrap_or_else(|| {
+                cfg.theme
+                    .as_ref()
+                    .and_then(|t| t.preset.clone())
+                    .unwrap_or_else(|| "default".to_string())
+            });
+            return crate::config::preset_names()
+                .into_iter()
+                .map(|name| SettingsRow {
+                    swatch: swatch_rgb(name),
+                    label: name.to_string(),
+                    value: if name.eq_ignore_ascii_case(&current) { "in use" } else { "" }.to_string(),
+                })
+                .collect();
+        }
         if tab == 0 {
             let accent = cfg
                 .theme
@@ -2477,10 +2512,7 @@ impl State {
                 .unwrap_or_else(|| "default".to_string());
             vec![
                 SettingsRow {
-                    swatch: crate::config::preset_swatch(&preset)
-                        .into_iter()
-                        .map(|[r, g, b]| Rgb { r, g, b })
-                        .collect(),
+                    swatch: swatch_rgb(&preset),
                     label: "color scheme".to_string(),
                     value: preset,
                 },
@@ -2552,16 +2584,32 @@ impl State {
         let rows = self.settings_rows(tab).len().max(1);
         let Some(st) = self.settings.as_mut() else { return };
         match &event.logical_key {
-            Key::Named(NamedKey::Escape) => self.settings = None,
-            Key::Named(NamedKey::ArrowDown) => st.sel = (st.sel + 1) % rows,
-            Key::Named(NamedKey::ArrowUp) => st.sel = st.sel.checked_sub(1).unwrap_or(rows - 1),
+            // On the schemes tab, Escape drops the scheme you were trying on and puts the config's
+            // own palette back before it closes — a preview must never survive a cancel.
+            Key::Named(NamedKey::Escape) => {
+                self.cancel_preview();
+                self.settings = None;
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                st.sel = (st.sel + 1) % rows;
+                self.preview_selected_scheme();
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                st.sel = st.sel.checked_sub(1).unwrap_or(rows - 1);
+                self.preview_selected_scheme();
+            }
             Key::Named(NamedKey::Tab) | Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::ArrowLeft) => {
-                st.tab = 1 - st.tab;
+                let back = matches!(&event.logical_key, Key::Named(NamedKey::ArrowLeft));
+                let n = SETTINGS_TABS.len();
+                st.tab = if back { (st.tab + n - 1) % n } else { (st.tab + 1) % n };
                 st.sel = 0;
+                self.cancel_preview(); // leaving the schemes tab abandons the try-on
             }
             Key::Named(NamedKey::Enter) => {
                 let sel = st.sel;
-                if tab == 1 {
+                if tab == 2 {
+                    self.commit_preview();
+                } else if tab == 1 {
                     st.capturing = true;
                 } else {
                     self.apply_theme_row(sel);
@@ -2575,36 +2623,157 @@ impl State {
         self.window.request_redraw();
     }
 
-    /// Enter on a theme row: cycle the colour scheme or accent, step the font size, or flip the
-    /// boolean.
+    /// The rows the panel actually draws — windowed around the selection, because the keys tab
+    /// lists every action and is taller than any card — plus the selection's index *within that
+    /// window* and where the window starts. The render builder and the click hit-test both go
+    /// through here, so a click can only ever resolve to a row that was drawn under it.
+    fn settings_window(&self) -> (Vec<SettingsRow>, usize, usize) {
+        let Some(s) = self.settings.as_ref() else { return (Vec::new(), 0, 0) };
+        let all = self.settings_rows(s.tab);
+        let sel = s.sel.min(all.len().saturating_sub(1));
+        let start = sel.saturating_sub(11);
+        (all.into_iter().skip(start).take(12).collect(), sel - start, start)
+    }
+
+    /// A mouse press while the settings panel is open. Returns whether the panel consumed it —
+    /// `true` for anything on the card (including its empty margins, which is what makes it
+    /// modal), `false` for a click outside, which falls through to the app underneath.
+    ///
+    /// On the schemes tab a click selects and previews the scheme under the cursor, and a click on
+    /// a row that's already previewing keeps it — so clicking a swatch twice is "try it, keep it"
+    /// with no keyboard at all.
+    fn settings_click(&mut self, button: MouseButton) -> bool {
+        let (x, y) = (self.cursor.0 as f32, self.cursor.1 as f32);
+        let (sw, sh) = (self.config.width, self.config.height);
+        let Some(st) = self.settings.as_ref() else { return false };
+        let (tab, sel) = (st.tab, st.sel);
+        let (rows, _, start) = self.settings_window();
+        if !self.renderer.settings_hit(x, y, rows.len(), sw, sh) {
+            return false;
+        }
+        if button != MouseButton::Left {
+            return true; // consumed: the card is modal, but only the left button acts
+        }
+        let tabs: Vec<String> = SETTINGS_TABS.iter().map(|s| (*s).to_string()).collect();
+        if let Some(i) = self.renderer.settings_tab_at(x, y, &tabs, rows.len(), sw, sh) {
+            if i != tab {
+                self.cancel_preview();
+                if let Some(st) = self.settings.as_mut() {
+                    st.tab = i;
+                    st.sel = 0;
+                }
+                self.window.request_redraw();
+            }
+            return true;
+        }
+        if let Some(w) = self.renderer.settings_row_at(x, y, rows.len(), sw, sh) {
+            let chips = rows[w].swatch.len();
+            let on_swatch = self.renderer.settings_swatch_hit(x, chips, rows.len(), sw, sh);
+            let i = start + w; // window index -> the row's index in the full list
+            // Same row twice = keep it. Checked before moving the selection so the second click
+            // commits rather than re-previewing what is already live.
+            let repeat = tab == 2 && i == sel;
+            if let Some(st) = self.settings.as_mut() {
+                st.sel = i;
+                st.capturing = false; // a click abandons a half-finished chord capture
+            }
+            match tab {
+                2 if repeat => self.commit_preview(),
+                2 => self.preview_selected_scheme(),
+                // The theme tab's ribbon is a shortcut into the schemes tab: click the colours to
+                // get to where colours can be tried on. Elsewhere on the row a click only selects,
+                // so a stray click can't silently cycle a setting.
+                0 if on_swatch => self.apply_theme_row(i),
+                _ => {}
+            }
+            self.window.request_redraw();
+        }
+        true
+    }
+
+    /// Try the selected scheme on: push its palette to the daemon so every pane repaints in it,
+    /// without touching `gmux.json`. No-op off the schemes tab, and when the scheme is already the
+    /// one being previewed (arrowing back onto a row shouldn't re-push a whole palette).
+    fn preview_selected_scheme(&mut self) {
+        let Some(st) = self.settings.as_ref() else { return };
+        if st.tab != 2 {
+            return;
+        }
+        let names = crate::config::preset_names();
+        let Some(name) = names.get(st.sel).copied() else { return };
+        if self.settings.as_ref().and_then(|s| s.preview.as_deref()) == Some(name) {
+            return;
+        }
+        // The preview must show what COMMITTING would look like, so it resolves through the real
+        // config — a hand-set `theme.fg` still wins over the scheme after you keep it, too.
+        let p = Config::load().palette_with_preset(name);
+        self.client.control(Call::SetPalette { fg: p.fg, bg: p.bg, ansi: p.ansi.to_vec() });
+        self.force_full = true; // the daemon re-resolves colors but emits no damage for it
+        if let Some(st) = self.settings.as_mut() {
+            st.preview = Some(name.to_string());
+        }
+        self.window.request_redraw();
+    }
+
+    /// Put the config's own palette back, dropping whatever was being tried on. Safe to call when
+    /// nothing is previewing.
+    fn cancel_preview(&mut self) {
+        let previewing = self.settings.as_mut().and_then(|s| s.preview.take()).is_some();
+        if !previewing {
+            return;
+        }
+        let cfg = Config::load();
+        self.send_palette(&cfg);
+        self.force_full = true;
+        self.window.request_redraw();
+    }
+
+    /// Keep the previewed scheme: write it to `gmux.json` (the palette is already live) and go
+    /// back to the theme tab, where the colour-scheme row now shows it.
+    fn commit_preview(&mut self) {
+        let Some(st) = self.settings.as_ref() else { return };
+        let names = crate::config::preset_names();
+        let Some(name) = names.get(st.sel).copied() else { return };
+        self.write_config(|cfg| {
+            let theme =
+                cfg.as_object_mut().unwrap().entry("theme").or_insert_with(|| serde_json::json!({}));
+            if let Some(map) = theme.as_object_mut() {
+                // "default" means "no preset key at all", so the built-in palette wins.
+                if name == "default" {
+                    map.remove("preset");
+                } else {
+                    map.insert("preset".into(), serde_json::Value::String(name.into()));
+                }
+                // fg/bg are the LAST layer, so leaving them set would keep overriding the scheme
+                // just chosen — a scheme supplies both, so they go with it.
+                map.remove("fg");
+                map.remove("bg");
+            }
+        });
+        if let Some(st) = self.settings.as_mut() {
+            st.preview = None; // committed, not pending: nothing left to restore
+            st.tab = 0;
+            st.sel = 0;
+        }
+        self.window.request_redraw();
+    }
+
+    /// Enter on a theme row: open the schemes tab, cycle the accent, step the font size, or flip
+    /// the boolean.
     fn apply_theme_row(&mut self, sel: usize) {
         match sel {
+            // The colour-scheme row is a doorway to the schemes tab, where each scheme is drawn in
+            // its own colours and previews live. One place changes the scheme, not two.
             0 => {
                 let cur = Config::load().theme.and_then(|t| t.preset);
-                let names = crate::config::preset_names();
-                let idx = cur
+                let sel = cur
                     .as_deref()
-                    .and_then(|c| names.iter().position(|n| n.eq_ignore_ascii_case(c)))
+                    .and_then(|c| crate::config::preset_names().iter().position(|n| n.eq_ignore_ascii_case(c)))
                     .unwrap_or(0);
-                let next = names[(idx + 1) % names.len()];
-                self.write_config(|cfg| {
-                    let theme = cfg
-                        .as_object_mut()
-                        .unwrap()
-                        .entry("theme")
-                        .or_insert_with(|| serde_json::json!({}));
-                    if let Some(map) = theme.as_object_mut() {
-                        if next == "default" {
-                            map.remove("preset");
-                        } else {
-                            map.insert("preset".into(), serde_json::Value::String(next.into()));
-                        }
-                        // fg/bg are the LAST layer, so leaving them set would keep overriding the
-                        // scheme you just picked — a preset supplies both, so they go with it.
-                        map.remove("fg");
-                        map.remove("bg");
-                    }
-                });
+                if let Some(st) = self.settings.as_mut() {
+                    st.tab = 2;
+                    st.sel = sel;
+                }
             }
             1 => {
                 let cur = Config::load().theme.and_then(|t| t.accent);
@@ -4161,17 +4330,16 @@ impl State {
         // Settings overlay: rows for the open tab, windowed around the selection like the palette
         // (the keys tab lists every action, which is taller than any window).
         let settings_view = self.settings.as_ref().map(|s| {
-            let all = self.settings_rows(s.tab);
-            let sel = s.sel.min(all.len().saturating_sub(1));
-            let start = sel.saturating_sub(11);
-            let rows: Vec<SettingsRow> = all.into_iter().skip(start).take(12).collect();
+            let (rows, sel, _) = self.settings_window();
             SettingsView {
-                tabs: vec!["theme".into(), "keys".into()],
+                tabs: SETTINGS_TABS.iter().map(|s| (*s).to_string()).collect(),
                 tab: s.tab,
                 rows,
-                selected: sel - start,
+                selected: sel,
                 footer: if s.capturing {
                     "press the new chord  ·  esc cancels".into()
+                } else if s.tab == 2 {
+                    "click or arrow to try one on  ·  enter keeps it  ·  esc restores".into()
                 } else if s.tab == 1 {
                     "enter rebinds  ·  tab switches  ·  e opens gmux.json  ·  esc closes".into()
                 } else {

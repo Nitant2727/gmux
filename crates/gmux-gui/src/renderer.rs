@@ -292,6 +292,80 @@ pub struct PaletteView {
     pub selected: usize,
 }
 
+/// Inner padding of the settings card, and the gap between tab labels. Named because the
+/// hit-tests below have to agree with the drawing to the pixel.
+const SET_PAD: f32 = 14.0;
+const SET_TAB_GAP: f32 = 22.0;
+/// Side of one colour chip in a scheme ribbon.
+const SET_CHIP: f32 = 11.0;
+
+/// The settings card's laid-out rect plus its row metrics.
+struct Card {
+    px: f32,
+    py: f32,
+    pw: f32,
+    ph: f32,
+    /// Height of one row.
+    row_h: f32,
+    /// Height of the tab strip above the rows.
+    head: f32,
+}
+
+/// Lay the settings card out for `rows` rows in a `fw` x `fh` window. The single source of the
+/// card's geometry: `render_frame` draws with it and the `settings_*_at` hit-tests read it, so a
+/// click can't land on a row the panel drew somewhere else.
+fn settings_card(rows: usize, ch_cell: f32, fw: f32, fh: f32) -> Card {
+    const SET_W: f32 = 640.0;
+    let row_h = ch_cell + 8.0;
+    let pw = SET_W.min(fw - 24.0).max(160.0);
+    let head = row_h + 10.0; // tab strip
+    let ph = (SET_PAD * 2.0 + head + row_h * (rows as f32 + 1.0)).min(fh - 32.0);
+    Card {
+        px: ((fw - pw) / 2.0).max(0.0),
+        py: ((fh - ph) / 2.0).max(8.0),
+        pw,
+        ph,
+        row_h,
+        head,
+    }
+}
+
+/// The settings row under `(x, y)`, or `None` in the tab strip, the footer, or the margins.
+fn settings_row_index(x: f32, y: f32, rows: usize, ch_cell: f32, fw: f32, fh: f32) -> Option<usize> {
+    let c = settings_card(rows, ch_cell, fw, fh);
+    if x < c.px || x >= c.px + c.pw {
+        return None;
+    }
+    let rows_y = c.py + SET_PAD + c.head;
+    let i = ((y - rows_y) / c.row_h).floor();
+    if i < 0.0 {
+        return None;
+    }
+    let i = i as usize;
+    // The drawing stops a row short of the footer; a click past that hits nothing.
+    let ry = rows_y + c.row_h * i as f32;
+    (i < rows && ry + c.row_h <= c.py + c.ph - c.row_h).then_some(i)
+}
+
+/// The tab under `(x, y)`, walking the same pill/gap sequence the strip is drawn with.
+#[allow(clippy::too_many_arguments)]
+fn settings_tab_index(x: f32, y: f32, tabs: &[String], rows: usize, cw_cell: f32, ch_cell: f32, fw: f32, fh: f32) -> Option<usize> {
+    let c = settings_card(rows, ch_cell, fw, fh);
+    let (y0, y1) = (c.py + SET_PAD - 2.0, c.py + SET_PAD + ch_cell + 4.0);
+    if y < y0 || y >= y1 {
+        return None;
+    }
+    let mut tx = c.px + SET_PAD;
+    for (i, name) in tabs.iter().enumerate() {
+        let tw = name.chars().count() as f32 * cw_cell;
+        if x >= tx - 6.0 && x < tx + tw + 6.0 {
+            return Some(i);
+        }
+        tx += tw + SET_TAB_GAP;
+    }
+    None
+}
+
 /// One settings row: a label on the left, a value on the right, and an optional colour ribbon
 /// previewing what the value means (a terminal scheme's background, six ANSI colours, foreground).
 pub struct SettingsRow {
@@ -1183,6 +1257,36 @@ impl Renderer {
         top
     }
 
+    /// Whether `(x, y)` is anywhere on the settings card. The panel is modal, so a click that
+    /// lands on it must never also reach the sidebar or a pane behind it.
+    pub fn settings_hit(&self, x: f32, y: f32, rows: usize, surf_w: u32, surf_h: u32) -> bool {
+        let c = settings_card(rows, self.cell_h() as f32, surf_w as f32, surf_h as f32);
+        x >= c.px && x < c.px + c.pw && y >= c.py && y < c.py + c.ph
+    }
+
+    /// The settings row under `(x, y)`, or `None` in the tab strip / footer / margins. Walks the
+    /// same rows `render_frame` lays out, including its clip at the card's bottom.
+    pub fn settings_row_at(&self, x: f32, y: f32, rows: usize, surf_w: u32, surf_h: u32) -> Option<usize> {
+        settings_row_index(x, y, rows, self.cell_h() as f32, surf_w as f32, surf_h as f32)
+    }
+
+    /// The tab under `(x, y)`, walking the same pill/gap sequence the strip is drawn with.
+    pub fn settings_tab_at(&self, x: f32, y: f32, tabs: &[String], rows: usize, surf_w: u32, surf_h: u32) -> Option<usize> {
+        let (cw, ch) = (self.cell_w() as f32, self.cell_h() as f32);
+        settings_tab_index(x, y, tabs, rows, cw, ch, surf_w as f32, surf_h as f32)
+    }
+
+    /// Whether `(x, y)` lands on the given settings row (as returned by [`Self::settings_row_at`])
+    /// *inside its colour ribbon*, rather than on its label or value.
+    pub fn settings_swatch_hit(&self, x: f32, chips: usize, rows: usize, surf_w: u32, surf_h: u32) -> bool {
+        if chips == 0 {
+            return false;
+        }
+        let c = settings_card(rows, self.cell_h() as f32, surf_w as f32, surf_h as f32);
+        let right = c.px + c.pw - SET_PAD;
+        x >= right - SET_CHIP * chips as f32 && x < right
+    }
+
     /// Whether `(x, y)` (window coords) lands on the close button in pane `rect`'s title strip.
     /// `rect` is the pane's OUTER rect as the app caches it, already shifted by the sidebar; the
     /// insets here mirror what `render_frame` draws.
@@ -1816,31 +1920,24 @@ impl Renderer {
         // footer of key hints. Taller than the palette because it lists every keybinding, so it is
         // capped to the window and the app scrolls its row window.
         if let Some(sv) = settings {
-            const SET_W: f32 = 640.0;
-            const PAD: f32 = 14.0;
-            let row_h = ch_cell + 8.0;
-            let pw = SET_W.min(fw - 24.0).max(160.0);
-            let head = row_h + 10.0; // tab strip
-            let ph = (PAD * 2.0 + head + row_h * (sv.rows.len() as f32 + 1.0)).min(fh - 32.0);
-            let px = ((fw - pw) / 2.0).max(0.0);
-            let py = ((fh - ph) / 2.0).max(8.0);
+            let Card { px, py, pw, ph, row_h, head } = settings_card(sv.rows.len(), ch_cell, fw, fh);
             // A hairline-ringed card, one step above the sidebar so it reads as "on top".
             push_rounded(&mut obg, px, py, px + pw, py + ph, RADIUS, rgba(SIDEBAR_ROW_HOVER), fw, fh);
             stroke_rounded(&mut obg, px, py, px + pw, py + ph, RADIUS, 1.0, rgba_a(TEXT, 0.10), fw, fh);
 
             // Tab strip: the open section is an accent pill, the others dim text.
-            let mut tx = px + PAD;
+            let mut tx = px + SET_PAD;
             for (i, name) in sv.tabs.iter().enumerate() {
                 let tw = name.chars().count() as f32 * cw_cell;
                 if i == sv.tab {
-                    push_rounded(&mut obg, tx - 6.0, py + PAD - 2.0, tx + tw + 6.0, py + PAD + ch_cell + 4.0, BADGE_RADIUS, rgba(accent()), fw, fh);
+                    push_rounded(&mut obg, tx - 6.0, py + SET_PAD - 2.0, tx + tw + 6.0, py + SET_PAD + ch_cell + 4.0, BADGE_RADIUS, rgba(accent()), fw, fh);
                 }
                 let ink = if i == sv.tab { on_accent(accent()) } else { TEXT_DIM };
-                self.text_run(name, tx, py + PAD, rgba(ink), fw, fh, &mut ogl);
-                tx += tw + 22.0;
+                self.text_run(name, tx, py + SET_PAD, rgba(ink), fw, fh, &mut ogl);
+                tx += tw + SET_TAB_GAP;
             }
 
-            let rows_y = py + PAD + head;
+            let rows_y = py + SET_PAD + head;
             for (i, row) in sv.rows.iter().enumerate() {
                 let ry = rows_y + row_h * i as f32;
                 if ry + row_h > py + ph - row_h {
@@ -1849,12 +1946,12 @@ impl Renderer {
                 if i == sv.selected {
                     push_rounded(&mut obg, px + 4.0, ry, px + pw - 4.0, ry + row_h, RADIUS - 2.0, rgba(SIDEBAR_ROW_ACTIVE), fw, fh);
                 }
-                self.text_run(&row.label, px + PAD, ry + 4.0, rgba(TEXT), fw, fh, &mut ogl);
+                self.text_run(&row.label, px + SET_PAD, ry + 4.0, rgba(TEXT), fw, fh, &mut ogl);
                 // The ribbon sits at the card's right edge and the value text to its left, so the
                 // swatch holds one x while cycling — it's the thing you watch, not the name.
-                let mut right = px + pw - PAD;
+                let mut right = px + pw - SET_PAD;
                 if !row.swatch.is_empty() {
-                    const CHIP: f32 = 11.0;
+                    const CHIP: f32 = SET_CHIP;
                     let sw = CHIP * row.swatch.len() as f32;
                     let (x0, y0) = (right - sw, ry + (row_h - CHIP) / 2.0);
                     for (n, c) in row.swatch.iter().enumerate() {
@@ -1868,10 +1965,10 @@ impl Renderer {
                 }
                 let vw = row.value.chars().count() as f32 * cw_cell;
                 let ink = if i == sv.selected { accent() } else { TEXT_DIM };
-                self.text_run(&row.value, (right - vw).max(px + PAD), ry + 4.0, rgba(ink), fw, fh, &mut ogl);
+                self.text_run(&row.value, (right - vw).max(px + SET_PAD), ry + 4.0, rgba(ink), fw, fh, &mut ogl);
             }
             // Footer hints, pinned to the card's bottom edge.
-            self.text_run(&sv.footer, px + PAD, py + ph - PAD - ch_cell, rgba(TEXT_DIM), fw, fh, &mut ogl);
+            self.text_run(&sv.footer, px + SET_PAD, py + ph - SET_PAD - ch_cell, rgba(TEXT_DIM), fw, fh, &mut ogl);
         }
 
         let sbg_buf = vb(bytemuck::cast_slice(&sbg));
@@ -2117,6 +2214,47 @@ struct GlyphOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_clicks_land_on_the_row_that_was_drawn_there() {
+        // The card, the tab strip and the row walk all come from settings_card, so this pins the
+        // hit-test's agreement with the drawing: no overlap, no off-by-one, nothing outside.
+        const ROWS: usize = 8;
+        let (cw, ch, fw, fh) = (9.0_f32, 20.0_f32, 1280.0_f32, 800.0_f32);
+        let c = settings_card(ROWS, ch, fw, fh);
+        let rows_y = c.py + SET_PAD + c.head;
+        let mid = c.px + c.pw / 2.0;
+
+        // Every row's own band resolves to that row, top edge included and bottom edge excluded.
+        for i in 0..ROWS {
+            let ry = rows_y + c.row_h * i as f32;
+            assert_eq!(settings_row_index(mid, ry, ROWS, ch, fw, fh), Some(i));
+            assert_eq!(settings_row_index(mid, ry + c.row_h - 0.5, ROWS, ch, fw, fh), Some(i));
+        }
+        // The tab strip and the space above the rows belong to no row...
+        assert_eq!(settings_row_index(mid, c.py + SET_PAD, ROWS, ch, fw, fh), None);
+        assert_eq!(settings_row_index(mid, rows_y - 0.5, ROWS, ch, fw, fh), None);
+        // ...nor does the footer band, or anything outside the card's sides.
+        assert_eq!(settings_row_index(mid, c.py + c.ph - 1.0, ROWS, ch, fw, fh), None);
+        assert_eq!(settings_row_index(c.px - 1.0, rows_y + 2.0, ROWS, ch, fw, fh), None);
+        assert_eq!(settings_row_index(c.px + c.pw, rows_y + 2.0, ROWS, ch, fw, fh), None);
+
+        // The tab strip maps each label to its own tab, and the gaps between them to none.
+        let tabs: Vec<String> = ["theme", "keys", "schemes"].iter().map(|s| s.to_string()).collect();
+        let ty = c.py + SET_PAD + 1.0;
+        let mut tx = c.px + SET_PAD;
+        for (i, name) in tabs.iter().enumerate() {
+            let tw = name.chars().count() as f32 * cw;
+            assert_eq!(settings_tab_index(tx + tw / 2.0, ty, &tabs, ROWS, cw, ch, fw, fh), Some(i));
+            tx += tw + SET_TAB_GAP;
+            if i + 1 < tabs.len() {
+                // Between two pills (each padded 6px) there is dead space that hits neither.
+                assert_eq!(settings_tab_index(tx - SET_TAB_GAP / 2.0, ty, &tabs, ROWS, cw, ch, fw, fh), None);
+            }
+        }
+        // A row-band y is never read as a tab, however far left the click is.
+        assert_eq!(settings_tab_index(mid, rows_y + 2.0, &tabs, ROWS, cw, ch, fw, fh), None);
+    }
 
     fn cell(ch: char) -> Cell {
         let c = Rgb { r: 0, g: 0, b: 0 };
