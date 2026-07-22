@@ -668,21 +668,11 @@ mod tests {
         let drop_at = Some(rows.len().saturating_sub(1));
         // Settings panel over the frame, as Ctrl+, shows it.
         let sv = crate::renderer::SettingsView {
-            tabs: vec!["theme".into(), "keys".into(), "schemes".into()],
-            tab: 2,
-            rows: crate::config::preset_names()
-                .into_iter()
-                .map(|name| crate::renderer::SettingsRow {
-                    label: name.into(),
-                    value: if name == "nord" { "in use" } else { "" }.into(),
-                    swatch: crate::config::preset_swatch(name)
-                        .into_iter()
-                        .map(|[r, g, b]| gmux_mux::Rgb { r, g, b })
-                        .collect(),
-                })
-                .collect(),
-            selected: 4,
-            footer: "click or arrow to try one on  ·  enter keeps it  ·  esc restores".into(),
+            tabs: vec!["theme".into(), "keys".into(), "schemes".into(), "accent".into()],
+            tab: 3,
+            rows: crate::app::accent_rows_for_preview(),
+            selected: 3,
+            footer: "click or arrow to try  ·  type a hex below  ·  enter keeps".into(),
         };
         r.render_frame(&view, &rows, sw, &[pane], w, h, "", false, drop_at, Some("ag"), Some(&sb), None, None, Some(&sv));
         let px = read_rgba(&r, &tex, w, h).expect("readback");

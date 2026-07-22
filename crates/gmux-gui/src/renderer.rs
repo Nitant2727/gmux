@@ -131,6 +131,16 @@ pub fn set_accent(choice: AccentChoice) {
     ACCENT_RGB.store(packed, Ordering::Relaxed);
 }
 
+/// The colour a choice would produce, without applying it — what the accent picker paints each
+/// option's swatch with, including the legibility lift `"system"` gets.
+pub fn resolve_accent(choice: AccentChoice) -> Rgb {
+    match choice {
+        AccentChoice::Default => ACCENT_FALLBACK,
+        AccentChoice::Fixed([r, g, b]) => Rgb { r, g, b },
+        AccentChoice::System => system_accent().map(ensure_legible).unwrap_or(ACCENT_FALLBACK),
+    }
+}
+
 fn unpack_accent(p: u32) -> Rgb {
     Rgb { r: (p >> 16) as u8, g: (p >> 8) as u8, b: p as u8 }
 }
@@ -1967,8 +1977,12 @@ impl Renderer {
                 let ink = if i == sv.selected { accent() } else { TEXT_DIM };
                 self.text_run(&row.value, (right - vw).max(px + SET_PAD), ry + 4.0, rgba(ink), fw, fh, &mut ogl);
             }
-            // Footer hints, pinned to the card's bottom edge.
-            self.text_run(&sv.footer, px + SET_PAD, py + ph - SET_PAD - ch_cell, rgba(TEXT_DIM), fw, fh, &mut ogl);
+            // Footer hints, pinned to the card's bottom edge. Clipped to the card: hints grow with
+            // the tab you're on and the card doesn't, so an over-long line would spill onto the
+            // pane behind it at a narrow window or a large font.
+            let fit = ((pw - SET_PAD * 2.0) / cw_cell).max(0.0) as usize;
+            let footer: String = sv.footer.chars().take(fit).collect();
+            self.text_run(&footer, px + SET_PAD, py + ph - SET_PAD - ch_cell, rgba(TEXT_DIM), fw, fh, &mut ogl);
         }
 
         let sbg_buf = vb(bytemuck::cast_slice(&sbg));

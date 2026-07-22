@@ -54,8 +54,8 @@ The binary is currently unsigned (SmartScreen may prompt on first run of a downl
 ## Default keybindings
 
 `Ctrl+,` opens the settings panel: a **theme** tab (color scheme, accent, font size,
-focus-follows-mouse), a **keys** tab listing every action with its current chord, and a
-**schemes** tab (below). Arrows move, Tab switches tab, Enter
+focus-follows-mouse), a **keys** tab listing every action with its current chord, and **schemes**
+and **accent** pickers (below). Arrows move, Tab switches tab, Enter
 changes the value — on a keybinding, Enter waits for you to press the new chord. Clicking works
 too: a click on a tab opens it, and on the schemes tab a click previews. Changes are
 written to `%APPDATA%\gmux\gmux.json` and applied live; `e` opens that file for anything the panel
@@ -157,8 +157,12 @@ agent — shows a small activity spinner; it animates only while work is in flig
 still sits at 0% CPU. Both are persisted.
 
 The chrome follows cmux's look: the selected workspace is a solid accent pill, a workspace wanting
-attention washes blue, and the focused pane carries an accent ring. Set `"theme": { "accent":
-"system" }` to follow your Windows accent color instead, or `"#rrggbb"` to pin your own.
+attention washes blue, and the focused pane carries an accent ring. The settings panel's **accent**
+tab picks that color: seven options each shown as a block of itself, plus a **custom hex** row you
+type `#rrggbb` into. Arrowing or clicking applies the accent to the chrome immediately, and Enter
+keeps it — the same try-it-then-keep-it as schemes. `"system"` follows your Windows accent color
+(lifted if it's too dark to read against). By hand: `"theme": { "accent": "system" }` or
+`"#rrggbb"`.
 
 Terminal cell colors are separate. Seven schemes ship built in — `campbell` (the Windows Terminal
 default), `one-dark`, `gruvbox-dark`, `nord`, `catppuccin-mocha`, `tokyo-night`, `solarized-dark` —
