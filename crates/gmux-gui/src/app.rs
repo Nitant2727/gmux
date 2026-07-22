@@ -194,6 +194,9 @@ struct SettingsState {
     /// while the panel asks whether to take it; pressing the same chord again confirms.
     conflict: Option<String>,
     conflict_owner: Option<String>,
+    /// A reset waiting on confirmation. Throwing settings away is the one thing in this panel that
+    /// can't be undone by pressing the same key again, so it always asks first.
+    reset: Option<ResetScope>,
     /// Font size in force when the font picker started trying sizes on. Restored on Escape — the
     /// config's own value would undo a live `Ctrl+=` zoom the user made before opening the panel.
     font_before: Option<f32>,
@@ -205,6 +208,41 @@ struct SettingsState {
 /// "system" follows Windows; the rest are common terminal accents, so the cycle is useful without
 /// a colour picker.
 const ACCENT_CYCLE: &[&str] = &["default", "system", "#3b8ae6", "#8f7ae6", "#4bb58a", "#d98a4b", "#c9566d"];
+
+/// How much a "reset to defaults" row throws away.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResetScope {
+    /// Just `keys`: every binding back to its shipped chord.
+    Keys,
+    /// Everything the panel writes — theme, keys, font size, focus-follows-mouse. Keys the panel
+    /// doesn't own (`pr_refresh_secs`, `persist_screen`) are left alone: this is "reset the
+    /// settings", not "delete my config file".
+    All,
+}
+
+impl ResetScope {
+    /// The question the footer asks before doing it.
+    fn prompt(self) -> &'static str {
+        match self {
+            ResetScope::Keys => "reset every keybinding? · enter confirms · esc cancels",
+            ResetScope::All => "reset every setting in this panel? · enter confirms · esc cancels",
+        }
+    }
+}
+
+/// Drop the keys a reset throws away from a parsed `gmux.json`. Keys the panel doesn't own are
+/// left alone — a reset is not "delete my config file" — and removing a key (rather than writing
+/// the default value back) keeps "absent" meaning "the built-in", the same distinction the theme
+/// rows draw between `default` and a pinned value. Pure/tested.
+fn strip_for_reset(cfg: &mut serde_json::Value, scope: ResetScope) {
+    let Some(map) = cfg.as_object_mut() else { return };
+    map.remove("keys");
+    if scope == ResetScope::All {
+        map.remove("theme");
+        map.remove("font_px");
+        map.remove("focus_follows_mouse");
+    }
+}
 
 /// The settings panel's sections, in tab-strip order (`SettingsState::tab` indexes this).
 const SETTINGS_TABS: [&str; 5] = ["theme", "keys", "schemes", "accent", "font"];
@@ -254,11 +292,19 @@ pub(crate) fn key_rows_for_preview() -> Vec<SettingsRow> {
     .map(|(a, c)| (a.to_string(), c.to_string()))
     .collect();
     let clash = crate::config::conflict_flags(&pairs);
-    pairs
+    let mut rows: Vec<SettingsRow> = pairs
         .into_iter()
         .zip(clash)
         .map(|((label, value), warn)| SettingsRow { label, value, swatch: Vec::new(), warn })
-        .collect()
+        .collect();
+    rows.push(SettingsRow { label: "reset all bindings".into(), ..Default::default() });
+    rows
+}
+
+/// The prompt the preview dump renders in the footer, straight from the real one.
+#[cfg(test)]
+pub(crate) fn reset_prompt_for_preview() -> &'static str {
+    ResetScope::Keys.prompt()
 }
 
 /// Append typed text to a `#rrggbb` buffer: hex digits only, lowercased (the config's parser is
@@ -1855,6 +1901,7 @@ impl State {
                     hex: None,
                     conflict: None,
                     conflict_owner: None,
+                    reset: None,
                     font_before: None,
                 });
                 self.window.request_redraw();
@@ -2623,6 +2670,7 @@ impl State {
                     "follow mouse focus",
                     if self.focus_follows_mouse { "on" } else { "off" }.to_string(),
                 ),
+                plain("reset all settings", String::new()),
             ]
         } else {
             // Every bindable action with its CURRENT chord (config override, else the default),
@@ -2636,11 +2684,13 @@ impl State {
                 })
                 .collect();
             let clash = crate::config::conflict_flags(&pairs);
-            pairs
+            let mut rows: Vec<SettingsRow> = pairs
                 .into_iter()
                 .zip(clash)
                 .map(|((name, cur), warn)| SettingsRow { label: name, value: cur, swatch: Vec::new(), warn })
-                .collect()
+                .collect();
+            rows.push(plain("reset all bindings", String::new()));
+            rows
         }
     }
 
@@ -2709,6 +2759,21 @@ impl State {
             return;
         }
 
+        // A staged reset owns Enter and Escape until it is answered.
+        if let Some(scope) = st.reset {
+            match &event.logical_key {
+                Key::Named(NamedKey::Enter) => self.do_reset(scope),
+                Key::Named(NamedKey::Escape) => {
+                    if let Some(st) = self.settings.as_mut() {
+                        st.reset = None;
+                    }
+                }
+                _ => return, // anything else is neither an answer nor a reason to close
+            }
+            self.window.request_redraw();
+            return;
+        }
+
         let tab = st.tab;
         let rows = self.settings_rows(tab).len().max(1);
         let Some(st) = self.settings.as_mut() else { return };
@@ -2718,6 +2783,17 @@ impl State {
             Key::Named(NamedKey::Escape) => {
                 self.cancel_preview();
                 self.settings = None;
+            }
+            // Delete puts one binding back to its shipped chord. No confirmation: it restores a
+            // documented default and the row visibly changes, unlike the wholesale resets.
+            Key::Named(NamedKey::Delete) if tab == 1 && st.sel + 1 < rows => {
+                let sel = st.sel;
+                let action = self.settings_rows(1)[sel].label.clone();
+                self.write_config(|cfg| {
+                    if let Some(keys) = cfg.get_mut("keys").and_then(|k| k.as_object_mut()) {
+                        keys.remove(&action);
+                    }
+                });
             }
             Key::Named(NamedKey::ArrowDown) => {
                 st.sel = (st.sel + 1) % rows;
@@ -2741,7 +2817,11 @@ impl State {
             }
             Key::Named(NamedKey::Enter) => {
                 let sel = st.sel;
+                let last = sel + 1 == rows;
                 match tab {
+                    // Both lists end in a reset row; Enter there stages the question.
+                    1 if last => st.reset = Some(ResetScope::Keys),
+                    0 if last => st.reset = Some(ResetScope::All),
                     2 => self.commit_preview(),
                     3 => self.commit_accent(),
                     4 => self.commit_font(),
@@ -2815,9 +2895,32 @@ impl State {
             // Same row twice = keep it. Checked before moving the selection so the second click
             // commits rather than re-previewing what is already live.
             let repeat = matches!(tab, 2 | 3 | 4) && i == sel;
+            let staged = self.settings.as_ref().and_then(|s| s.reset);
             if let Some(st) = self.settings.as_mut() {
                 st.sel = i;
                 st.capturing = false; // a click abandons a half-finished chord capture
+            }
+            // The reset rows end their lists. A click stages the question; clicking the same row
+            // again answers it — the same "twice means yes" the pickers use, so the mouse never
+            // resets anything on one click.
+            let last = i + 1 == self.settings_rows(tab).len();
+            if last && matches!(tab, 0 | 1) {
+                let scope = if tab == 1 { ResetScope::Keys } else { ResetScope::All };
+                match staged {
+                    Some(s) if s == scope => self.do_reset(scope),
+                    _ => {
+                        if let Some(st) = self.settings.as_mut() {
+                            st.reset = Some(scope);
+                        }
+                    }
+                }
+                self.window.request_redraw();
+                return true;
+            }
+            if staged.is_some() {
+                if let Some(st) = self.settings.as_mut() {
+                    st.reset = None; // clicking elsewhere is an answer of "no"
+                }
             }
             match tab {
                 2 if repeat => self.commit_preview(),
@@ -2910,6 +3013,21 @@ impl State {
             st.accent_preview = None; // committed, not pending: nothing left to restore
             st.hex = None;
             st.tab = 0;
+            st.sel = 0;
+        }
+        self.window.request_redraw();
+    }
+
+    /// Carry out a confirmed reset: drop the keys this panel owns from `gmux.json`, then re-read it
+    /// so the defaults take effect now rather than on the config watcher's next tick. Removing the
+    /// keys (instead of writing the default values back) keeps "unset" meaning the built-in — the
+    /// same distinction the theme rows draw.
+    fn do_reset(&mut self, scope: ResetScope) {
+        self.cancel_preview(); // a try-on in flight would otherwise outlive the settings it edits
+        self.write_config(|cfg| strip_for_reset(cfg, scope));
+        self.maybe_reload_config(); // palette, accent, keymap, font size — all through one path
+        if let Some(st) = self.settings.as_mut() {
+            st.reset = None;
             st.sel = 0;
         }
         self.window.request_redraw();
@@ -4584,7 +4702,9 @@ impl State {
                 tab: s.tab,
                 rows,
                 selected: sel,
-                footer: if let (Some(c), Some(owner)) = (&s.conflict, &s.conflict_owner) {
+                footer: if let Some(scope) = s.reset {
+                    scope.prompt().to_string()
+                } else if let (Some(c), Some(owner)) = (&s.conflict, &s.conflict_owner) {
                     format!("{c} runs {owner} · press again to take · esc cancels")
                 } else if s.capturing {
                     "press the new chord  ·  esc cancels".into()
@@ -5105,6 +5225,57 @@ mod tests {
                 SidebarItem::Row(r) => r.name.clone(),
             })
             .collect()
+    }
+
+    #[test]
+    fn a_reset_clears_only_what_the_panel_owns() {
+        let original = serde_json::json!({
+            "font_px": 22.0,
+            "focus_follows_mouse": true,
+            "theme": { "preset": "nord", "accent": "#c9566d" },
+            "keys": { "split_h": "ctrl+alt+2" },
+            // Not the panel's: the daemon's, and a hand-written one it has never heard of.
+            "persist_screen": false,
+            "pr_refresh_secs": 300,
+            "my_own_note": "keep me",
+        });
+
+        // The keys reset is exactly that — every other setting survives it.
+        let mut cfg = original.clone();
+        strip_for_reset(&mut cfg, ResetScope::Keys);
+        assert!(cfg.get("keys").is_none());
+        assert_eq!(cfg.get("theme"), original.get("theme"));
+        assert_eq!(cfg.get("font_px"), original.get("font_px"));
+
+        // The full reset drops everything the panel writes...
+        let mut cfg = original.clone();
+        strip_for_reset(&mut cfg, ResetScope::All);
+        for k in ["keys", "theme", "font_px", "focus_follows_mouse"] {
+            assert!(cfg.get(k).is_none(), "{k} should be gone");
+        }
+        // ...and nothing else: a reset is not "delete my config file".
+        assert_eq!(cfg.get("persist_screen"), original.get("persist_screen"));
+        assert_eq!(cfg.get("pr_refresh_secs"), original.get("pr_refresh_secs"));
+        assert_eq!(cfg.get("my_own_note"), original.get("my_own_note"));
+
+        // What's left parses, and reads as the shipped defaults rather than as nothing at all.
+        let parsed: crate::config::Config = serde_json::from_value(cfg).expect("still valid config");
+        assert!(parsed.theme.is_none() && parsed.keys.is_none() && parsed.font_px.is_none());
+        assert_eq!(parsed.palette(), crate::config::Config::default().palette());
+        let km = crate::config::Keymap::build(&parsed);
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert_eq!(
+            km.action(ctrl_shift, &Key::Character("d".into())),
+            Some(crate::config::Action::SplitH),
+            "the rebind is gone: the shipped chord runs it again"
+        );
+
+        // An empty config is a fixed point, and a non-object never panics.
+        let mut empty = serde_json::json!({});
+        strip_for_reset(&mut empty, ResetScope::All);
+        assert_eq!(empty, serde_json::json!({}));
+        let mut junk = serde_json::json!("not an object");
+        strip_for_reset(&mut junk, ResetScope::All);
     }
 
     #[test]

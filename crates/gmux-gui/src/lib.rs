@@ -671,8 +671,8 @@ mod tests {
             tabs: ["theme", "keys", "schemes", "accent", "font"].iter().map(|s| s.to_string()).collect(),
             tab: 1,
             rows: crate::app::key_rows_for_preview(),
-            selected: 2,
-            footer: "ctrl+shift+d runs split_h · press again to take · esc cancels".into(),
+            selected: 6, // the reset row, with its question staged
+            footer: crate::app::reset_prompt_for_preview().into(),
         };
         r.render_frame(&view, &rows, sw, &[pane], w, h, "", false, drop_at, Some("ag"), Some(&sb), None, None, Some(&sv));
         let px = read_rgba(&r, &tex, w, h).expect("readback");
