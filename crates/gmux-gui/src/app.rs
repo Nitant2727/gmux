@@ -793,10 +793,13 @@ struct State {
     /// reused for undamaged frames so the always-on underline doesn't flicker. Evicted with
     /// `snap_cache` (same live-pane set).
     link_cache: HashMap<u64, Vec<UrlSpan>>,
-    /// M12: the flag-gated WebView2 browser pane (its own top-level window), opened on the first
-    /// `Browse` request drained from the daemon.
+    /// M12: the flag-gated WebView2 browser panel, opened on the first `Browse` request drained
+    /// from the daemon (or by the toggle) and embedded in this window's right-hand dock.
     #[cfg(feature = "browser")]
     browser: Option<gmux_browser::BrowserPane>,
+    /// Width of the browser panel in px; `0` = hidden. Subtracted from the content area in
+    /// [`State::areas`], so the terminal panes reflow around it.
+    dock_w: u32,
 }
 
 /// Run the gmux GUI. `_shell` is currently unused (the daemon picks its shell); kept for the CLI
@@ -987,6 +990,7 @@ impl ApplicationHandler for App {
             link_cache: HashMap::new(),
             #[cfg(feature = "browser")]
             browser: None,
+            dock_w: 0,
         };
         // sync_size + palette are sent from `poll_connect` once the daemon answers.
         self.state = Some(st);
@@ -1023,6 +1027,7 @@ impl ApplicationHandler for App {
                     st.config.height = sz.height;
                     st.surface.configure(&st.renderer.device, &st.config);
                     st.sync_size();
+                    st.sync_dock_bounds(); // the browser panel rides the window's right edge
                     st.force_full = true; // panes reflow at the new size: refetch every grid
                     st.mark_activity();
                     st.window.request_redraw();
@@ -1497,6 +1502,7 @@ impl State {
                 self.palette = Some(PaletteState { query: String::new(), selected: 0 });
                 self.window.request_redraw();
             }
+            Action::ToggleBrowser => self.toggle_browser_dock(),
             Action::CopyMode => {
                 self.search = None;
                 self.rename = None;
@@ -1730,13 +1736,16 @@ impl State {
             Some(spawn_output_subscriber(self.proxy.clone(), self.damaged.clone(), self.toast_tx.clone()));
     }
 
-    /// M12 (feature "browser"): drain queued Browse requests into the WebView2 pane.
+    /// M12 (feature "browser"): drain queued Browse requests into the browser panel, opening the
+    /// dock if it was closed — `gmux browse --pane <url>` should show you the page, not silently
+    /// load it behind a hidden panel.
     #[cfg(feature = "browser")]
     fn poll_browse(&mut self) {
         if let Ok(ResultBody::Browses(urls)) = self.client.call(Call::PollBrowse) {
             for url in urls {
-                // A pane whose window the user closed can't navigate (the post would be a silent
-                // no-op), so drop the stale handle and open a fresh pane instead.
+                // Still the PROVEN top-level window (round 35/36). The embedded panel is wired up
+                // but does not display yet — see `toggle_browser_dock` and PARKED.md — so routing
+                // `gmux browse --pane` through it would trade a working feature for a broken one.
                 if self.browser.as_ref().is_some_and(|b| !b.navigate(&url)) {
                     self.browser = None;
                 }
@@ -1749,6 +1758,94 @@ impl State {
             }
         }
     }
+
+    /// Default dock width: 40% of the window, floored at 320px and never more than half — a panel
+    /// you can't read is useless, and one that swallows the terminal defeats the point.
+    #[cfg(feature = "browser")]
+    fn default_dock_w(&self) -> u32 {
+        (self.config.width * 2 / 5).clamp(320, (self.config.width / 2).max(320))
+    }
+
+    /// Reserve the dock column (does not create the WebView2 — see `embed_browser`).
+    #[cfg(feature = "browser")]
+    fn open_dock(&mut self) {
+        self.dock_w = self.default_dock_w().min(self.config.width.saturating_sub(200));
+    }
+
+    /// Create the embedded panel at the current dock rect and point it at `url`.
+    #[cfg(feature = "browser")]
+    fn embed_browser(&mut self, url: &str) {
+        let hwnd = window_hwnd(&self.window).unwrap_or(0);
+        if hwnd == 0 {
+            return;
+        }
+        let (x, y, w, h) = self.dock_rect();
+        match gmux_browser::BrowserPane::embed(hwnd, x, y, w, h, url) {
+            Ok(b) => {
+                // Must come from THIS thread — the one that owns the parent window. See
+                // `show_from_parent_thread`.
+                b.show_from_parent_thread();
+                self.browser = Some(b);
+            }
+            Err(e) => eprintln!("gmux: browser panel failed: {e}"),
+        }
+        // The panes just lost the dock's width; tell the daemon so it re-cells them.
+        self.sync_size();
+        self.window.request_redraw();
+    }
+
+    /// Ctrl+Shift+B: show/hide the browser panel. Hiding keeps the WebView2 (and its page + login
+    /// session) alive, so toggling back is instant. The first toggle with no panel yet opens a
+    /// blank page rather than nothing at all.
+    ///
+    /// **Experimental.** The dock's layout half works (the column is reserved and the panes reflow
+    /// around it), but the embedded WebView2 child does not become visible — see PARKED.md. Until
+    /// that is solved, `gmux browse --pane` deliberately keeps using the top-level window.
+    #[cfg(feature = "browser")]
+    fn toggle_browser_dock(&mut self) {
+        if self.dock_w > 0 {
+            self.dock_w = 0;
+            if let Some(b) = &self.browser {
+                b.set_visible(false);
+            }
+        } else {
+            self.open_dock();
+            match &self.browser {
+                Some(b) => {
+                    let (x, y, w, h) = self.dock_rect();
+                    b.set_bounds(x, y, w, h);
+                    b.set_visible(true);
+                    b.show_from_parent_thread();
+                }
+                None => self.embed_browser("about:blank"),
+            }
+        }
+        self.sync_size();
+        self.window.request_redraw();
+    }
+
+    /// Keep the panel glued to its column after a window resize.
+    #[cfg(feature = "browser")]
+    fn sync_dock_bounds(&self) {
+        if self.dock_w == 0 {
+            return;
+        }
+        if let Some(b) = &self.browser {
+            let (x, y, w, h) = self.dock_rect();
+            b.set_bounds(x, y, w, h);
+        }
+    }
+
+    /// Without the `browser` feature the dock never opens, so these are no-ops that keep the call
+    /// sites free of `#[cfg]`.
+    #[cfg(not(feature = "browser"))]
+    fn toggle_browser_dock(&mut self) {
+        self.notice =
+            Some(("browser panel needs a --features browser build".into(), Instant::now()));
+        self.window.request_redraw();
+    }
+    #[cfg(not(feature = "browser"))]
+    fn sync_dock_bounds(&self) {}
 
     /// Handle a left press: in the sidebar, the '+' row opens a new tab and a workspace row selects
     /// that window (and arms a possible tab reorder); in the content area, a split-gap starts a
@@ -2855,8 +2952,18 @@ impl State {
 
     fn areas(&self) -> (u32, u32, u32) {
         let sidebar_w = self.renderer.sidebar_width().min(self.config.width / 3);
-        let content_w = self.config.width.saturating_sub(sidebar_w).max(1);
+        // The browser panel eats from the right of the content area, so the terminal panes reflow
+        // through the SAME ResizeView path a window resize uses — the daemon needs no new concept.
+        let content_w =
+            self.config.width.saturating_sub(sidebar_w).saturating_sub(self.dock_w).max(1);
         (sidebar_w, content_w, self.config.height)
+    }
+
+    /// The browser panel's rect in window coords: the column to the right of the panes.
+    #[cfg(feature = "browser")]
+    fn dock_rect(&self) -> (i32, i32, i32, i32) {
+        let (sidebar_w, content_w, h) = self.areas();
+        ((sidebar_w + content_w) as i32, 0, self.dock_w as i32, h as i32)
     }
 
     /// Scroll the active pane's viewport by `lines` (positive = deeper into history), clamped

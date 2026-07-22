@@ -48,6 +48,8 @@ pub enum Action {
     ExportScrollback,
     /// Enter keyboard copy mode (move with arrows/hjkl, mark with v, copy with y/Enter).
     CopyMode,
+    /// Show/hide the embedded browser panel (needs a `--features browser` build).
+    ToggleBrowser,
     /// Nudge the active pane's split divider by a small fraction (keyboard resize).
     ResizeLeft,
     ResizeRight,
@@ -87,6 +89,7 @@ impl Action {
             "command_palette" => Action::CommandPalette,
             "export_scrollback" => Action::ExportScrollback,
             "copy_mode" => Action::CopyMode,
+            "toggle_browser" => Action::ToggleBrowser,
             "resize_left" => Action::ResizeLeft,
             "resize_right" => Action::ResizeRight,
             "resize_up" => Action::ResizeUp,
@@ -133,6 +136,7 @@ const DEFAULTS: &[(&str, &str, Action)] = &[
     ("command_palette", "ctrl+shift+p", Action::CommandPalette),
     ("export_scrollback", "ctrl+shift+s", Action::ExportScrollback),
     ("copy_mode", "ctrl+shift+m", Action::CopyMode),
+    ("toggle_browser", "ctrl+shift+b", Action::ToggleBrowser),
     ("resize_left", "alt+shift+left", Action::ResizeLeft),
     ("resize_right", "alt+shift+right", Action::ResizeRight),
     ("resize_up", "alt+shift+up", Action::ResizeUp),
@@ -562,6 +566,15 @@ mod tests {
             let (m, k) = parse_chord(chord).unwrap();
             assert_eq!(km.action(m, &k), Some(*action));
         }
+    }
+
+    #[test]
+    fn toggle_browser_binds_and_names() {
+        // Ctrl+Shift+B toggles the embedded browser panel out of the box.
+        let km = Keymap::default();
+        let (m, k) = parse_chord("ctrl+shift+b").unwrap();
+        assert_eq!(km.action(m, &k), Some(Action::ToggleBrowser));
+        assert_eq!(Action::from_name("toggle_browser"), Some(Action::ToggleBrowser));
     }
 
     #[test]
