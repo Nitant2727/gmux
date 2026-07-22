@@ -566,6 +566,7 @@ dependencies = [
  "gmux-gui",
  "gmux-pipe",
  "gmux-proto",
+ "gmux-pty",
  "gmux-server",
  "serde_json",
  "toml_edit 0.22.27",

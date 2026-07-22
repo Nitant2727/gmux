@@ -62,6 +62,12 @@ struct Inner {
     /// panel, every keystroke goes to WebView2 and the app's own keymap never sees the toggle —
     /// so the panel could be opened but not closed. The app polls this each event-loop pass.
     toggle_requested: Cell<bool>,
+    /// What the address bar shows: the page's current URI, updated by `SourceChanged` so links
+    /// clicked inside the page are reflected too, not just app-driven navigations.
+    url: RefCell<String>,
+    /// Whether back/forward can act, from `HistoryChanged` — the bar dims dead buttons.
+    can_back: Cell<bool>,
+    can_fwd: Cell<bool>,
 }
 
 impl EmbeddedBrowser {
@@ -80,6 +86,9 @@ impl EmbeddedBrowser {
             bounds: Cell::new(RECT { left: x, top: y, right: x + w, bottom: y + h }),
             visible: Cell::new(true),
             toggle_requested: Cell::new(false),
+            url: RefCell::new(url.to_string()),
+            can_back: Cell::new(false),
+            can_fwd: Cell::new(false),
         });
         let for_env = Rc::clone(&inner);
         // `CreateCoreWebView2Environment` is async; its handler then starts the controller, whose
@@ -145,6 +154,46 @@ impl EmbeddedBrowser {
     pub fn take_toggle_request(&self) -> bool {
         self.inner.toggle_requested.replace(false)
     }
+
+    /// The page's current URI — what the address bar shows. Tracks in-page navigation too.
+    pub fn current_url(&self) -> String {
+        self.inner.url.borrow().clone()
+    }
+
+    /// `(can_go_back, can_go_forward)` for the nav buttons.
+    pub fn nav_state(&self) -> (bool, bool) {
+        (self.inner.can_back.get(), self.inner.can_fwd.get())
+    }
+
+    pub fn go_back(&self) {
+        if let Some(c) = self.inner.controller.borrow().as_ref() {
+            unsafe {
+                if let Ok(wv) = c.CoreWebView2() {
+                    let _ = wv.GoBack();
+                }
+            }
+        }
+    }
+
+    pub fn go_forward(&self) {
+        if let Some(c) = self.inner.controller.borrow().as_ref() {
+            unsafe {
+                if let Ok(wv) = c.CoreWebView2() {
+                    let _ = wv.GoForward();
+                }
+            }
+        }
+    }
+
+    pub fn reload(&self) {
+        if let Some(c) = self.inner.controller.borrow().as_ref() {
+            unsafe {
+                if let Ok(wv) = c.CoreWebView2() {
+                    let _ = wv.Reload();
+                }
+            }
+        }
+    }
 }
 
 impl Inner {
@@ -180,6 +229,49 @@ impl Inner {
         let mut token = 0i64;
         unsafe {
             let _ = controller.add_AcceleratorKeyPressed(&handler, &mut token);
+        }
+        // Track the page's URI and history state for the address bar. One updater serves both
+        // events: `SourceChanged` fires on navigation (links included), `HistoryChanged` when
+        // back/forward availability moves.
+        if let Ok(wv) = unsafe { controller.CoreWebView2() } {
+            let sync = {
+                let inner = Rc::clone(self);
+                move |wv: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2| unsafe {
+                    let mut uri = windows::core::PWSTR::null();
+                    if wv.Source(&mut uri).is_ok() && !uri.is_null() {
+                        *inner.url.borrow_mut() = String::from_utf16_lossy(uri.as_wide());
+                        // COM allocated the string; freeing it is on us.
+                        windows::Win32::System::Com::CoTaskMemFree(Some(uri.0 as *const _));
+                    }
+                    let (mut back, mut fwd) = (windows::core::BOOL(0), windows::core::BOOL(0));
+                    let _ = wv.CanGoBack(&mut back);
+                    let _ = wv.CanGoForward(&mut fwd);
+                    inner.can_back.set(back.as_bool());
+                    inner.can_fwd.set(fwd.as_bool());
+                }
+            };
+            let on_source = sync.clone();
+            let src_handler = webview2_com::SourceChangedEventHandler::create(Box::new(
+                move |sender, _| {
+                    if let Some(wv) = sender {
+                        on_source(&wv);
+                    }
+                    Ok(())
+                },
+            ));
+            let hist_handler = webview2_com::HistoryChangedEventHandler::create(Box::new(
+                move |sender, _| {
+                    if let Some(wv) = sender {
+                        sync(&wv);
+                    }
+                    Ok(())
+                },
+            ));
+            let (mut t1, mut t2) = (0i64, 0i64);
+            unsafe {
+                let _ = wv.add_SourceChanged(&src_handler, &mut t1);
+                let _ = wv.add_HistoryChanged(&hist_handler, &mut t2);
+            }
         }
         *self.controller.borrow_mut() = Some(controller);
         // WebView2 takes keyboard focus as it comes up; give it back to the terminal — opening a

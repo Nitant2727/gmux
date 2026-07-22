@@ -447,6 +447,67 @@ pub struct SettingsView {
     pub offset: usize,
 }
 
+/// The browser panel's chrome, drawn by the app across the dock's top edge: back / forward /
+/// reload and an address bar, the way Claude desktop frames its preview browser. The WebView2
+/// below owns its own rect and can't draw outside it, so this strip is the app's.
+pub struct BrowserBar {
+    /// Dock rect in window coords: the bar spans `x..x+w` at `y = 0..BROWSER_BAR_H`.
+    pub x: f32,
+    pub w: f32,
+    /// The page's current URI (tracks links clicked inside the page).
+    pub url: String,
+    /// `Some` while the address bar is being edited: the buffer, drawn with a caret in place of
+    /// the URL. Enter navigates, Escape puts the URL back.
+    pub editing: Option<String>,
+    pub can_back: bool,
+    pub can_fwd: bool,
+}
+
+/// Height of the browser chrome strip; the WebView2 sits below it.
+pub const BROWSER_BAR_H: f32 = 40.0;
+/// Side of one nav button's hit square, and the bar's inner padding.
+const BAR_BTN: f32 = 26.0;
+const BAR_PAD: f32 = 8.0;
+
+/// What a click in the browser bar landed on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BarHit {
+    Back,
+    Forward,
+    Reload,
+    Url,
+}
+
+/// The bar's button/field rects for a dock at `(x, w)`: `(back, fwd, reload, url_field)`, each
+/// `(x0, x1)` — everything is vertically centred in the strip, so x is the only per-item axis.
+/// One source of geometry for the drawing and the hit-test, settings-card style.
+fn browser_bar_layout(x: f32, w: f32) -> ((f32, f32), (f32, f32), (f32, f32), (f32, f32)) {
+    let back = (x + BAR_PAD, x + BAR_PAD + BAR_BTN);
+    let fwd = (back.1 + 2.0, back.1 + 2.0 + BAR_BTN);
+    let reload = (fwd.1 + 2.0, fwd.1 + 2.0 + BAR_BTN);
+    let url = ((reload.1 + BAR_PAD).min(x + w), (x + w - BAR_PAD).max(reload.1 + BAR_PAD));
+    (back, fwd, reload, url)
+}
+
+/// Hit-test a click at `(cx, cy)` (window coords) against the bar of a dock at `(x, w)`.
+pub fn browser_bar_hit(cx: f32, cy: f32, x: f32, w: f32) -> Option<BarHit> {
+    if cy < 0.0 || cy >= BROWSER_BAR_H || cx < x || cx >= x + w {
+        return None;
+    }
+    let (back, fwd, reload, url) = browser_bar_layout(x, w);
+    if cx >= back.0 && cx < back.1 {
+        Some(BarHit::Back)
+    } else if cx >= fwd.0 && cx < fwd.1 {
+        Some(BarHit::Forward)
+    } else if cx >= reload.0 && cx < reload.1 {
+        Some(BarHit::Reload)
+    } else if cx >= url.0 && cx < url.1 {
+        Some(BarHit::Url)
+    } else {
+        None
+    }
+}
+
 /// The active pane's search overlay: a band drawn at the pane bottom. `current`/`total` are shown
 /// as-is (app.rs owns their semantics); `total == 0` with a non-empty `query` renders "no matches".
 /// Also reused as a generic prompt band (close confirmation): a custom `label`, empty query, and
@@ -1731,6 +1792,7 @@ impl Renderer {
         preedit: Option<&str>,
         palette: Option<&PaletteView>,
         settings: Option<&SettingsView>,
+        browser: Option<&BrowserBar>,
     ) {
         let (fw, fh) = (surf_w.max(1) as f32, surf_h.max(1) as f32);
         // `sbg` is the opaque sidebar panel; `srd` is the rounded chrome (sidebar rows + pane
@@ -1982,6 +2044,56 @@ impl Renderer {
                 let hw = hint.chars().count() as f32 * cw_cell;
                 self.text_run(hint, (px + pw - PAD - hw).max(px + PAD), ry + 4.0, rgba(TEXT_DIM), fw, fh, &mut ogl);
             }
+        }
+
+        // Browser chrome: nav buttons + address bar across the dock's top edge. Not modal — it is
+        // ordinary chrome, so every overlay below (palette, settings) draws over it.
+        if let Some(bar) = browser {
+            let (bx, bw) = (bar.x, bar.w);
+            let (back, fwd, reload, url) = browser_bar_layout(bx, bw);
+            // The strip itself, with a hairline seam against the page below.
+            push_rounded(&mut obg, bx, 0.0, bx + bw, BROWSER_BAR_H, 1.0, rgba(BG_SIDEBAR), fw, fh);
+            push_rounded(&mut obg, bx, BROWSER_BAR_H - 1.0, bx + bw, BROWSER_BAR_H, 0.5, rgba_a(TEXT, 0.08), fw, fh);
+            let ty = (BROWSER_BAR_H - ch_cell) / 2.0;
+            // Back / forward: glyph buttons, dimmed when history can't go that way.
+            for (label, (x0, x1), on) in
+                [("<", back, bar.can_back), (">", fwd, bar.can_fwd)]
+            {
+                let ink = if on { rgba(TEXT) } else { rgba_a(TEXT_DIM, 0.45) };
+                self.text_run(label, x0 + (x1 - x0 - cw_cell) / 2.0, ty, ink, fw, fh, &mut ogl);
+            }
+            // Reload: a ring with a notch — drawn, because the glyph atlas is ASCII-only.
+            {
+                let (cx, cy) = ((reload.0 + reload.1) / 2.0, BROWSER_BAR_H / 2.0);
+                let r = 6.0;
+                push_rounded(&mut obg, cx - r, cy - r, cx + r, cy + r, r, rgba(TEXT_DIM), fw, fh);
+                let ri = r - 2.0;
+                push_rounded(&mut obg, cx - ri, cy - ri, cx + ri, cy + ri, ri, rgba(BG_SIDEBAR), fw, fh);
+                // Notch at the top-right, with a small arrow-head block beside it.
+                push_rounded(&mut obg, cx + 1.0, cy - r - 1.0, cx + r + 1.0, cy - 1.0, 1.0, rgba(BG_SIDEBAR), fw, fh);
+                push_rounded(&mut obg, cx + 1.5, cy - r - 1.0, cx + 5.5, cy - r + 3.0, 1.0, rgba(TEXT_DIM), fw, fh);
+            }
+            // The address field: a rounded input, accent-ringed while editing.
+            let (ux0, ux1) = url;
+            let (fy0, fy1) = (7.0, BROWSER_BAR_H - 7.0);
+            push_rounded(&mut obg, ux0, fy0, ux1, fy1, 6.0, rgba(BG_PANE), fw, fh);
+            let ring = if bar.editing.is_some() { rgba_a(accent(), 0.9) } else { rgba_a(TEXT, 0.10) };
+            stroke_rounded(&mut obg, ux0, fy0, ux1, fy1, 6.0, 1.0, ring, fw, fh);
+            let (text, ink) = match &bar.editing {
+                Some(buf) => (format!("{buf}_"), rgba(TEXT)),
+                None => (bar.url.clone(), rgba(TEXT_DIM)),
+            };
+            // Clip to the field: keep the START of the URL (scheme + host are what identify it).
+            let fit = (((ux1 - ux0 - 20.0) / cw_cell).max(0.0)) as usize;
+            // ".." marks the cut, not an ellipsis glyph: the atlas is ASCII-only.
+            let shown: String = if text.chars().count() > fit && fit > 2 {
+                let mut s: String = text.chars().take(fit - 2).collect();
+                s.push_str("..");
+                s
+            } else {
+                text.chars().take(fit).collect()
+            };
+            self.text_run(&shown, ux0 + 10.0, ty, ink, fw, fh, &mut ogl);
         }
 
         // Settings panel: a centered card with a tab strip, `label ......... value` rows, and a
@@ -2679,7 +2791,7 @@ mod tests {
             dragging: false,
         };
         let sb = SearchBar { label: "find:".into(), query: "hi".into(), current: 1, total: 1, overlay_only: false };
-        r.render_frame(&view, &[], 0, &[pv], 1, 1, "", false, None, None, Some(&sb), None, None, None);
+        r.render_frame(&view, &[], 0, &[pv], 1, 1, "", false, None, None, Some(&sb), None, None, None, None);
         let _ = r.device.poll(wgpu::PollType::wait_indefinitely());
     }
 }
