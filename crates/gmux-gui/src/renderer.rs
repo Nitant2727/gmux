@@ -292,6 +292,20 @@ pub struct PaletteView {
     pub selected: usize,
 }
 
+/// The settings overlay (Ctrl+,): a centered panel with a tab strip and a list of
+/// `(label, value)` rows. The app owns what the rows mean and what Enter does to them; the
+/// renderer only lays them out.
+pub struct SettingsView {
+    pub tabs: Vec<String>,
+    /// Index into `tabs` of the open section.
+    pub tab: usize,
+    pub rows: Vec<(String, String)>,
+    /// Index into `rows` of the highlighted row.
+    pub selected: usize,
+    /// Hint line along the bottom (changes while capturing a chord).
+    pub footer: String,
+}
+
 /// The active pane's search overlay: a band drawn at the pane bottom. `current`/`total` are shown
 /// as-is (app.rs owns their semantics); `total == 0` with a non-empty `query` renders "no matches".
 /// Also reused as a generic prompt band (close confirmation): a custom `label`, empty query, and
@@ -1535,6 +1549,7 @@ impl Renderer {
         search: Option<&SearchBar>,
         preedit: Option<&str>,
         palette: Option<&PaletteView>,
+        settings: Option<&SettingsView>,
     ) {
         let (fw, fh) = (surf_w.max(1) as f32, surf_h.max(1) as f32);
         // `sbg` is the opaque sidebar panel; `srd` is the rounded chrome (sidebar rows + pane
@@ -1786,6 +1801,52 @@ impl Renderer {
                 let hw = hint.chars().count() as f32 * cw_cell;
                 self.text_run(hint, (px + pw - PAD - hw).max(px + PAD), ry + 4.0, rgba(TEXT_DIM), fw, fh, &mut ogl);
             }
+        }
+
+        // Settings panel: a centered card with a tab strip, `label ......... value` rows, and a
+        // footer of key hints. Taller than the palette because it lists every keybinding, so it is
+        // capped to the window and the app scrolls its row window.
+        if let Some(sv) = settings {
+            const SET_W: f32 = 640.0;
+            const PAD: f32 = 14.0;
+            let row_h = ch_cell + 8.0;
+            let pw = SET_W.min(fw - 24.0).max(160.0);
+            let head = row_h + 10.0; // tab strip
+            let ph = (PAD * 2.0 + head + row_h * (sv.rows.len() as f32 + 1.0)).min(fh - 32.0);
+            let px = ((fw - pw) / 2.0).max(0.0);
+            let py = ((fh - ph) / 2.0).max(8.0);
+            // A hairline-ringed card, one step above the sidebar so it reads as "on top".
+            push_rounded(&mut obg, px, py, px + pw, py + ph, RADIUS, rgba(SIDEBAR_ROW_HOVER), fw, fh);
+            stroke_rounded(&mut obg, px, py, px + pw, py + ph, RADIUS, 1.0, rgba_a(TEXT, 0.10), fw, fh);
+
+            // Tab strip: the open section is an accent pill, the others dim text.
+            let mut tx = px + PAD;
+            for (i, name) in sv.tabs.iter().enumerate() {
+                let tw = name.chars().count() as f32 * cw_cell;
+                if i == sv.tab {
+                    push_rounded(&mut obg, tx - 6.0, py + PAD - 2.0, tx + tw + 6.0, py + PAD + ch_cell + 4.0, BADGE_RADIUS, rgba(accent()), fw, fh);
+                }
+                let ink = if i == sv.tab { on_accent(accent()) } else { TEXT_DIM };
+                self.text_run(name, tx, py + PAD, rgba(ink), fw, fh, &mut ogl);
+                tx += tw + 22.0;
+            }
+
+            let rows_y = py + PAD + head;
+            for (i, (label, value)) in sv.rows.iter().enumerate() {
+                let ry = rows_y + row_h * i as f32;
+                if ry + row_h > py + ph - row_h {
+                    break; // clipped by the card; the app windows the rows
+                }
+                if i == sv.selected {
+                    push_rounded(&mut obg, px + 4.0, ry, px + pw - 4.0, ry + row_h, RADIUS - 2.0, rgba(SIDEBAR_ROW_ACTIVE), fw, fh);
+                }
+                self.text_run(label, px + PAD, ry + 4.0, rgba(TEXT), fw, fh, &mut ogl);
+                let vw = value.chars().count() as f32 * cw_cell;
+                let ink = if i == sv.selected { accent() } else { TEXT_DIM };
+                self.text_run(value, (px + pw - PAD - vw).max(px + PAD), ry + 4.0, rgba(ink), fw, fh, &mut ogl);
+            }
+            // Footer hints, pinned to the card's bottom edge.
+            self.text_run(&sv.footer, px + PAD, py + ph - PAD - ch_cell, rgba(TEXT_DIM), fw, fh, &mut ogl);
         }
 
         let sbg_buf = vb(bytemuck::cast_slice(&sbg));
@@ -2291,7 +2352,7 @@ mod tests {
             dragging: false,
         };
         let sb = SearchBar { label: "find:".into(), query: "hi".into(), current: 1, total: 1, overlay_only: false };
-        r.render_frame(&view, &[], 0, &[pv], 1, 1, "", false, None, None, Some(&sb), None, None);
+        r.render_frame(&view, &[], 0, &[pv], 1, 1, "", false, None, None, Some(&sb), None, None, None);
         let _ = r.device.poll(wgpu::PollType::wait_indefinitely());
     }
 }
