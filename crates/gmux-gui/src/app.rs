@@ -2465,7 +2465,13 @@ impl State {
                 .as_ref()
                 .and_then(|t| t.accent.clone())
                 .unwrap_or_else(|| "default".to_string());
+            let preset = cfg
+                .theme
+                .as_ref()
+                .and_then(|t| t.preset.clone())
+                .unwrap_or_else(|| "default".to_string());
             vec![
+                ("color scheme".to_string(), preset),
                 ("accent".to_string(), accent),
                 ("font size".to_string(), format!("{:.0} px", self.font_px)),
                 (
@@ -2557,10 +2563,38 @@ impl State {
         self.window.request_redraw();
     }
 
-    /// Enter on a theme row: cycle the accent, step the font size, or flip the boolean.
+    /// Enter on a theme row: cycle the colour scheme or accent, step the font size, or flip the
+    /// boolean.
     fn apply_theme_row(&mut self, sel: usize) {
         match sel {
             0 => {
+                let cur = Config::load().theme.and_then(|t| t.preset);
+                let names = crate::config::preset_names();
+                let idx = cur
+                    .as_deref()
+                    .and_then(|c| names.iter().position(|n| n.eq_ignore_ascii_case(c)))
+                    .unwrap_or(0);
+                let next = names[(idx + 1) % names.len()];
+                self.write_config(|cfg| {
+                    let theme = cfg
+                        .as_object_mut()
+                        .unwrap()
+                        .entry("theme")
+                        .or_insert_with(|| serde_json::json!({}));
+                    if let Some(map) = theme.as_object_mut() {
+                        if next == "default" {
+                            map.remove("preset");
+                        } else {
+                            map.insert("preset".into(), serde_json::Value::String(next.into()));
+                        }
+                        // fg/bg are the LAST layer, so leaving them set would keep overriding the
+                        // scheme you just picked — a preset supplies both, so they go with it.
+                        map.remove("fg");
+                        map.remove("bg");
+                    }
+                });
+            }
+            1 => {
                 let cur = Config::load().theme.and_then(|t| t.accent);
                 let idx = cur
                     .as_deref()
@@ -2583,7 +2617,7 @@ impl State {
                     }
                 });
             }
-            1 => {
+            2 => {
                 // Wrap at the clamp so one key can walk the whole range.
                 let next = if self.font_px >= 28.0 { 10.0 } else { self.font_px + 2.0 };
                 self.write_config(|cfg| {
@@ -2594,7 +2628,7 @@ impl State {
                 self.config_font_px = next;
                 self.apply_font_px(next);
             }
-            2 => {
+            3 => {
                 let next = !self.focus_follows_mouse;
                 self.write_config(|cfg| {
                     cfg.as_object_mut()
