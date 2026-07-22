@@ -196,6 +196,12 @@ impl Window {
         pane
     }
 
+    /// Swap two panes' positions in this window's split tree (a drag-and-drop rearrange). The
+    /// layout's shape is untouched; only which pane sits in which slot changes.
+    pub fn swap_panes(&mut self, a: PaneId, b: PaneId) -> bool {
+        self.root.swap_leaves(a, b)
+    }
+
     /// Move focus spatially within a `(w, h)` area.
     pub fn focus_dir(&mut self, dir: FocusDir, w: u32, h: u32) {
         let rs = self.layout_rects(w, h);

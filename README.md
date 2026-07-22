@@ -89,6 +89,9 @@ No more splitting into whatever directory the daemon happened to start in.
 From the CLI: `gmux new-window --cwd <dir>` opens one, and `gmux workspace -t @2 <dir>` re-anchors
 an existing workspace (`--clear` unpins it). `Ctrl+Shift+T` still opens a plain unanchored tab.
 
+**Rearranging panes.** Drag a pane by its title strip onto another pane to swap the two — the split
+shape stays put, the contents trade places. The receiving pane's strip lights up before you let go.
+
 **Pane title bars.** Each pane carries a title strip: the active one is tinted with the accent and
 its title is full-strength, inactive ones stay neutral and dim, so focus survives a four-way split.
 The active pane (and whichever pane you're hovering) shows a close button at the strip's right end;

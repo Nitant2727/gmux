@@ -40,7 +40,7 @@ impl Rect {
 }
 
 /// The split tree.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Node {
     Leaf(PaneId),
     Split { dir: SplitDir, ratio: f32, a: Box<Node>, b: Box<Node> },
@@ -66,6 +66,35 @@ impl Node {
             }
             Node::Leaf(_) => false,
             Node::Split { a, b, .. } => a.split_leaf(target, dir, new) || b.split_leaf(target, dir, new),
+        }
+    }
+
+    /// Swap two panes' positions in the tree, leaving the split structure (directions and ratios)
+    /// untouched — a drag-and-drop rearrange moves the CONTENT between slots, not the slots.
+    /// Returns `false` unless both ids are present. Pure/tested.
+    pub fn swap_leaves(&mut self, x: PaneId, y: PaneId) -> bool {
+        if x == y {
+            return false;
+        }
+        let mut ids = Vec::new();
+        self.leaves(&mut ids);
+        if !ids.contains(&x) || !ids.contains(&y) {
+            return false;
+        }
+        self.relabel(x, y);
+        true
+    }
+
+    /// Exchange the labels of leaves `x` and `y` wherever they appear.
+    fn relabel(&mut self, x: PaneId, y: PaneId) {
+        match self {
+            Node::Leaf(id) if *id == x => *id = y,
+            Node::Leaf(id) if *id == y => *id = x,
+            Node::Leaf(_) => {}
+            Node::Split { a, b, .. } => {
+                a.relabel(x, y);
+                b.relabel(x, y);
+            }
         }
     }
 
@@ -227,6 +256,44 @@ mod tests {
 
     fn p(n: u64) -> PaneId {
         PaneId(n)
+    }
+
+    #[test]
+    fn swap_leaves_moves_panes_without_reshaping_the_tree() {
+        // A three-pane layout: 1 beside (2 stacked over 3).
+        let mut root = Node::leaf(p(1));
+        root.split_leaf(p(1), SplitDir::Horizontal, p(2));
+        root.split_leaf(p(2), SplitDir::Vertical, p(3));
+        let before = root.clone();
+
+        assert!(root.swap_leaves(p(1), p(3)));
+        let mut ids = Vec::new();
+        root.leaves(&mut ids);
+        assert_eq!(ids, vec![p(3), p(2), p(1)], "1 and 3 traded slots");
+
+        // The SHAPE is untouched — same splits, same ratios; only the labels moved.
+        let shape = |n: &Node| {
+            fn walk(n: &Node, out: &mut Vec<(bool, f32)>) {
+                if let Node::Split { dir, ratio, a, b } = n {
+                    out.push((*dir == SplitDir::Horizontal, *ratio));
+                    walk(a, out);
+                    walk(b, out);
+                }
+            }
+            let mut out = Vec::new();
+            walk(n, &mut out);
+            out
+        };
+        assert_eq!(shape(&root), shape(&before), "split directions and ratios unchanged");
+
+        // Swapping back restores the original tree exactly.
+        assert!(root.swap_leaves(p(3), p(1)));
+        assert_eq!(root, before);
+
+        // Degenerate/unknown ids are refused rather than corrupting the tree.
+        assert!(!root.swap_leaves(p(1), p(1)), "a pane cannot swap with itself");
+        assert!(!root.swap_leaves(p(1), p(99)), "an unknown id is refused");
+        assert_eq!(root, before, "a refused swap leaves the tree alone");
     }
 
     #[test]

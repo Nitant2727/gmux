@@ -12,25 +12,32 @@ use crate::config::AccentChoice;
 // Design tokens (single source of truth).
 // Fluent dark (WinUI layer/accent tokens): neutral gray layers, cyan accent, semantic status hues.
 // The accent is a runtime value ([`accent`]) — WinUI apps follow the user's Windows accent color.
-const BG_APP: Rgb = Rgb { r: 0x1a, g: 0x1a, b: 0x1a }; // window / between-pane background
-const BG_SIDEBAR: Rgb = Rgb { r: 0x20, g: 0x20, b: 0x20 };
-const BG_PANE: Rgb = Rgb { r: 0x27, g: 0x27, b: 0x27 }; // pane fill + letterbox
-const SIDEBAR_ROW_ACTIVE: Rgb = Rgb { r: 0x33, g: 0x33, b: 0x33 };
-const SIDEBAR_ROW_HOVER: Rgb = Rgb { r: 0x2a, g: 0x2a, b: 0x2a }; // between BG_SIDEBAR and active
+// Near-black neutrals: the chrome should sit UNDER the terminal, not beside it. Each layer is a
+// small step up from the one behind it (app < sidebar < pane), which is enough separation on an
+// OLED-ish dark surface without the mid-grey haze the Fluent defaults had.
+const BG_APP: Rgb = Rgb { r: 0x0b, g: 0x0b, b: 0x0d }; // window / between-pane background
+const BG_SIDEBAR: Rgb = Rgb { r: 0x11, g: 0x11, b: 0x14 };
+const BG_PANE: Rgb = Rgb { r: 0x15, g: 0x15, b: 0x18 }; // pane fill + letterbox
+const SIDEBAR_ROW_ACTIVE: Rgb = Rgb { r: 0x22, g: 0x22, b: 0x26 };
+const SIDEBAR_ROW_HOVER: Rgb = Rgb { r: 0x1a, g: 0x1a, b: 0x1e }; // between BG_SIDEBAR and active
 // cmux's accent (its `cmuxAccentNSColor` for the dark scheme: rgb 0,145,255). gmux follows it by
 // default so the two apps look like the same product; `"accent": "system"` opts into the Windows
 // accent instead, and any hex pins a custom one.
-const ACCENT_FALLBACK: Rgb = Rgb { r: 0x00, g: 0x91, b: 0xff };
-const TEXT: Rgb = Rgb { r: 0xff, g: 0xff, b: 0xff };
-const TEXT_DIM: Rgb = Rgb { r: 0x9d, g: 0x9d, b: 0x9d };
+// Softened from cmux's rgb(0,145,255): against near-black neutrals the pure cyan-blue glares,
+// especially as a solid row fill you look at all day. Same hue family, less saturation burn.
+const ACCENT_FALLBACK: Rgb = Rgb { r: 0x3b, g: 0x8a, b: 0xe6 };
+// Not pure white on near-black — 0xff on 0x0b is harsh at a terminal's text density.
+const TEXT: Rgb = Rgb { r: 0xe8, g: 0xe8, b: 0xec };
+const TEXT_DIM: Rgb = Rgb { r: 0x7e, g: 0x80, b: 0x88 };
 // cmux rings a pane that wants you in systemBlue, not a warning color — attention there means
 // "this agent has news", not "this is broken". Matching it (macOS dark systemBlue).
-const ATTENTION: Rgb = Rgb { r: 0x0a, g: 0x84, b: 0xff }; // attention dot / ring
-const PEACH: Rgb = Rgb { r: 0xff, g: 0xd3, b: 0x3a }; // search-match highlight (Fluent caution)
-const PROGRESS: Rgb = Rgb { r: 0x6c, g: 0xcb, b: 0x5f };
-const ERROR: Rgb = Rgb { r: 0xff, g: 0x99, b: 0xa4 };
-const PANE_BORDER_INACTIVE: Rgb = Rgb { r: 0x38, g: 0x38, b: 0x38 };
-const CURSOR: Rgb = Rgb { r: 0xd4, g: 0xd4, b: 0xd4 };
+const ATTENTION: Rgb = Rgb { r: 0x4d, g: 0x9a, b: 0xf0 }; // attention dot / ring
+const PEACH: Rgb = Rgb { r: 0xe3, g: 0xb3, b: 0x41 }; // search-match highlight
+const PROGRESS: Rgb = Rgb { r: 0x5f, g: 0xb0, b: 0x71 };
+const ERROR: Rgb = Rgb { r: 0xe0, g: 0x7b, b: 0x86 };
+// Barely-there border: on near-black, a light-grey outline is the loudest thing on screen.
+const PANE_BORDER_INACTIVE: Rgb = Rgb { r: 0x24, g: 0x24, b: 0x29 };
+const CURSOR: Rgb = Rgb { r: 0xc8, g: 0xc8, b: 0xd0 };
 
 // Spacing (8px grid).
 const MARGIN: f32 = 8.0; // outer margin around the pane area
@@ -214,6 +221,10 @@ pub struct PaneView<'a> {
     /// Draw a close button in this pane's title strip (the active pane, or the hovered one) —
     /// always-on close buttons in every pane of a busy split are visual noise.
     pub show_close: bool,
+    /// A pane rearrange is hovering this pane: it would receive the dragged pane on release.
+    pub drop_target: bool,
+    /// This pane is the one being dragged.
+    pub dragging: bool,
 }
 
 /// One workspace (window/tab) row in the sidebar.
@@ -989,6 +1000,8 @@ impl Renderer {
             view,
             &[PaneView {
                 show_close: false,
+                drop_target: false,
+                dragging: false,
                 snap,
                 attention,
                 active: true,
@@ -1150,6 +1163,13 @@ impl Renderer {
     /// Whether `(x, y)` (window coords) lands on the close button in pane `rect`'s title strip.
     /// `rect` is the pane's OUTER rect as the app caches it, already shifted by the sidebar; the
     /// insets here mirror what `render_frame` draws.
+    /// Whether `(x, y)` (window coords) is inside pane `rect`'s title strip — the grab handle for
+    /// a pane rearrange. Uses the same chrome rect the strip is drawn into.
+    pub fn title_strip_hit(&self, x: f32, y: f32, rect: Rect, sidebar_w: u32, surf_w: u32, surf_h: u32) -> bool {
+        let (cx, cy, cw_, _) = pane_chrome_rect(rect, sidebar_w, surf_w, surf_h);
+        x >= cx && x < cx + cw_ && y >= cy && y < cy + TITLE_STRIP + BORDER
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn pane_close_hit(&self, x: f32, y: f32, rect: Rect, sidebar_w: u32, surf_w: u32, surf_h: u32, active: bool, attention: Attention) -> bool {
         let cw = self.cell_w() as f32;
@@ -1584,7 +1604,17 @@ impl Renderer {
             // The ACTIVE pane's strip is tinted toward the accent and its title is full-strength;
             // inactive strips stay neutral and dim. Focus was previously carried only by the 1px
             // border and the glow, which is easy to lose in a four-way split.
-            let base = if pv.active { blend(accent(), BG_SIDEBAR, 0.16) } else { BG_SIDEBAR };
+            // A rearrange in flight: the receiving pane's strip goes accent, the dragged one's
+            // dims — so the swap reads as "these two trade places" before you let go.
+            let base = if pv.drop_target {
+                blend(accent(), BG_SIDEBAR, 0.55)
+            } else if pv.dragging {
+                blend(TEXT, BG_SIDEBAR, 0.02)
+            } else if pv.active {
+                blend(accent(), BG_SIDEBAR, 0.16)
+            } else {
+                BG_SIDEBAR
+            };
             let (t_top, t_bot) = (rgba(blend(TEXT, base, 0.05)), rgba(base));
             push_rounded_grad(&mut srd, sx0, sy0, sx1, sy1, sr, t_top, t_bot, fw, fh);
             push_rounded_grad(&mut srd, sx0, sy0 + sr, sx1, sy1, 0.0, t_top, t_bot, fw, fh);
@@ -2257,6 +2287,8 @@ mod tests {
             title: "t".into(),
             selection: None,
             show_close: false,
+            drop_target: false,
+            dragging: false,
         };
         let sb = SearchBar { label: "find:".into(), query: "hi".into(), current: 1, total: 1, overlay_only: false };
         r.render_frame(&view, &[], 0, &[pv], 1, 1, "", false, None, None, Some(&sb), None, None);
