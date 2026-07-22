@@ -174,6 +174,9 @@ pub struct Theme {
     /// full palette; missing keys keep the built-in defaults. A relative path resolves against
     /// the config directory (`%APPDATA%\gmux\`), not the process cwd.
     pub scheme: Option<PathBuf>,
+    /// A built-in colour scheme by name (see [`PRESETS`]) — the coarsest layer, so `scheme`,
+    /// `ansi`, and `fg`/`bg` still refine it. Unset or unknown = the gmux defaults.
+    pub preset: Option<String>,
     /// Non-WT inline path: 16 `"#rrggbb"` strings for the ANSI 0..=15 system colors. Applied over
     /// the defaults (and over `scheme`, if both are given); entries past 16 or bad hex are ignored.
     pub ansi: Option<Vec<String>>,
@@ -203,6 +206,86 @@ const DEFAULT_PALETTE: Palette = Palette {
         [0x00, 0x00, 0xff], [0xff, 0x00, 0xff], [0x00, 0xff, 0xff], [0xff, 0xff, 0xff],
     ],
 };
+
+/// The built-in colour schemes, each the scheme's own published palette. Selected by name through
+/// `theme.preset` and cycled by the settings panel; the order here is the order the panel cycles.
+/// "default" is deliberately absent — it means *no* preset, so [`DEFAULT_PALETTE`] stands.
+pub const PRESETS: &[(&str, Palette)] = &[
+    ("campbell", Palette {
+        fg: [0xcc, 0xcc, 0xcc], bg: [0x0c, 0x0c, 0x0c],
+        ansi: [
+            [0x0c, 0x0c, 0x0c], [0xc5, 0x0f, 0x1f], [0x13, 0xa1, 0x0e], [0xc1, 0x9c, 0x00],
+            [0x00, 0x37, 0xda], [0x88, 0x17, 0x98], [0x3a, 0x96, 0xdd], [0xcc, 0xcc, 0xcc],
+            [0x76, 0x76, 0x76], [0xe7, 0x48, 0x56], [0x16, 0xc6, 0x0c], [0xf9, 0xf1, 0xa5],
+            [0x3b, 0x78, 0xff], [0xb4, 0x00, 0x9e], [0x61, 0xd6, 0xd6], [0xf2, 0xf2, 0xf2],
+        ],
+    }),
+    ("one-dark", Palette {
+        fg: [0xab, 0xb2, 0xbf], bg: [0x28, 0x2c, 0x34],
+        ansi: [
+            [0x28, 0x2c, 0x34], [0xe0, 0x6c, 0x75], [0x98, 0xc3, 0x79], [0xe5, 0xc0, 0x7b],
+            [0x61, 0xaf, 0xef], [0xc6, 0x78, 0xdd], [0x56, 0xb6, 0xc2], [0xab, 0xb2, 0xbf],
+            [0x5c, 0x63, 0x70], [0xe0, 0x6c, 0x75], [0x98, 0xc3, 0x79], [0xe5, 0xc0, 0x7b],
+            [0x61, 0xaf, 0xef], [0xc6, 0x78, 0xdd], [0x56, 0xb6, 0xc2], [0xff, 0xff, 0xff],
+        ],
+    }),
+    ("gruvbox-dark", Palette {
+        fg: [0xeb, 0xdb, 0xb2], bg: [0x28, 0x28, 0x28],
+        ansi: [
+            [0x28, 0x28, 0x28], [0xcc, 0x24, 0x1d], [0x98, 0x97, 0x1a], [0xd7, 0x99, 0x21],
+            [0x45, 0x85, 0x88], [0xb1, 0x62, 0x86], [0x68, 0x9d, 0x6a], [0xa8, 0x99, 0x84],
+            [0x92, 0x83, 0x74], [0xfb, 0x49, 0x34], [0xb8, 0xbb, 0x26], [0xfa, 0xbd, 0x2f],
+            [0x83, 0xa5, 0x98], [0xd3, 0x86, 0x9b], [0x8e, 0xc0, 0x7c], [0xeb, 0xdb, 0xb2],
+        ],
+    }),
+    ("nord", Palette {
+        fg: [0xd8, 0xde, 0xe9], bg: [0x2e, 0x34, 0x40],
+        ansi: [
+            [0x3b, 0x42, 0x52], [0xbf, 0x61, 0x6a], [0xa3, 0xbe, 0x8c], [0xeb, 0xcb, 0x8b],
+            [0x81, 0xa1, 0xc1], [0xb4, 0x8e, 0xad], [0x88, 0xc0, 0xd0], [0xe5, 0xe9, 0xf0],
+            [0x4c, 0x56, 0x6a], [0xbf, 0x61, 0x6a], [0xa3, 0xbe, 0x8c], [0xeb, 0xcb, 0x8b],
+            [0x81, 0xa1, 0xc1], [0xb4, 0x8e, 0xad], [0x8f, 0xbc, 0xbb], [0xec, 0xef, 0xf4],
+        ],
+    }),
+    ("catppuccin-mocha", Palette {
+        fg: [0xcd, 0xd6, 0xf4], bg: [0x1e, 0x1e, 0x2e],
+        ansi: [
+            [0x45, 0x47, 0x5a], [0xf3, 0x8b, 0xa8], [0xa6, 0xe3, 0xa1], [0xf9, 0xe2, 0xaf],
+            [0x89, 0xb4, 0xfa], [0xf5, 0xc2, 0xe7], [0x94, 0xe2, 0xd5], [0xba, 0xc2, 0xde],
+            [0x58, 0x5b, 0x70], [0xf3, 0x8b, 0xa8], [0xa6, 0xe3, 0xa1], [0xf9, 0xe2, 0xaf],
+            [0x89, 0xb4, 0xfa], [0xf5, 0xc2, 0xe7], [0x94, 0xe2, 0xd5], [0xa6, 0xad, 0xc8],
+        ],
+    }),
+    ("tokyo-night", Palette {
+        fg: [0xc0, 0xca, 0xf5], bg: [0x1a, 0x1b, 0x26],
+        ansi: [
+            [0x15, 0x16, 0x1e], [0xf7, 0x76, 0x8e], [0x9e, 0xce, 0x6a], [0xe0, 0xaf, 0x68],
+            [0x7a, 0xa2, 0xf7], [0xbb, 0x9a, 0xf7], [0x7d, 0xcf, 0xff], [0xa9, 0xb1, 0xd6],
+            [0x41, 0x48, 0x68], [0xf7, 0x76, 0x8e], [0x9e, 0xce, 0x6a], [0xe0, 0xaf, 0x68],
+            [0x7a, 0xa2, 0xf7], [0xbb, 0x9a, 0xf7], [0x7d, 0xcf, 0xff], [0xc0, 0xca, 0xf5],
+        ],
+    }),
+    ("solarized-dark", Palette {
+        fg: [0x83, 0x94, 0x96], bg: [0x00, 0x2b, 0x36],
+        ansi: [
+            [0x07, 0x36, 0x42], [0xdc, 0x32, 0x2f], [0x85, 0x99, 0x00], [0xb5, 0x89, 0x00],
+            [0x26, 0x8b, 0xd2], [0xd3, 0x36, 0x82], [0x2a, 0xa1, 0x98], [0xee, 0xe8, 0xd5],
+            [0x00, 0x2b, 0x36], [0xcb, 0x4b, 0x16], [0x58, 0x6e, 0x75], [0x65, 0x7b, 0x83],
+            [0x83, 0x94, 0x96], [0x6c, 0x71, 0xc4], [0x93, 0xa1, 0xa1], [0xfd, 0xf6, 0xe3],
+        ],
+    }),
+];
+
+/// Look a [`PRESETS`] entry up by name, case-insensitively. `None` for an unknown name.
+pub fn preset_palette(name: &str) -> Option<Palette> {
+    PRESETS.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, p)| *p)
+}
+
+/// The settings panel's cycle order: "default" (no preset) followed by every [`PRESETS`] name, so
+/// the panel and the resolver can't list different schemes.
+pub fn preset_names() -> Vec<&'static str> {
+    std::iter::once("default").chain(PRESETS.iter().map(|(n, _)| *n)).collect()
+}
 
 /// The 16 ANSI slots keyed by their Windows Terminal scheme names (index = ANSI color number).
 const WT_ANSI_KEYS: [&str; 16] = [
@@ -279,6 +362,16 @@ impl Config {
     pub fn palette(&self) -> Palette {
         let mut p = DEFAULT_PALETTE;
         let Some(theme) = self.theme.as_ref() else { return p };
+        // A named preset is the coarsest layer: it replaces the whole palette, and everything
+        // below refines it. An unknown name is logged and skipped rather than silently ignored —
+        // a typo'd preset would otherwise look like the feature doesn't work.
+        if let Some(name) = theme.preset.as_deref() {
+            match preset_palette(name) {
+                Some(preset) => p = preset,
+                None if name.eq_ignore_ascii_case("default") => {}
+                None => eprintln!("gmux: unknown theme preset {name:?}, using the defaults"),
+            }
+        }
         if let Some(path) = &theme.scheme {
             if let Some(map) = load_scheme(path) {
                 if let Some(c) = map.get("foreground").and_then(|s| parse_hex(s)) {
@@ -365,8 +458,9 @@ pub fn default_template() -> String {
   \"font_px\": {font},
   \"persist_screen\": true,
   \"theme\": {{
-    \"fg\": \"#{fg:02x}{fg1:02x}{fg2:02x}\",
-    \"bg\": \"#{bg:02x}{bg1:02x}{bg2:02x}\",
+    \"preset\": null,
+    \"fg\": null,
+    \"bg\": null,
     \"scheme\": null,
     \"ansi\": null,
     \"accent\": null
@@ -378,8 +472,6 @@ pub fn default_template() -> String {
 "
         ,
         font = 18.0f32, // ponytail: mirror of app::DEFAULT_FONT_PX (config cannot import app)
-        fg = DEFAULT_PALETTE.fg[0], fg1 = DEFAULT_PALETTE.fg[1], fg2 = DEFAULT_PALETTE.fg[2],
-        bg = DEFAULT_PALETTE.bg[0], bg1 = DEFAULT_PALETTE.bg[1], bg2 = DEFAULT_PALETTE.bg[2],
     )
 }
 
@@ -567,6 +659,68 @@ mod tests {
         let (m, k) = parse_chord("ctrl+,").unwrap();
         assert_eq!(km.action(m, &k), Some(Action::OpenSettings));
         assert_eq!(Action::from_name("open_settings"), Some(Action::OpenSettings));
+    }
+
+    // -- built-in colour schemes --
+
+    #[test]
+    fn every_preset_resolves_and_is_refined_by_the_finer_layers() {
+        // The panel cycles exactly the presets that resolve, so a name it shows can't be one the
+        // resolver rejects (which would look like picking a scheme did nothing).
+        let names = preset_names();
+        assert_eq!(names[0], "default", "the cycle starts at 'no preset'");
+        assert_eq!(names.len(), PRESETS.len() + 1);
+        for name in names.iter().skip(1) {
+            let p = preset_palette(name).unwrap_or_else(|| panic!("{name} does not resolve"));
+            assert_ne!(p.fg, p.bg, "{name} would render invisible text");
+            // Case-insensitive, the way the config is read.
+            assert_eq!(preset_palette(&name.to_uppercase()), Some(p));
+        }
+        assert_eq!(preset_palette("no-such-scheme"), None);
+
+        // A preset replaces the whole palette...
+        let cfg = Config {
+            theme: Some(Theme { preset: Some("nord".into()), ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(cfg.palette(), preset_palette("nord").unwrap());
+
+        // ...and every finer layer still overrides it: inline `ansi` beats the preset's slots, and
+        // the standalone fg/bg beat the preset's fg/bg.
+        let cfg = Config {
+            theme: Some(Theme {
+                preset: Some("nord".into()),
+                ansi: Some(vec!["#010203".into()]), // slot 0 only
+                fg: Some("#0a0b0c".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let p = cfg.palette();
+        let nord = preset_palette("nord").unwrap();
+        assert_eq!(p.ansi[0], [0x01, 0x02, 0x03], "inline ansi wins over the preset");
+        assert_eq!(p.ansi[1], nord.ansi[1], "untouched slots keep the preset");
+        assert_eq!(p.fg, [0x0a, 0x0b, 0x0c], "theme.fg wins over the preset");
+        assert_eq!(p.bg, nord.bg, "no theme.bg -> the preset's background stands");
+    }
+
+    #[test]
+    fn unknown_preset_leaves_the_defaults_alone() {
+        let cfg = Config {
+            theme: Some(Theme { preset: Some("garbage".into()), ..Default::default() }),
+            ..Default::default()
+        };
+        assert_eq!(cfg.palette(), DEFAULT_PALETTE, "a typo'd preset must not corrupt the palette");
+    }
+
+    #[test]
+    fn the_template_pins_no_colors_of_its_own() {
+        // The template is written on first open; if it pinned fg/bg (the LAST palette layer) a
+        // preset picked later would render with the wrong background and look broken.
+        let cfg: Config = serde_json::from_str(&default_template()).unwrap();
+        let theme = cfg.theme.as_ref().unwrap();
+        assert!(theme.fg.is_none() && theme.bg.is_none() && theme.preset.is_none());
+        assert_eq!(cfg.palette(), DEFAULT_PALETTE);
     }
 
     #[test]
@@ -802,6 +956,7 @@ mod tests {
                 bg: Some("#040506".into()),
                 ansi: Some(vec!["#111111".into(), "#deadbe".into()]), // slots 0,1
                 scheme: None,
+                preset: None,
                 accent: None,
             }),
             ..Default::default()

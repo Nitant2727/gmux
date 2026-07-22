@@ -156,8 +156,14 @@ still sits at 0% CPU. Both are persisted.
 
 The chrome follows cmux's look: the selected workspace is a solid accent pill, a workspace wanting
 attention washes blue, and the focused pane carries an accent ring. Set `"theme": { "accent":
-"system" }` to follow your Windows accent color instead, or `"#rrggbb"` to pin your own. Terminal
-cell colors are separate and come from `theme.scheme` / `theme.ansi`.
+"system" }` to follow your Windows accent color instead, or `"#rrggbb"` to pin your own.
+
+Terminal cell colors are separate. Seven schemes ship built in — `campbell` (the Windows Terminal
+default), `one-dark`, `gruvbox-dark`, `nord`, `catppuccin-mocha`, `tokyo-night`, `solarized-dark` —
+picked from the settings panel's **color scheme** row or by setting `"theme": { "preset":
+"nord" }`. A preset is the coarsest layer: `theme.scheme` (a Windows Terminal scheme file),
+`theme.ansi` (16 inline hex strings), and `theme.fg` / `theme.bg` all still override it, so you can
+take a scheme and change two colors. Changes apply to every running pane without a restart.
 
 ## Platform
 
