@@ -89,6 +89,11 @@ No more splitting into whatever directory the daemon happened to start in.
 From the CLI: `gmux new-window --cwd <dir>` opens one, and `gmux workspace -t @2 <dir>` re-anchors
 an existing workspace (`--clear` unpins it). `Ctrl+Shift+T` still opens a plain unanchored tab.
 
+**Pane title bars.** Each pane carries a title strip: the active one is tinted with the accent and
+its title is full-strength, inactive ones stay neutral and dim, so focus survives a four-way split.
+The active pane (and whichever pane you're hovering) shows a close button at the strip's right end;
+closing a pane that's running something asks first, exactly like `Ctrl+Shift+W`.
+
 **At a glance.** Every workspace row carries a leading dot: **filled** while something is running in
 it (a build, an agent), a **hollow ring** when it's idle — so "which agents are still working" is
 one look down the sidebar rather than a hunt for spinners.

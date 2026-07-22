@@ -506,6 +506,15 @@ impl Server {
                 }
                 Response::ok(id, ResultBody::Done)
             }
+            Call::ClosePaneId { pane } => {
+                // Focus it, then reuse the ClosePane path verbatim — including the remote-mirror
+                // round-trip and the "last pane closes the window" rule.
+                self.session.focus_pane(PaneId(*pane));
+                if self.session.active_window().map(|w| w.active_id()) == Some(PaneId(*pane)) {
+                    return self.handle(&Request { id, call: Call::ClosePane });
+                }
+                Response::ok(id, ResultBody::Done) // unknown id: nothing to close
+            }
             Call::ToggleZoom => {
                 if let Some(w) = self.session.active_window_mut() {
                     w.toggle_zoom();
@@ -1487,6 +1496,48 @@ mod tests {
         assert!(!persist_screen_from_json("\u{feff}{\"persist_screen\": false}"), "BOM is stripped");
         // A non-bool value is ignored (defaults true), not coerced.
         assert!(persist_screen_from_json(r#"{"persist_screen": "no"}"#));
+    }
+
+    /// `ClosePaneId` closes the pane it names — not whichever happens to be active — and an
+    /// unknown id is a harmless no-op. Console-free remote panes, so it runs headless.
+    #[test]
+    fn close_pane_id_targets_that_pane() {
+        use gmux_mux::{Pane, Session};
+        let first = Pane::remote(1, 80, 24, Box::new(|_| {}));
+        let first_id = first.id.0;
+        let (pr_tx, pr_rx) = channel();
+        let mut server = Server {
+            session: Session::start("t", first),
+            shell: "pwsh".into(),
+            last_view: (800, 600),
+            notifications: Vec::new(),
+            browse_requests: Vec::new(),
+            ticks: 0,
+            remotes: Vec::new(),
+            progress: HashMap::new(),
+            palette: Palette::default(),
+            persist_screen: true,
+            pr_refresh_ticks: 0,
+            pr_cursor: 0,
+            pr_rx,
+            pr_tx,
+        };
+        // Split so the window holds two panes; the split becomes active.
+        let second = Pane::remote(2, 80, 24, Box::new(|_| {}));
+        let second_id = second.id.0;
+        server.session.active_window_mut().unwrap().split(SplitDir::Horizontal, second);
+        assert_eq!(server.session.pane_count(), 2);
+
+        // An unknown id changes nothing.
+        let resp = server.handle(&Request { id: 1, call: Call::ClosePaneId { pane: 999_999 } });
+        assert_eq!(resp.result, Some(ResultBody::Done));
+        assert_eq!(server.session.pane_count(), 2, "an unknown id must not close anything");
+
+        // Closing the NON-active pane leaves the active one alive.
+        let resp = server.handle(&Request { id: 2, call: Call::ClosePaneId { pane: first_id } });
+        assert_eq!(resp.result, Some(ResultBody::Done));
+        assert_eq!(server.session.pane_count(), 1);
+        assert!(server.session.pane(PaneId(second_id)).is_some(), "the other pane survived");
     }
 
     /// Import scanning: git projects only by default, every subfolder with `all`, dot-folders and

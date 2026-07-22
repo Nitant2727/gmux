@@ -112,6 +112,13 @@ pub enum Call {
     FocusPane { dir: String },
     /// Close the active pane.
     ClosePane,
+    /// Close a SPECIFIC pane by id (a click on that pane's close button). Focuses it first, so the
+    /// daemon's close path and the layout that follows are the same ones `ClosePane` produces.
+    /// An unknown id is a harmless no-op.
+    ClosePaneId {
+        #[serde(default)]
+        pane: u64,
+    },
     /// Toggle zoom on the active pane.
     ToggleZoom,
     /// Drag-resize the split at a divider: grow `pane` (the top/left pane of the dragged divider)
@@ -586,6 +593,7 @@ mod tests {
             Call::ResizeView { w: 800, h: 600, cell_w: 9, cell_h: 18, pane_chrome: 34, pane_chrome_y: 56 },
             Call::FocusPane { dir: "right".into() },
             Call::ClosePane,
+            Call::ClosePaneId { pane: 9 },
             Call::ToggleZoom,
             Call::ResizeSplit { pane: 4, dx: 0.5, dy: -0.25 },
             Call::SwitchWindow { next: true },
