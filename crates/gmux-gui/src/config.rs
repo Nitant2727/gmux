@@ -287,6 +287,23 @@ pub fn preset_names() -> Vec<&'static str> {
     std::iter::once("default").chain(PRESETS.iter().map(|(n, _)| *n)).collect()
 }
 
+/// Eight colours previewing what a scheme *name* looks like: background, the six ANSI hues you
+/// actually see in a terminal (red..cyan), foreground. `"default"` previews the built-ins; an
+/// unknown name has nothing to preview and yields an empty ribbon rather than a misleading one.
+pub fn preset_swatch(name: &str) -> Vec<[u8; 3]> {
+    let p = if name.eq_ignore_ascii_case("default") {
+        Some(DEFAULT_PALETTE)
+    } else {
+        preset_palette(name)
+    };
+    p.map_or_else(Vec::new, |p| {
+        let mut v = vec![p.bg];
+        v.extend_from_slice(&p.ansi[1..7]);
+        v.push(p.fg);
+        v
+    })
+}
+
 /// The 16 ANSI slots keyed by their Windows Terminal scheme names (index = ANSI color number).
 const WT_ANSI_KEYS: [&str; 16] = [
     "black", "red", "green", "yellow", "blue", "purple", "cyan", "white",
@@ -702,6 +719,22 @@ mod tests {
         assert_eq!(p.ansi[1], nord.ansi[1], "untouched slots keep the preset");
         assert_eq!(p.fg, [0x0a, 0x0b, 0x0c], "theme.fg wins over the preset");
         assert_eq!(p.bg, nord.bg, "no theme.bg -> the preset's background stands");
+    }
+
+    #[test]
+    fn every_cycled_name_previews_the_palette_it_would_apply() {
+        // The panel draws this ribbon next to the name, so it has to be the palette the same name
+        // resolves to — a swatch that disagreed with what Enter applies is worse than none.
+        for name in preset_names() {
+            let s = preset_swatch(name);
+            assert_eq!(s.len(), 8, "{name} previews bg + 6 hues + fg");
+            let p = preset_palette(name).unwrap_or(DEFAULT_PALETTE);
+            assert_eq!(s[0], p.bg);
+            assert_eq!(s[1..7], p.ansi[1..7]);
+            assert_eq!(s[7], p.fg);
+        }
+        assert_eq!(preset_swatch("DEFAULT"), preset_swatch("default"), "case-insensitive");
+        assert!(preset_swatch("no-such-scheme").is_empty(), "nothing to preview -> no ribbon");
     }
 
     #[test]
