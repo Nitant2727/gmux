@@ -377,12 +377,25 @@ impl Config {
     /// Returns [`DEFAULT_PALETTE`] when no theme customizes any color, so callers always have a
     /// concrete palette to send.
     pub fn palette(&self) -> Palette {
+        self.resolve_palette(None)
+    }
+
+    /// The palette this config would resolve to if its `theme.preset` were `name` — what the
+    /// settings panel's live preview must push, since committing the scheme keeps whatever finer
+    /// overrides (`scheme`, `ansi`, `fg`/`bg`) the config also carries.
+    pub fn palette_with_preset(&self, name: &str) -> Palette {
+        self.resolve_palette(Some(name))
+    }
+
+    fn resolve_palette(&self, preset_override: Option<&str>) -> Palette {
         let mut p = DEFAULT_PALETTE;
-        let Some(theme) = self.theme.as_ref() else { return p };
+        let Some(theme) = self.theme.as_ref() else {
+            return preset_override.and_then(preset_palette).unwrap_or(p);
+        };
         // A named preset is the coarsest layer: it replaces the whole palette, and everything
         // below refines it. An unknown name is logged and skipped rather than silently ignored —
         // a typo'd preset would otherwise look like the feature doesn't work.
-        if let Some(name) = theme.preset.as_deref() {
+        if let Some(name) = preset_override.or(theme.preset.as_deref()) {
             match preset_palette(name) {
                 Some(preset) => p = preset,
                 None if name.eq_ignore_ascii_case("default") => {}
@@ -735,6 +748,32 @@ mod tests {
         }
         assert_eq!(preset_swatch("DEFAULT"), preset_swatch("default"), "case-insensitive");
         assert!(preset_swatch("no-such-scheme").is_empty(), "nothing to preview -> no ribbon");
+    }
+
+    #[test]
+    fn a_previewed_scheme_resolves_like_the_committed_one_would() {
+        // The panel pushes this palette while you try a scheme on, so it has to be exactly what
+        // keeping it produces — including the overrides the config already carries. A preview that
+        // ignored theme.fg would repaint once when you tried it and again when you kept it.
+        let cfg = Config {
+            theme: Some(Theme {
+                preset: Some("gruvbox-dark".into()),
+                fg: Some("#0a0b0c".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let nord = preset_palette("nord").unwrap();
+        let p = cfg.palette_with_preset("nord");
+        assert_eq!(p.ansi, nord.ansi, "the previewed scheme replaces the committed one");
+        assert_eq!(p.bg, nord.bg);
+        assert_eq!(p.fg, [0x0a, 0x0b, 0x0c], "theme.fg still wins, exactly as it will after Enter");
+        assert_eq!(cfg.palette().ansi, preset_palette("gruvbox-dark").unwrap().ansi, "config untouched");
+
+        // "default" previews the built-ins from any starting point, and a config with no theme at
+        // all can still preview (the panel is reachable before anything has been customized).
+        assert_eq!(cfg.palette_with_preset("default").ansi, DEFAULT_PALETTE.ansi);
+        assert_eq!(Config::default().palette_with_preset("nord"), nord);
     }
 
     #[test]

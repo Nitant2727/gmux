@@ -53,9 +53,11 @@ The binary is currently unsigned (SmartScreen may prompt on first run of a downl
 
 ## Default keybindings
 
-`Ctrl+,` opens the settings panel: a **theme** tab (accent, font size, focus-follows-mouse) and a
-**keys** tab listing every action with its current chord. Arrows move, Tab switches tab, Enter
-changes the value — on a keybinding, Enter waits for you to press the new chord. Changes are
+`Ctrl+,` opens the settings panel: a **theme** tab (color scheme, accent, font size,
+focus-follows-mouse), a **keys** tab listing every action with its current chord, and a
+**schemes** tab (below). Arrows move, Tab switches tab, Enter
+changes the value — on a keybinding, Enter waits for you to press the new chord. Clicking works
+too: a click on a tab opens it, and on the schemes tab a click previews. Changes are
 written to `%APPDATA%\gmux\gmux.json` and applied live; `e` opens that file for anything the panel
 doesn't cover (colour schemes, per-workspace settings).
 
@@ -160,10 +162,13 @@ attention washes blue, and the focused pane carries an accent ring. Set `"theme"
 
 Terminal cell colors are separate. Seven schemes ship built in — `campbell` (the Windows Terminal
 default), `one-dark`, `gruvbox-dark`, `nord`, `catppuccin-mocha`, `tokyo-night`, `solarized-dark` —
-picked from the settings panel's **color scheme** row or by setting `"theme": { "preset":
-"nord" }`. The panel draws each scheme's own colors as a ribbon beside its name — background, the
-six ANSI hues, foreground — so cycling shows you the palette instead of asking you to recognise it
-by name. A preset is the coarsest layer: `theme.scheme` (a Windows Terminal scheme file),
+picked from the settings panel's **schemes** tab or by setting `"theme": { "preset": "nord" }`.
+
+That tab lists every scheme drawn in its own colors — background, the six ANSI hues, foreground —
+and **clicking one tries it on**: the palette goes live in every pane immediately, with nothing
+written to disk. Arrow keys do the same. Click the row again (or press Enter) to keep it; Escape
+puts your own palette back. So you choose a scheme by looking at your actual terminal in it, not by
+recognising a name. A preset is the coarsest layer: `theme.scheme` (a Windows Terminal scheme file),
 `theme.ansi` (16 inline hex strings), and `theme.fg` / `theme.bg` all still override it, so you can
 take a scheme and change two colors. Changes apply to every running pane without a restart.
 

@@ -667,29 +667,22 @@ mod tests {
         // Drop indicator above the last item, as a reorder drag would show it.
         let drop_at = Some(rows.len().saturating_sub(1));
         // Settings panel over the frame, as Ctrl+, shows it.
-        let row = |label: &str, value: &str| crate::renderer::SettingsRow {
-            label: label.into(),
-            value: value.into(),
-            swatch: Vec::new(),
-        };
         let sv = crate::renderer::SettingsView {
-            tabs: vec!["theme".into(), "keys".into()],
-            tab: 0,
-            rows: vec![
-                crate::renderer::SettingsRow {
-                    label: "color scheme".into(),
-                    value: "tokyo-night".into(),
-                    swatch: crate::config::preset_swatch("tokyo-night")
+            tabs: vec!["theme".into(), "keys".into(), "schemes".into()],
+            tab: 2,
+            rows: crate::config::preset_names()
+                .into_iter()
+                .map(|name| crate::renderer::SettingsRow {
+                    label: name.into(),
+                    value: if name == "nord" { "in use" } else { "" }.into(),
+                    swatch: crate::config::preset_swatch(name)
                         .into_iter()
                         .map(|[r, g, b]| gmux_mux::Rgb { r, g, b })
                         .collect(),
-                },
-                row("accent", "#3b8ae6"),
-                row("font size", "18 px"),
-                row("follow mouse focus", "off"),
-            ],
-            selected: 0,
-            footer: "enter changes  ·  tab switches  ·  e opens gmux.json  ·  esc closes".into(),
+                })
+                .collect(),
+            selected: 4,
+            footer: "click or arrow to try one on  ·  enter keeps it  ·  esc restores".into(),
         };
         r.render_frame(&view, &rows, sw, &[pane], w, h, "", false, drop_at, Some("ag"), Some(&sb), None, None, Some(&sv));
         let px = read_rgba(&r, &tex, w, h).expect("readback");
