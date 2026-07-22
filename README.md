@@ -90,6 +90,11 @@ with `gh` and pushes it, or set it by hand with `gmux pr -t @2 128 open [url]` (
 branch, and **clicking it opens the pull request** when the badge carries a URL (`--resolve` always
 supplies one).
 
+`Ctrl+Shift+B` toggles an embedded browser panel down the right-hand side (needs a
+`--features browser` build); the terminal panes reflow around it, and `gmux browse --pane <url>`
+opens the panel and loads the page there. Hiding the panel keeps the page and its login session
+loaded, so toggling back is instant.
+
 Auto-refresh is **opt-in**: set `"pr_refresh_secs": 300` in `%APPDATA%\gmux\gmux.json` and the
 daemon re-resolves badges on that cadence — one workspace per cycle, on a worker thread, using each
 pane's own directory. Left at its default of `0` it never runs, and gmux makes no network calls at

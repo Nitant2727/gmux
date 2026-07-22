@@ -793,10 +793,10 @@ struct State {
     /// reused for undamaged frames so the always-on underline doesn't flicker. Evicted with
     /// `snap_cache` (same live-pane set).
     link_cache: HashMap<u64, Vec<UrlSpan>>,
-    /// M12: the flag-gated WebView2 browser panel, opened on the first `Browse` request drained
-    /// from the daemon (or by the toggle) and embedded in this window's right-hand dock.
+    /// M12 stage 2: the flag-gated WebView2 panel, hosted on THIS thread and parented to this
+    /// window (see `gmux_browser::embedded`), shown in the right-hand dock.
     #[cfg(feature = "browser")]
-    browser: Option<gmux_browser::BrowserPane>,
+    browser: Option<gmux_browser::EmbeddedBrowser>,
     /// Width of the browser panel in px; `0` = hidden. Subtracted from the content area in
     /// [`State::areas`], so the terminal panes reflow around it.
     dock_w: u32,
@@ -1743,18 +1743,18 @@ impl State {
     fn poll_browse(&mut self) {
         if let Ok(ResultBody::Browses(urls)) = self.client.call(Call::PollBrowse) {
             for url in urls {
-                // Still the PROVEN top-level window (round 35/36). The embedded panel is wired up
-                // but does not display yet — see `toggle_browser_dock` and PARKED.md — so routing
-                // `gmux browse --pane` through it would trade a working feature for a broken one.
-                if self.browser.as_ref().is_some_and(|b| !b.navigate(&url)) {
-                    self.browser = None;
+                if self.dock_w == 0 {
+                    self.open_dock();
                 }
-                if self.browser.is_none() {
-                    match gmux_browser::BrowserPane::open(&url) {
-                        Ok(b) => self.browser = Some(b),
-                        Err(e) => eprintln!("gmux: browser pane failed: {e}"),
+                match &self.browser {
+                    Some(b) => {
+                        b.navigate(&url);
+                        b.set_visible(true);
                     }
+                    None => self.embed_browser(&url),
                 }
+                self.sync_size();
+                self.window.request_redraw();
             }
         }
     }
@@ -1780,13 +1780,10 @@ impl State {
             return;
         }
         let (x, y, w, h) = self.dock_rect();
-        match gmux_browser::BrowserPane::embed(hwnd, x, y, w, h, url) {
-            Ok(b) => {
-                // Must come from THIS thread — the one that owns the parent window. See
-                // `show_from_parent_thread`.
-                b.show_from_parent_thread();
-                self.browser = Some(b);
-            }
+        // Hosted on THIS (the winit) thread — WebView2 requires the controller to live on the
+        // thread owning its parent window, which is what round 44's child-window attempt got wrong.
+        match gmux_browser::EmbeddedBrowser::new(hwnd, x, y, w, h, url) {
+            Ok(b) => self.browser = Some(b),
             Err(e) => eprintln!("gmux: browser panel failed: {e}"),
         }
         // The panes just lost the dock's width; tell the daemon so it re-cells them.
@@ -1798,9 +1795,6 @@ impl State {
     /// session) alive, so toggling back is instant. The first toggle with no panel yet opens a
     /// blank page rather than nothing at all.
     ///
-    /// **Experimental.** The dock's layout half works (the column is reserved and the panes reflow
-    /// around it), but the embedded WebView2 child does not become visible — see PARKED.md. Until
-    /// that is solved, `gmux browse --pane` deliberately keeps using the top-level window.
     #[cfg(feature = "browser")]
     fn toggle_browser_dock(&mut self) {
         if self.dock_w > 0 {
@@ -1815,7 +1809,6 @@ impl State {
                     let (x, y, w, h) = self.dock_rect();
                     b.set_bounds(x, y, w, h);
                     b.set_visible(true);
-                    b.show_from_parent_thread();
                 }
                 None => self.embed_browser("about:blank"),
             }
