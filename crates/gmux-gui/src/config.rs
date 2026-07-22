@@ -287,6 +287,16 @@ pub fn preset_names() -> Vec<&'static str> {
     std::iter::once("default").chain(PRESETS.iter().map(|(n, _)| *n)).collect()
 }
 
+/// What an accent *string* means: `"system"` follows Windows, `"#rrggbb"` pins a colour, and
+/// anything else (including `"default"` and unparseable text) is the built-in accent.
+pub fn accent_choice(s: &str) -> AccentChoice {
+    if s.eq_ignore_ascii_case("system") {
+        AccentChoice::System
+    } else {
+        parse_hex(s).map_or(AccentChoice::Default, AccentChoice::Fixed)
+    }
+}
+
 /// Eight colours previewing what a scheme *name* looks like: background, the six ANSI hues you
 /// actually see in a terminal (red..cyan), foreground. `"default"` previews the built-ins; an
 /// unknown name has nothing to preview and yields an empty ribbon rather than a misleading one.
@@ -363,11 +373,7 @@ impl Config {
     /// How `theme.accent` resolves: a pinned color, the Windows accent (`"system"`), or the
     /// built-in default when unset or unparseable.
     pub fn accent(&self) -> AccentChoice {
-        match self.theme.as_ref().and_then(|t| t.accent.as_deref()) {
-            Some(s) if s.eq_ignore_ascii_case("system") => AccentChoice::System,
-            Some(s) => parse_hex(s).map_or(AccentChoice::Default, AccentChoice::Fixed),
-            None => AccentChoice::Default,
-        }
+        self.theme.as_ref().and_then(|t| t.accent.as_deref()).map_or(AccentChoice::Default, accent_choice)
     }
 
     /// Resolve the full terminal palette from `theme`, layering (in order) over the gmux defaults:

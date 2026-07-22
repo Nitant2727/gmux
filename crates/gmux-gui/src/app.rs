@@ -185,6 +185,11 @@ struct SettingsState {
     /// A colour scheme being tried on: its palette is live in every pane but nothing is written to
     /// disk yet. Enter keeps it, Escape (or leaving the tab) restores the config's own palette.
     preview: Option<String>,
+    /// Same, for the chrome accent — separate because the two restore through different paths (a
+    /// scheme goes back through the daemon, an accent is local to the renderer).
+    accent_preview: Option<String>,
+    /// Inline `#rrggbb` entry on the accent tab's custom row, or `None` when not typing.
+    hex: Option<String>,
     /// Rebinding: the next chord pressed becomes this action's binding.
     capturing: bool,
 }
@@ -195,11 +200,57 @@ struct SettingsState {
 const ACCENT_CYCLE: &[&str] = &["default", "system", "#3b8ae6", "#8f7ae6", "#4bb58a", "#d98a4b", "#c9566d"];
 
 /// The settings panel's sections, in tab-strip order (`SettingsState::tab` indexes this).
-const SETTINGS_TABS: [&str; 3] = ["theme", "keys", "schemes"];
+const SETTINGS_TABS: [&str; 4] = ["theme", "keys", "schemes", "accent"];
 
 /// A colour scheme's preview ribbon, in the renderer's colour type.
 fn swatch_rgb(name: &str) -> Vec<Rgb> {
     crate::config::preset_swatch(name).into_iter().map(|[r, g, b]| Rgb { r, g, b }).collect()
+}
+
+/// Whether typed text belongs in the custom-hex buffer: `#` and hex digits only. Note this claims
+/// `e`, `d` and friends, which is why the hex arm is matched before the panel's `e` shortcut —
+/// on the custom row a hex digit is a hex digit. Pure/tested.
+fn is_hex_input(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c == '#' || c.is_ascii_hexdigit())
+}
+
+/// The accent picker's rows as the preview dump draws them (the real ones come from `State`,
+/// which needs a window and a daemon). Kept beside `ACCENT_CYCLE` so the two can't drift.
+#[cfg(test)]
+pub(crate) fn accent_rows_for_preview() -> Vec<SettingsRow> {
+    let mut rows: Vec<SettingsRow> = ACCENT_CYCLE
+        .iter()
+        .map(|name| SettingsRow {
+            swatch: accent_swatch(name),
+            label: (*name).to_string(),
+            value: if *name == "#8f7ae6" { "in use" } else { "" }.to_string(),
+        })
+        .collect();
+    rows.push(SettingsRow {
+        swatch: Vec::new(),
+        label: "custom hex".to_string(),
+        value: "#c0f_".to_string(),
+    });
+    rows
+}
+
+/// Append typed text to a `#rrggbb` buffer: hex digits only, lowercased (the config's parser is
+/// case-insensitive, but a mixed-case echo looks like a typo), and stopping at six digits so a
+/// held key can't grow the buffer past a colour. A bare `#` is dropped — the buffer already
+/// carries one. Pure/tested.
+fn push_hex(buf: &mut String, text: &str) {
+    for ch in text.chars().filter(char::is_ascii_hexdigit) {
+        if buf.len() < 7 {
+            buf.push(ch.to_ascii_lowercase());
+        }
+    }
+}
+
+/// An accent's swatch: the same colour four times over. One 11px chip is too small to judge a
+/// colour by, and unlike a scheme an accent has only one — so the ribbon is a solid block.
+fn accent_swatch(name: &str) -> Vec<Rgb> {
+    let c = crate::renderer::resolve_accent(crate::config::accent_choice(name));
+    vec![c; 4]
 }
 
 /// A press on a pane's title strip that may become a pane rearrange once the cursor moves past the
@@ -1811,8 +1862,14 @@ impl State {
                 self.rename = None;
                 self.palette = None;
                 self.cancel_preview(); // reopening mid-preview must not strand the try-on palette
-                self.settings =
-                    Some(SettingsState { tab: 0, sel: 0, capturing: false, preview: None });
+                self.settings = Some(SettingsState {
+                    tab: 0,
+                    sel: 0,
+                    capturing: false,
+                    preview: None,
+                    accent_preview: None,
+                    hex: None,
+                });
                 self.window.request_redraw();
             }
             Action::Search => self.enter_search(),
@@ -2482,6 +2539,43 @@ impl State {
             swatch: Vec::new(),
         };
         let cfg = Config::load();
+        if tab == 3 {
+            let st = self.settings.as_ref();
+            let cur = st.and_then(|s| s.accent_preview.clone()).unwrap_or_else(|| {
+                cfg.theme
+                    .as_ref()
+                    .and_then(|t| t.accent.clone())
+                    .unwrap_or_else(|| "default".to_string())
+            });
+            let mut rows: Vec<SettingsRow> = ACCENT_CYCLE
+                .iter()
+                .map(|name| SettingsRow {
+                    swatch: accent_swatch(name),
+                    label: (*name).to_string(),
+                    value: if name.eq_ignore_ascii_case(&cur) { "in use" } else { "" }.to_string(),
+                })
+                .collect();
+            // The custom row carries whatever hex is being typed, else the config's own accent when
+            // it is a colour the list above doesn't offer — so a hand-picked accent is visible here
+            // rather than looking like nothing is selected.
+            let typing = st.and_then(|s| s.hex.clone());
+            let pinned = (!ACCENT_CYCLE.iter().any(|n| n.eq_ignore_ascii_case(&cur))
+                && crate::config::accent_choice(&cur) != crate::config::AccentChoice::Default)
+                .then_some(cur);
+            let value = typing.clone().or(pinned).unwrap_or_default();
+            // A half-typed "#3b8" would resolve to the built-in accent; showing that as its swatch
+            // would claim a colour the user hasn't chosen. Only a complete hex gets a ribbon.
+            let swatch = match crate::config::accent_choice(&value) {
+                crate::config::AccentChoice::Fixed(_) => accent_swatch(&value),
+                _ => Vec::new(),
+            };
+            rows.push(SettingsRow {
+                swatch,
+                label: "custom hex".to_string(),
+                value: if typing.is_some() { format!("{value}_") } else { value },
+            });
+            return rows;
+        }
         if tab == 2 {
             // Every scheme, each drawn in its own colours: the list IS the preview.
             let current = self.settings.as_ref().and_then(|s| s.preview.clone()).unwrap_or_else(|| {
@@ -2592,11 +2686,15 @@ impl State {
             }
             Key::Named(NamedKey::ArrowDown) => {
                 st.sel = (st.sel + 1) % rows;
+                st.hex = None; // moving off the custom row abandons a half-typed hex
                 self.preview_selected_scheme();
+                self.preview_selected_accent();
             }
             Key::Named(NamedKey::ArrowUp) => {
                 st.sel = st.sel.checked_sub(1).unwrap_or(rows - 1);
+                st.hex = None;
                 self.preview_selected_scheme();
+                self.preview_selected_accent();
             }
             Key::Named(NamedKey::Tab) | Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::ArrowLeft) => {
                 let back = matches!(&event.logical_key, Key::Named(NamedKey::ArrowLeft));
@@ -2607,16 +2705,28 @@ impl State {
             }
             Key::Named(NamedKey::Enter) => {
                 let sel = st.sel;
-                if tab == 2 {
-                    self.commit_preview();
-                } else if tab == 1 {
-                    st.capturing = true;
-                } else {
-                    self.apply_theme_row(sel);
+                match tab {
+                    2 => self.commit_preview(),
+                    3 => self.commit_accent(),
+                    1 => st.capturing = true,
+                    _ => self.apply_theme_row(sel),
                 }
             }
+            // Backspace edits the custom hex; on any other row it does nothing.
+            Key::Named(NamedKey::Backspace) if tab == 3 => {
+                if let Some(h) = st.hex.as_mut() {
+                    h.pop();
+                }
+                self.preview_selected_accent();
+            }
+            // On the accent tab's custom row, hex digits type a colour. '#' is optional — it is
+            // prepended so the buffer always reads back through the same parser the config uses.
+            Key::Character(c) if tab == 3 && st.sel == ACCENT_CYCLE.len() && is_hex_input(c.as_str()) => {
+                push_hex(st.hex.get_or_insert_with(|| "#".to_string()), c.as_str());
+                self.preview_selected_accent();
+            }
             // 'e' hands the raw file to the OS editor — the panel covers the common cases, not
-            // colour schemes or per-pane settings.
+            // per-workspace settings or a scheme file.
             Key::Character(c) if c.as_str() == "e" => self.open_config_file(),
             _ => {}
         }
@@ -2672,7 +2782,7 @@ impl State {
             let i = start + w; // window index -> the row's index in the full list
             // Same row twice = keep it. Checked before moving the selection so the second click
             // commits rather than re-previewing what is already live.
-            let repeat = tab == 2 && i == sel;
+            let repeat = (tab == 2 || tab == 3) && i == sel;
             if let Some(st) = self.settings.as_mut() {
                 st.sel = i;
                 st.capturing = false; // a click abandons a half-finished chord capture
@@ -2680,9 +2790,11 @@ impl State {
             match tab {
                 2 if repeat => self.commit_preview(),
                 2 => self.preview_selected_scheme(),
-                // The theme tab's ribbon is a shortcut into the schemes tab: click the colours to
-                // get to where colours can be tried on. Elsewhere on the row a click only selects,
-                // so a stray click can't silently cycle a setting.
+                3 if repeat => self.commit_accent(),
+                3 => self.preview_selected_accent(),
+                // The theme tab's ribbon is a shortcut into the picker behind it: click the colours
+                // to get to where colours can be tried on. Elsewhere on the row a click only
+                // selects, so a stray click can't silently cycle a setting.
                 0 if on_swatch => self.apply_theme_row(i),
                 _ => {}
             }
@@ -2715,16 +2827,79 @@ impl State {
         self.window.request_redraw();
     }
 
-    /// Put the config's own palette back, dropping whatever was being tried on. Safe to call when
-    /// nothing is previewing.
+    /// Try the selected accent on. Chrome-only, so this is a renderer-local change and a redraw —
+    /// no daemon round trip, unlike a colour scheme.
+    fn preview_selected_accent(&mut self) {
+        let Some(name) = self.selected_accent_name() else { return };
+        crate::renderer::set_accent(crate::config::accent_choice(&name));
+        if let Some(st) = self.settings.as_mut() {
+            st.accent_preview = Some(name);
+        }
+        self.window.request_redraw();
+    }
+
+    /// The accent the selected row stands for: a named row is its label, the custom row is the hex
+    /// being typed. `None` off the accent tab, and while a hex is too short to mean a colour — a
+    /// half-typed `#3b8` parses as the built-in accent, which is not what the user is choosing.
+    fn selected_accent_name(&self) -> Option<String> {
+        let st = self.settings.as_ref()?;
+        if st.tab != 3 {
+            return None;
+        }
+        let row = self.settings_rows(3).into_iter().nth(st.sel)?;
+        if st.sel < ACCENT_CYCLE.len() {
+            return Some(row.label);
+        }
+        let hex = row.value.trim_end_matches('_').to_string();
+        matches!(crate::config::accent_choice(&hex), crate::config::AccentChoice::Fixed(_))
+            .then_some(hex)
+    }
+
+    /// Keep the accent under the selection: apply it (a click-free Enter may not have previewed it
+    /// yet) and write it to `gmux.json`.
+    fn commit_accent(&mut self) {
+        let Some(name) = self.selected_accent_name() else { return };
+        crate::renderer::set_accent(crate::config::accent_choice(&name));
+        self.write_config(|cfg| {
+            let theme =
+                cfg.as_object_mut().unwrap().entry("theme").or_insert_with(|| serde_json::json!({}));
+            if let Some(map) = theme.as_object_mut() {
+                // "default" means "no accent key at all", so the built-in wins.
+                if name.eq_ignore_ascii_case("default") {
+                    map.remove("accent");
+                } else {
+                    map.insert("accent".into(), serde_json::Value::String(name));
+                }
+            }
+        });
+        if let Some(st) = self.settings.as_mut() {
+            st.accent_preview = None; // committed, not pending: nothing left to restore
+            st.hex = None;
+            st.tab = 0;
+            st.sel = 0;
+        }
+        self.window.request_redraw();
+    }
+
+    /// Put the config's own palette and accent back, dropping whatever was being tried on. Safe to
+    /// call when nothing is previewing.
     fn cancel_preview(&mut self) {
-        let previewing = self.settings.as_mut().and_then(|s| s.preview.take()).is_some();
-        if !previewing {
+        let scheme = self.settings.as_mut().and_then(|s| s.preview.take()).is_some();
+        let accent = self.settings.as_mut().and_then(|s| s.accent_preview.take()).is_some();
+        if let Some(st) = self.settings.as_mut() {
+            st.hex = None;
+        }
+        if !scheme && !accent {
             return;
         }
         let cfg = Config::load();
-        self.send_palette(&cfg);
-        self.force_full = true;
+        if scheme {
+            self.send_palette(&cfg);
+            self.force_full = true;
+        }
+        if accent {
+            crate::renderer::set_accent(cfg.accent());
+        }
         self.window.request_redraw();
     }
 
@@ -2775,28 +2950,18 @@ impl State {
                     st.sel = sel;
                 }
             }
+            // Likewise the accent row: its picker previews live and takes a custom hex, so it owns
+            // the setting outright rather than sharing it with a cycler here.
             1 => {
                 let cur = Config::load().theme.and_then(|t| t.accent);
-                let idx = cur
+                let sel = cur
                     .as_deref()
                     .and_then(|c| ACCENT_CYCLE.iter().position(|p| p.eq_ignore_ascii_case(c)))
-                    .unwrap_or(0);
-                let next = ACCENT_CYCLE[(idx + 1) % ACCENT_CYCLE.len()];
-                self.write_config(|cfg| {
-                    let theme = cfg
-                        .as_object_mut()
-                        .unwrap()
-                        .entry("theme")
-                        .or_insert_with(|| serde_json::json!({}));
-                    if let Some(map) = theme.as_object_mut() {
-                        // "default" means "no accent key at all", so the built-in wins.
-                        if next == "default" {
-                            map.remove("accent");
-                        } else {
-                            map.insert("accent".into(), serde_json::Value::String(next.into()));
-                        }
-                    }
-                });
+                    .unwrap_or(if cur.is_some() { ACCENT_CYCLE.len() } else { 0 }); // a pinned hex = the custom row
+                if let Some(st) = self.settings.as_mut() {
+                    st.tab = 3;
+                    st.sel = sel;
+                }
             }
             2 => {
                 // Wrap at the clamp so one key can walk the whole range.
@@ -4338,8 +4503,10 @@ impl State {
                 selected: sel,
                 footer: if s.capturing {
                     "press the new chord  ·  esc cancels".into()
+                } else if s.tab == 3 {
+                    "click or arrow to try  ·  type a hex below  ·  enter keeps".into()
                 } else if s.tab == 2 {
-                    "click or arrow to try one on  ·  enter keeps it  ·  esc restores".into()
+                    "click or arrow to try  ·  enter keeps  ·  esc restores".into()
                 } else if s.tab == 1 {
                     "enter rebinds  ·  tab switches  ·  e opens gmux.json  ·  esc closes".into()
                 } else {
@@ -4851,6 +5018,48 @@ mod tests {
                 SidebarItem::Row(r) => r.name.clone(),
             })
             .collect()
+    }
+
+    #[test]
+    fn typed_hex_builds_a_color_the_config_parser_accepts() {
+        // What the accent picker types has to end up as a string `accent_choice` reads as a pinned
+        // colour — the picker previews through that same parser, so anything else previews as the
+        // built-in accent while claiming to be the user's.
+        let mut buf = "#".to_string();
+        push_hex(&mut buf, "3B");
+        push_hex(&mut buf, "8");
+        push_hex(&mut buf, "AE6");
+        assert_eq!(buf, "#3b8ae6", "lowercased, in order");
+        assert_eq!(
+            crate::config::accent_choice(&buf),
+            crate::config::AccentChoice::Fixed([0x3b, 0x8a, 0xe6])
+        );
+        // Six digits is the cap: a held key can't grow the buffer past a colour.
+        push_hex(&mut buf, "ff");
+        assert_eq!(buf, "#3b8ae6");
+
+        // Short of six digits there is no colour yet, and the picker must not preview one.
+        let mut short = "#".to_string();
+        push_hex(&mut short, "3b8");
+        assert_eq!(crate::config::accent_choice(&short), crate::config::AccentChoice::Default);
+
+        // The key handler's filter: hex digits and '#' are input, everything else falls through to
+        // the panel's own shortcuts (notably 'e', which is both a hex digit and "open gmux.json").
+        assert!(is_hex_input("a") && is_hex_input("E") && is_hex_input("#") && is_hex_input("9"));
+        assert!(!is_hex_input("g") && !is_hex_input("z") && !is_hex_input(" ") && !is_hex_input(""));
+
+        // Every option the picker lists resolves to a solid four-chip block of its own colour, and
+        // the pinned ones show exactly the colour their label spells.
+        for name in ACCENT_CYCLE {
+            let s = accent_swatch(name);
+            assert_eq!(s.len(), 4, "{name} draws one colour, not a ribbon");
+            assert!(s.iter().all(|c| *c == s[0]));
+            if let Some(hex) = name.strip_prefix('#') {
+                let n = u32::from_str_radix(hex, 16).unwrap();
+                let want = Rgb { r: (n >> 16) as u8, g: (n >> 8) as u8, b: n as u8 };
+                assert_eq!(s[0], want, "{name} must swatch itself");
+            }
+        }
     }
 
     #[test]
