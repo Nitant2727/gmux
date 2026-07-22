@@ -668,11 +668,11 @@ mod tests {
         let drop_at = Some(rows.len().saturating_sub(1));
         // Settings panel over the frame, as Ctrl+, shows it.
         let sv = crate::renderer::SettingsView {
-            tabs: vec!["theme".into(), "keys".into(), "schemes".into(), "accent".into()],
-            tab: 3,
-            rows: crate::app::accent_rows_for_preview(),
-            selected: 3,
-            footer: "click or arrow to try  ·  type a hex below  ·  enter keeps".into(),
+            tabs: ["theme", "keys", "schemes", "accent", "font"].iter().map(|s| s.to_string()).collect(),
+            tab: 4,
+            rows: crate::app::font_rows_for_preview(),
+            selected: 8,
+            footer: "click or arrow to try  ·  enter keeps  ·  esc restores".into(),
         };
         r.render_frame(&view, &rows, sw, &[pane], w, h, "", false, drop_at, Some("ag"), Some(&sb), None, None, Some(&sv));
         let px = read_rgba(&r, &tex, w, h).expect("readback");

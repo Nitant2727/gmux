@@ -190,6 +190,9 @@ struct SettingsState {
     accent_preview: Option<String>,
     /// Inline `#rrggbb` entry on the accent tab's custom row, or `None` when not typing.
     hex: Option<String>,
+    /// Font size in force when the font picker started trying sizes on. Restored on Escape — the
+    /// config's own value would undo a live `Ctrl+=` zoom the user made before opening the panel.
+    font_before: Option<f32>,
     /// Rebinding: the next chord pressed becomes this action's binding.
     capturing: bool,
 }
@@ -200,7 +203,24 @@ struct SettingsState {
 const ACCENT_CYCLE: &[&str] = &["default", "system", "#3b8ae6", "#8f7ae6", "#4bb58a", "#d98a4b", "#c9566d"];
 
 /// The settings panel's sections, in tab-strip order (`SettingsState::tab` indexes this).
-const SETTINGS_TABS: [&str; 4] = ["theme", "keys", "schemes", "accent"];
+const SETTINGS_TABS: [&str; 5] = ["theme", "keys", "schemes", "accent", "font"];
+
+/// The font sizes the picker offers: every point where it matters, then a coarser ladder. Not the
+/// whole `FONT_MIN..=FONT_MAX` range — 33 rows of one-point steps is a worse list than 12 good
+/// ones, and `Ctrl+=` / the config still reach any size in between.
+const FONT_SIZES: [f32; 12] =
+    [10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 20.0, 22.0, 24.0];
+
+/// The picker's sizes with `current` folded in, so a size reached by `Ctrl+=` or by hand still has
+/// a row to be marked on rather than the list looking like nothing is selected. Pure/tested.
+fn font_ladder(current: f32) -> Vec<f32> {
+    let mut v = FONT_SIZES.to_vec();
+    if !v.iter().any(|s| (s - current).abs() < 0.01) {
+        v.push(current);
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    }
+    v
+}
 
 /// A colour scheme's preview ribbon, in the renderer's colour type.
 fn swatch_rgb(name: &str) -> Vec<Rgb> {
@@ -214,24 +234,18 @@ fn is_hex_input(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c == '#' || c.is_ascii_hexdigit())
 }
 
-/// The accent picker's rows as the preview dump draws them (the real ones come from `State`,
-/// which needs a window and a daemon). Kept beside `ACCENT_CYCLE` so the two can't drift.
+/// The font picker's rows as the preview dump draws them (the real ones come from `State`, which
+/// needs a window and a daemon). Kept beside `FONT_SIZES` so the two can't drift.
 #[cfg(test)]
-pub(crate) fn accent_rows_for_preview() -> Vec<SettingsRow> {
-    let mut rows: Vec<SettingsRow> = ACCENT_CYCLE
-        .iter()
-        .map(|name| SettingsRow {
-            swatch: accent_swatch(name),
-            label: (*name).to_string(),
-            value: if *name == "#8f7ae6" { "in use" } else { "" }.to_string(),
+pub(crate) fn font_rows_for_preview() -> Vec<SettingsRow> {
+    font_ladder(18.0)
+        .into_iter()
+        .map(|px| SettingsRow {
+            swatch: vec![crate::renderer::accent(); (px / 2.0).round() as usize],
+            label: format!("{px:.0} px"),
+            value: if px == 18.0 { "in use" } else { "" }.to_string(),
         })
-        .collect();
-    rows.push(SettingsRow {
-        swatch: Vec::new(),
-        label: "custom hex".to_string(),
-        value: "#c0f_".to_string(),
-    });
-    rows
+        .collect()
 }
 
 /// Append typed text to a `#rrggbb` buffer: hex digits only, lowercased (the config's parser is
@@ -1869,6 +1883,7 @@ impl State {
                     preview: None,
                     accent_preview: None,
                     hex: None,
+                    font_before: None,
                 });
                 self.window.request_redraw();
             }
@@ -2539,6 +2554,20 @@ impl State {
             swatch: Vec::new(),
         };
         let cfg = Config::load();
+        if tab == 4 {
+            // No sample text: one glyph atlas means the frame can only draw ONE size, so a bar
+            // whose length tracks the size is the honest visual — it compares sizes at a glance
+            // without pretending to show them.
+            return self
+                .font_rows()
+                .into_iter()
+                .map(|px| SettingsRow {
+                    swatch: vec![crate::renderer::accent(); (px / 2.0).round() as usize],
+                    label: format!("{px:.0} px"),
+                    value: if (px - self.font_px).abs() < 0.01 { "in use" } else { "" }.to_string(),
+                })
+                .collect();
+        }
         if tab == 3 {
             let st = self.settings.as_ref();
             let cur = st.and_then(|s| s.accent_preview.clone()).unwrap_or_else(|| {
@@ -2689,25 +2718,27 @@ impl State {
                 st.hex = None; // moving off the custom row abandons a half-typed hex
                 self.preview_selected_scheme();
                 self.preview_selected_accent();
+                self.preview_selected_font();
             }
             Key::Named(NamedKey::ArrowUp) => {
                 st.sel = st.sel.checked_sub(1).unwrap_or(rows - 1);
                 st.hex = None;
                 self.preview_selected_scheme();
                 self.preview_selected_accent();
+                self.preview_selected_font();
             }
             Key::Named(NamedKey::Tab) | Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::ArrowLeft) => {
                 let back = matches!(&event.logical_key, Key::Named(NamedKey::ArrowLeft));
                 let n = SETTINGS_TABS.len();
-                st.tab = if back { (st.tab + n - 1) % n } else { (st.tab + 1) % n };
-                st.sel = 0;
-                self.cancel_preview(); // leaving the schemes tab abandons the try-on
+                let next = if back { (tab + n - 1) % n } else { (tab + 1) % n };
+                self.enter_tab(next, 0); // leaving a picker abandons the try-on
             }
             Key::Named(NamedKey::Enter) => {
                 let sel = st.sel;
                 match tab {
                     2 => self.commit_preview(),
                     3 => self.commit_accent(),
+                    4 => self.commit_font(),
                     1 => st.capturing = true,
                     _ => self.apply_theme_row(sel),
                 }
@@ -2767,12 +2798,7 @@ impl State {
         let tabs: Vec<String> = SETTINGS_TABS.iter().map(|s| (*s).to_string()).collect();
         if let Some(i) = self.renderer.settings_tab_at(x, y, &tabs, rows.len(), sw, sh) {
             if i != tab {
-                self.cancel_preview();
-                if let Some(st) = self.settings.as_mut() {
-                    st.tab = i;
-                    st.sel = 0;
-                }
-                self.window.request_redraw();
+                self.enter_tab(i, 0);
             }
             return true;
         }
@@ -2782,7 +2808,7 @@ impl State {
             let i = start + w; // window index -> the row's index in the full list
             // Same row twice = keep it. Checked before moving the selection so the second click
             // commits rather than re-previewing what is already live.
-            let repeat = (tab == 2 || tab == 3) && i == sel;
+            let repeat = matches!(tab, 2 | 3 | 4) && i == sel;
             if let Some(st) = self.settings.as_mut() {
                 st.sel = i;
                 st.capturing = false; // a click abandons a half-finished chord capture
@@ -2792,6 +2818,8 @@ impl State {
                 2 => self.preview_selected_scheme(),
                 3 if repeat => self.commit_accent(),
                 3 => self.preview_selected_accent(),
+                4 if repeat => self.commit_font(),
+                4 => self.preview_selected_font(),
                 // The theme tab's ribbon is a shortcut into the picker behind it: click the colours
                 // to get to where colours can be tried on. Elsewhere on the row a click only
                 // selects, so a stray click can't silently cycle a setting.
@@ -2881,15 +2909,76 @@ impl State {
         self.window.request_redraw();
     }
 
-    /// Put the config's own palette and accent back, dropping whatever was being tried on. Safe to
-    /// call when nothing is previewing.
+    /// Open a settings tab: abandons whatever was being tried on, and on the font tab remembers the
+    /// size in force, which both anchors the list (see [`Self::font_rows`]) and is what Escape puts
+    /// back. Every path that changes tabs goes through here.
+    fn enter_tab(&mut self, tab: usize, sel: usize) {
+        self.cancel_preview();
+        let px = self.font_px;
+        if let Some(st) = self.settings.as_mut() {
+            st.tab = tab;
+            st.sel = sel;
+            st.capturing = false;
+            if tab == 4 {
+                st.font_before = Some(px);
+            }
+        }
+        self.window.request_redraw();
+    }
+
+    /// The font picker's sizes. Anchored to the size that was in force when the tab was opened, NOT
+    /// to the live one: previewing changes the live size, and a list that rebuilt around it would
+    /// slide its own rows out from under the selection mid-arrow.
+    fn font_rows(&self) -> Vec<f32> {
+        let base = self.settings.as_ref().and_then(|s| s.font_before).unwrap_or(self.font_px);
+        font_ladder(base)
+    }
+
+    /// Try the selected font size on: applies live (atlas rebuild + geometry resend, the same path
+    /// `Ctrl+=` takes) without writing it. Escape puts back the size the tab was opened at.
+    fn preview_selected_font(&mut self) {
+        let Some(st) = self.settings.as_ref() else { return };
+        if st.tab != 4 {
+            return;
+        }
+        let Some(px) = self.font_rows().get(st.sel).copied() else { return };
+        self.apply_font_px(px);
+        self.window.request_redraw();
+    }
+
+    /// Keep the size under the selection: apply it and write it, so it also survives a restart.
+    fn commit_font(&mut self) {
+        let Some(st) = self.settings.as_ref() else { return };
+        let Some(px) = self.font_rows().get(st.sel).copied() else { return };
+        self.apply_font_px(px);
+        self.write_config(|cfg| {
+            cfg.as_object_mut().unwrap().insert("font_px".into(), serde_json::json!(px));
+        });
+        self.config_font_px = px;
+        if let Some(st) = self.settings.as_mut() {
+            st.font_before = None; // committed, not pending: nothing left to restore
+            st.tab = 0;
+            st.sel = 0;
+        }
+        self.window.request_redraw();
+    }
+
+    /// Put the config's own palette and accent back, and the font size that was in force, dropping
+    /// whatever was being tried on. Safe to call when nothing is previewing.
     fn cancel_preview(&mut self) {
         let scheme = self.settings.as_mut().and_then(|s| s.preview.take()).is_some();
         let accent = self.settings.as_mut().and_then(|s| s.accent_preview.take()).is_some();
+        let font = self.settings.as_mut().and_then(|s| s.font_before.take());
+        if let Some(px) = font {
+            self.apply_font_px(px);
+        }
         if let Some(st) = self.settings.as_mut() {
             st.hex = None;
         }
         if !scheme && !accent {
+            if font.is_some() {
+                self.window.request_redraw();
+            }
             return;
         }
         let cfg = Config::load();
@@ -2933,46 +3022,34 @@ impl State {
         self.window.request_redraw();
     }
 
-    /// Enter on a theme row: open the schemes tab, cycle the accent, step the font size, or flip
-    /// the boolean.
+    /// Enter on a theme row. The first three rows are doorways into the pickers that own those
+    /// settings — each previews live, so a second way to change them from here would be a worse
+    /// one. Only the boolean is flipped in place.
     fn apply_theme_row(&mut self, sel: usize) {
         match sel {
-            // The colour-scheme row is a doorway to the schemes tab, where each scheme is drawn in
-            // its own colours and previews live. One place changes the scheme, not two.
             0 => {
                 let cur = Config::load().theme.and_then(|t| t.preset);
-                let sel = cur
+                let at = cur
                     .as_deref()
                     .and_then(|c| crate::config::preset_names().iter().position(|n| n.eq_ignore_ascii_case(c)))
                     .unwrap_or(0);
-                if let Some(st) = self.settings.as_mut() {
-                    st.tab = 2;
-                    st.sel = sel;
-                }
+                self.enter_tab(2, at);
             }
-            // Likewise the accent row: its picker previews live and takes a custom hex, so it owns
-            // the setting outright rather than sharing it with a cycler here.
             1 => {
                 let cur = Config::load().theme.and_then(|t| t.accent);
-                let sel = cur
+                let at = cur
                     .as_deref()
                     .and_then(|c| ACCENT_CYCLE.iter().position(|p| p.eq_ignore_ascii_case(c)))
                     .unwrap_or(if cur.is_some() { ACCENT_CYCLE.len() } else { 0 }); // a pinned hex = the custom row
-                if let Some(st) = self.settings.as_mut() {
-                    st.tab = 3;
-                    st.sel = sel;
-                }
+                self.enter_tab(3, at);
             }
             2 => {
-                // Wrap at the clamp so one key can walk the whole range.
-                let next = if self.font_px >= 28.0 { 10.0 } else { self.font_px + 2.0 };
-                self.write_config(|cfg| {
-                    cfg.as_object_mut()
-                        .unwrap()
-                        .insert("font_px".into(), serde_json::json!(next));
-                });
-                self.config_font_px = next;
-                self.apply_font_px(next);
+                let at = self
+                    .font_rows()
+                    .iter()
+                    .position(|px| (px - self.font_px).abs() < 0.01)
+                    .unwrap_or(0);
+                self.enter_tab(4, at);
             }
             3 => {
                 let next = !self.focus_follows_mouse;
@@ -4503,6 +4580,8 @@ impl State {
                 selected: sel,
                 footer: if s.capturing {
                     "press the new chord  ·  esc cancels".into()
+                } else if s.tab == 4 {
+                    "click or arrow to try  ·  enter keeps  ·  esc restores".into()
                 } else if s.tab == 3 {
                     "click or arrow to try  ·  type a hex below  ·  enter keeps".into()
                 } else if s.tab == 2 {
@@ -5018,6 +5097,28 @@ mod tests {
                 SidebarItem::Row(r) => r.name.clone(),
             })
             .collect()
+    }
+
+    #[test]
+    fn the_font_ladder_always_has_a_row_for_the_size_in_force() {
+        // A listed size changes nothing — no duplicate row, no reordering.
+        assert_eq!(font_ladder(16.0), FONT_SIZES.to_vec());
+        assert_eq!(font_ladder(24.0), FONT_SIZES.to_vec());
+
+        // A size reached by Ctrl+= or by hand is folded in, in order, so the picker can mark it
+        // "in use" instead of looking like nothing is selected.
+        let l = font_ladder(19.0);
+        assert_eq!(l.len(), FONT_SIZES.len() + 1);
+        assert!(l.windows(2).all(|w| w[0] < w[1]), "sorted: {l:?}");
+        assert_eq!(l[l.iter().position(|p| *p == 19.0).unwrap() - 1], 18.0);
+
+        // Sizes below and above the ladder land at its ends rather than being dropped.
+        assert_eq!(font_ladder(8.0).first().copied(), Some(8.0));
+        assert_eq!(font_ladder(40.0).last().copied(), Some(40.0));
+        // Every offered size survives the atlas clamp, so a row can't apply as a different size.
+        for px in font_ladder(19.0) {
+            assert_eq!(clamp_font_px(px), px);
+        }
     }
 
     #[test]

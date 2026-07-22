@@ -54,8 +54,9 @@ The binary is currently unsigned (SmartScreen may prompt on first run of a downl
 ## Default keybindings
 
 `Ctrl+,` opens the settings panel: a **theme** tab (color scheme, accent, font size,
-focus-follows-mouse), a **keys** tab listing every action with its current chord, and **schemes**
-and **accent** pickers (below). Arrows move, Tab switches tab, Enter
+focus-follows-mouse), a **keys** tab listing every action with its current chord, and **schemes**,
+**accent** and **font** pickers, each of which tries a value on live before you keep it (Enter
+keeps, Escape restores). Arrows move, Tab switches tab, Enter
 changes the value — on a keybinding, Enter waits for you to press the new chord. Clicking works
 too: a click on a tab opens it, and on the schemes tab a click previews. Changes are
 written to `%APPDATA%\gmux\gmux.json` and applied live; `e` opens that file for anything the panel
@@ -72,7 +73,7 @@ doesn't cover (colour schemes, per-workspace settings).
 | `Ctrl+Shift+P` | Command palette (fuzzy actions + tab switcher) |
 | `Ctrl+Shift+F` | Scrollback search (Enter/Shift+Enter cycle matches) |
 | `Ctrl+Up` / `Ctrl+Down` | Jump to previous / next command prompt (needs shell integration) |
-| `Ctrl+=` / `Ctrl+-` / `Ctrl+0`, `Ctrl+wheel` | Font zoom |
+| `Ctrl+=` / `Ctrl+-` / `Ctrl+0`, `Ctrl+wheel` | Font zoom (the panel's **font** tab picks a size and persists it) |
 | `Ctrl+Shift+S` | Export the pane's scrollback to Downloads |
 | `Ctrl+Shift+C` / `Ctrl+Shift+V`, right-click | Copy selection / paste |
 | `Ctrl+Shift+M` | Copy mode (arrows/hjkl move, `v` marks, `y` copies, Esc exits) |
