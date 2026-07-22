@@ -31,7 +31,10 @@ jobs:
         with:
           key: release-${{ matrix.label }}
       - name: Build gmux (release)
-        run: cargo build --release --locked -p gmux --target ${{ matrix.target }}
+        # `browser` is on for releases: the embedded WebView2 panel (Ctrl+Shift+B) is a shipped
+        # feature, and a default-features build would leave the binary without it. WebView2 is
+        # present on Windows 10 21H2+ and Windows 11, which is the support floor anyway.
+        run: cargo build --release --locked -p gmux --features browser --target ${{ matrix.target }}
       - name: Package portable zip
         shell: pwsh
         run: |
