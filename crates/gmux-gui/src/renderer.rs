@@ -211,6 +211,9 @@ pub struct PaneView<'a> {
     /// Selected cell range `((start_col,start_row),(end_col,end_row))`, normalized start<=end in
     /// reading order, in viewport cell coords. Those cells get fg/bg swapped + an ACCENT tint.
     pub selection: Option<((u16, u16), (u16, u16))>,
+    /// Draw a close button in this pane's title strip (the active pane, or the hovered one) —
+    /// always-on close buttons in every pane of a busy split are visual noise.
+    pub show_close: bool,
 }
 
 /// One workspace (window/tab) row in the sidebar.
@@ -353,6 +356,21 @@ fn push_rounded_grad(out: &mut Vec<RoundedVertex>, x0: f32, y0: f32, x1: f32, y1
             color: if ly < 0.0 { top } else { bot },
         });
     }
+}
+
+/// The drawn rect of a pane's chrome, given the daemon's edge-to-edge tile.
+///
+/// Daemon rects tile the content area with no gaps; the GUI shrinks each edge — MARGIN at a
+/// content boundary, GAP/2 at an interior split edge, so neighbours share one GAP. Shared by the
+/// renderer and the close-button hit-test, because a hit-test that re-derived these insets would
+/// drift from the drawing the moment either changed. Pure/tested.
+fn pane_chrome_rect(rect: Rect, sidebar_w: u32, surf_w: u32, surf_h: u32) -> (f32, f32, f32, f32) {
+    let (ox, oy, ow, oh) = (rect.x as f32, rect.y as f32, rect.w as f32, rect.h as f32);
+    let l = if rect.x <= sidebar_w { MARGIN } else { GAP / 2.0 };
+    let t = if rect.y == 0 { MARGIN } else { GAP / 2.0 };
+    let rgt = if rect.x + rect.w >= surf_w { MARGIN } else { GAP / 2.0 };
+    let bot = if rect.y + rect.h >= surf_h { MARGIN } else { GAP / 2.0 };
+    (ox + l, oy + t, (ow - l - rgt).max(1.0), (oh - t - bot).max(1.0))
 }
 
 /// Stroke a rounded rect as a ring `w` px thick: the outer rounded quad, then the inner one punched
@@ -970,6 +988,7 @@ impl Renderer {
         self.render_panes(
             view,
             &[PaneView {
+                show_close: false,
                 snap,
                 attention,
                 active: true,
@@ -1126,6 +1145,23 @@ impl Renderer {
             top += h + ROW_GAP;
         }
         top
+    }
+
+    /// Whether `(x, y)` (window coords) lands on the close button in pane `rect`'s title strip.
+    /// `rect` is the pane's OUTER rect as the app caches it, already shifted by the sidebar; the
+    /// insets here mirror what `render_frame` draws.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pane_close_hit(&self, x: f32, y: f32, rect: Rect, sidebar_w: u32, surf_w: u32, surf_h: u32, active: bool, attention: Attention) -> bool {
+        let cw = self.cell_w() as f32;
+        let ch = self.cell_h() as f32;
+        let (bw, _) = border_style(active, attention);
+        // The SAME chrome rect render_frame draws into — a split pane's edges are half-gaps, not
+        // margins, so re-deriving them here would put the hit-box beside the glyph.
+        let (cx, cy, cw_, _) = pane_chrome_rect(rect, sidebar_w, surf_w, surf_h);
+        let (sx1, sy0) = (cx + cw_ - bw, cy + bw);
+        let ty = (sy0 + (TITLE_STRIP - ch) / 2.0).max(sy0);
+        let bx = sx1 - 8.0 - cw;
+        x >= bx - 4.0 && x <= bx + cw + 4.0 && y >= ty - 3.0 && y < ty + ch + 3.0
     }
 
     /// Whether `(x, y)` lands on the close button of a hovered row whose top edge is `row_top`.
@@ -1508,13 +1544,7 @@ impl Renderer {
         for pv in panes {
             // Daemon rects tile the content area edge-to-edge. Shrink each edge: MARGIN at the
             // content boundary, GAP/2 at an interior split edge (so neighbours share a GAP gap).
-            let (ox, oy, ow, oh) = (pv.rect.x as f32, pv.rect.y as f32, pv.rect.w as f32, pv.rect.h as f32);
-            let l = if pv.rect.x <= sidebar_w { MARGIN } else { GAP / 2.0 };
-            let t = if pv.rect.y == 0 { MARGIN } else { GAP / 2.0 };
-            let rgt = if pv.rect.x + pv.rect.w >= surf_w { MARGIN } else { GAP / 2.0 };
-            let bot = if pv.rect.y + pv.rect.h >= surf_h { MARGIN } else { GAP / 2.0 };
-            let (cx, cy) = (ox + l, oy + t);
-            let (cw_, ch_) = ((ow - l - rgt).max(1.0), (oh - t - bot).max(1.0));
+            let (cx, cy, cw_, ch_) = pane_chrome_rect(pv.rect, sidebar_w, surf_w, surf_h);
 
             // Pane chrome: a rounded border ring (outer) with the BG_PANE fill (inner, inset by the
             // border width) drawn on top. The fill also letterboxes the cell-grid remainder.
@@ -1551,9 +1581,15 @@ impl Renderer {
             let sr = (RADIUS - bw).max(0.0);
             // Title band: lit at the top, settling into BG_PANE where it meets the cells, so the
             // strip reads as a raised surface instead of a flat stripe.
-            let (t_top, t_bot) = (rgba(blend(TEXT, BG_SIDEBAR, 0.05)), rgba(BG_SIDEBAR));
+            // The ACTIVE pane's strip is tinted toward the accent and its title is full-strength;
+            // inactive strips stay neutral and dim. Focus was previously carried only by the 1px
+            // border and the glow, which is easy to lose in a four-way split.
+            let base = if pv.active { blend(accent(), BG_SIDEBAR, 0.16) } else { BG_SIDEBAR };
+            let (t_top, t_bot) = (rgba(blend(TEXT, base, 0.05)), rgba(base));
             push_rounded_grad(&mut srd, sx0, sy0, sx1, sy1, sr, t_top, t_bot, fw, fh);
             push_rounded_grad(&mut srd, sx0, sy0 + sr, sx1, sy1, 0.0, t_top, t_bot, fw, fh);
+            // Hairline where the strip meets the cells, so the title reads as its own surface.
+            push_rounded(&mut srd, sx0, sy1 - 1.0, sx1, sy1, 0.0, rgba_a(TEXT, 0.07), fw, fh);
             let ty = (sy0 + (TITLE_STRIP - ch_cell) / 2.0).max(sy0);
             let mut tx = sx0 + 12.0;
             if pv.active {
@@ -1562,10 +1598,18 @@ impl Renderer {
                 push_rounded(&mut srd, tx, dy, tx + dot, dy + dot, dot / 2.0, rgba(accent()), fw, fh);
                 tx += dot + 5.0;
             }
-            let max_chars = ((sx1 - 8.0 - tx).max(0.0) / cw_cell) as usize;
+            // Close button at the strip's right end (active pane, or whichever one is hovered).
+            let mut title_right = sx1 - 8.0;
+            if pv.show_close {
+                let bx = title_right - cw_cell;
+                self.text_run("x", bx, ty, rgba_a(TEXT, if pv.active { 0.8 } else { 0.5 }), fw, fh, &mut sgl);
+                title_right = bx - 6.0;
+            }
+            let max_chars = ((title_right - tx).max(0.0) / cw_cell) as usize;
             let title = truncate_ellipsis(&pv.title, max_chars);
             if !title.is_empty() {
-                self.text_run(&title, tx, ty, rgba(TEXT_DIM), fw, fh, &mut sgl);
+                let ink = if pv.active { TEXT } else { TEXT_DIM };
+                self.text_run(&title, tx, ty, rgba(ink), fw, fh, &mut sgl);
             }
 
             // Cell-area geometry (hoisted so the scrollbar, scroll badge, and search band share this
@@ -1983,6 +2027,26 @@ mod tests {
     }
 
     #[test]
+    fn pane_chrome_insets_margin_at_edges_half_gap_inside() {
+        // A single pane filling the content area gets MARGIN on every side.
+        let full = Rect { x: 100, y: 0, w: 400, h: 300 };
+        let (x, y, w, h) = pane_chrome_rect(full, 100, 500, 300);
+        assert_eq!((x, y), (100.0 + MARGIN, MARGIN));
+        assert_eq!((w, h), (400.0 - 2.0 * MARGIN, 300.0 - 2.0 * MARGIN));
+
+        // The LEFT half of a vertical split: margin on the outer edges, half a gap on the split.
+        let left = Rect { x: 100, y: 0, w: 200, h: 300 };
+        let (_, _, lw, _) = pane_chrome_rect(left, 100, 500, 300);
+        assert_eq!(lw, 200.0 - MARGIN - GAP / 2.0);
+        // And its neighbour mirrors it, so the two share exactly one GAP.
+        let right = Rect { x: 300, y: 0, w: 200, h: 300 };
+        let (rx, _, rw, _) = pane_chrome_rect(right, 100, 500, 300);
+        assert_eq!(rx, 300.0 + GAP / 2.0);
+        assert_eq!(rx - (100.0 + MARGIN + lw), GAP, "neighbours share one gap");
+        assert_eq!(rw, 200.0 - MARGIN - GAP / 2.0);
+    }
+
+    #[test]
     fn pr_status_colors_are_distinct_and_junk_is_none() {
         // The four states must be visually distinct (GitHub's green/gray/purple/red).
         let open = pr_color("open").unwrap();
@@ -2192,6 +2256,7 @@ mod tests {
             history: 0,
             title: "t".into(),
             selection: None,
+            show_close: false,
         };
         let sb = SearchBar { label: "find:".into(), query: "hi".into(), current: 1, total: 1, overlay_only: false };
         r.render_frame(&view, &[], 0, &[pv], 1, 1, "", false, None, None, Some(&sb), None, None);

@@ -112,6 +112,13 @@ pub enum Call {
     FocusPane { dir: String },
     /// Close the active pane.
     ClosePane,
+    /// Close a SPECIFIC pane by id (a click on that pane's close button). Focuses it first, so the
+    /// daemon's close path and the layout that follows are the same ones `ClosePane` produces.
+    /// An unknown id is a harmless no-op.
+    ClosePaneId {
+        #[serde(default)]
+        pane: u64,
+    },
     /// Toggle zoom on the active pane.
     ToggleZoom,
     /// Drag-resize the split at a divider: grow `pane` (the top/left pane of the dragged divider)

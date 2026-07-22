@@ -370,8 +370,10 @@ fn palette_items(tab_names: &[String], query: &str, recents: &[String]) -> Vec<(
 /// A close gesture waiting on confirmation because the target has running child processes
 /// (a build, an agent). Enter proceeds; Escape or any other key cancels.
 enum ConfirmClose {
-    /// Ctrl+Shift+W on the active pane.
-    Pane,
+    /// Close this specific pane (Ctrl+Shift+W, or a title-strip close button). Carries the id
+    /// because the button can target a pane that is NOT the active one — confirming a bare
+    /// "close the active pane" would then kill the wrong one.
+    Pane(u64),
     /// Middle-click on the sidebar tab with this stable window id.
     Window(u64),
 }
@@ -1653,7 +1655,7 @@ impl State {
                     Ok(ResultBody::Busy(true))
                 );
                 if busy {
-                    self.confirm_close = Some(ConfirmClose::Pane);
+                    self.confirm_close = Some(ConfirmClose::Pane(self.active_pane));
                     self.window.request_redraw();
                 } else {
                     self.client.control(Call::ClosePane);
@@ -2061,6 +2063,11 @@ impl State {
                 }
                 self.window.request_redraw();
             }
+            return;
+        }
+        // A pane's close button wins over everything else in the content area (it sits in the
+        // title strip, where a plain click would otherwise just focus the pane).
+        if self.close_pane_button_at(cx, cy) {
             return;
         }
         // Content area: cached rects are in content-area coords, so shift the click by the sidebar.
@@ -2607,7 +2614,7 @@ impl State {
         let Some(target) = self.confirm_close.take() else { return };
         if confirm {
             match target {
-                ConfirmClose::Pane => self.client.control(Call::ClosePane),
+                ConfirmClose::Pane(pane) => self.client.control(Call::ClosePaneId { pane }),
                 ConfirmClose::Window(id) => self.client.control(Call::CloseWindow { id }),
             }
             self.sync_size();
@@ -2893,6 +2900,46 @@ impl State {
         if link_scheme_ok(&url) {
             open_url(&url);
         }
+        true
+    }
+
+    /// If `(x, y)` landed on a pane's title-strip close button, close THAT pane and report `true`.
+    /// Only the panes that draw the button (active, or hovered) are considered, so an invisible
+    /// hit-box can't swallow a click meant to focus a pane.
+    fn close_pane_button_at(&mut self, x: f64, y: f64) -> bool {
+        let (sidebar_w, _, surf_h) = self.areas();
+        let surf_w = self.config.width;
+        let hovered = self.pane_under_cursor();
+        let target = self.last_panes.iter().find(|p| {
+            let shown = p.id == self.active_pane || p.id == hovered;
+            if !shown {
+                return false;
+            }
+            // last_panes are content-area coords; shift into window coords for the hit-test.
+            let rect = Rect { x: p.x + sidebar_w, y: p.y, w: p.w, h: p.h };
+            let att = if p.attention { Attention::Pending } else { Attention::Quiet };
+            self.renderer.pane_close_hit(
+                x as f32,
+                y as f32,
+                rect,
+                sidebar_w,
+                surf_w,
+                surf_h,
+                p.id == self.active_pane,
+                att,
+            )
+        });
+        let Some(pane) = target.map(|p| p.id) else { return false };
+        // A pane running something asks first, exactly like Ctrl+Shift+W does.
+        let busy = matches!(self.client.call(Call::PaneBusy { pane }), Ok(ResultBody::Busy(true)));
+        if busy {
+            self.confirm_close = Some(ConfirmClose::Pane(pane));
+        } else {
+            self.client.control(Call::ClosePaneId { pane });
+            self.sync_size();
+            self.force_full = true;
+        }
+        self.window.request_redraw();
         true
     }
 
@@ -3592,6 +3639,11 @@ impl State {
         // fetch failed, so a stale span can't open a URL that is no longer under the cursor).
         self.url_spans = url_spans;
         self.sync_title(); // window title follows the active pane (last_panes/active_pane now current)
+        // Which pane's title strip shows a close button (besides the active one's).
+        let hovered_pane = {
+            let (cx, cy) = self.cursor;
+            (cx >= 0.0 && cy >= 0.0 && (cx as u32) >= sidebar_w).then(|| self.pane_under_cursor())
+        };
         let views: Vec<PaneView> = snaps
             .iter()
             .map(|(s, a, active, rect, scrolled, id, title)| {
@@ -3610,6 +3662,9 @@ impl State {
                     history: if *active { self.scroll_history as u32 } else { 0 },
                     title: title.clone(),
                     selection,
+                    // The active pane always offers its close button; others only while hovered,
+                    // so a four-way split isn't four x's competing for attention.
+                    show_close: *active || hovered_pane == Some(*id),
                 }
             })
             .collect();
@@ -3667,7 +3722,7 @@ impl State {
             .or_else(|| {
                 self.confirm_close.as_ref().map(|c| SearchBar {
                     label: match c {
-                        ConfirmClose::Pane => "pane is busy — Enter closes it, Esc keeps it".into(),
+                        ConfirmClose::Pane(_) => "pane is busy — Enter closes it, Esc keeps it".into(),
                         ConfirmClose::Window(_) => {
                             "tab has busy panes — Enter closes it, Esc keeps it".into()
                         }
