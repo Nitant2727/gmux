@@ -1811,6 +1811,9 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         let Some(st) = self.state.as_mut() else { return };
+        // Every pass, not on the heartbeat: a toggle typed into the browser panel should act on
+        // the keypress, not up to a second later.
+        st.poll_browser_toggle();
 
         // Still bringing up the daemon connection: keep painting (a cleared frame) each tick and
         // poll the connect thread. Skip all the client-dependent polling below until it's live.
@@ -2344,12 +2347,27 @@ impl State {
                     b.set_bounds(x, y, w, h);
                     b.set_visible(true);
                 }
-                None => self.embed_browser("about:blank"),
+                // The start page, not about:blank: WebView2 renders about:blank dark-themed, i.e.
+                // a black page in a near-black app — the panel opened and looked like nothing had.
+                None => self.embed_browser(&gmux_browser::embedded::start_page_url()),
             }
         }
         self.sync_size();
         self.window.request_redraw();
     }
+
+    /// Ctrl+Shift+B pressed *inside the page*: once the user clicks into the panel, WebView2 owns
+    /// the keyboard and the app's keymap never sees the chord — the panel could be opened but not
+    /// closed by key. The embedded browser reports it through its accelerator event instead, and
+    /// this drains that. Polled every event-loop pass (the COM callback wakes the loop).
+    #[cfg(feature = "browser")]
+    fn poll_browser_toggle(&mut self) {
+        if self.browser.as_ref().is_some_and(|b| b.take_toggle_request()) {
+            self.toggle_browser_dock();
+        }
+    }
+    #[cfg(not(feature = "browser"))]
+    fn poll_browser_toggle(&mut self) {}
 
     /// Keep the panel glued to its column after a window resize.
     #[cfg(feature = "browser")]

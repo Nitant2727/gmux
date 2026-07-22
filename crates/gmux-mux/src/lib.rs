@@ -224,7 +224,11 @@ impl Window {
 
     /// Sidebar metadata for this window: name, active pane's cwd, git branch, and attention.
     pub fn workspace_info(&self) -> WorkspaceInfo {
-        let cwd = self.active_pane().cwd();
+        // The pane's live cwd needs shell integration; the window's anchored workspace_dir does
+        // not. Without the fallback, a workspace opened by picking a folder still showed as
+        // "shell" (and lost its git branch) until the user installed the integration — the name
+        // they chose the folder for was already known and just not used.
+        let cwd = self.active_pane().cwd().or_else(|| self.workspace_dir.clone());
         let branch = cwd.as_deref().and_then(|c| workspace::git_branch(std::path::Path::new(c)));
         // A custom name (sidebar rename) wins over the derived cwd name.
         let name = self.name.clone().unwrap_or_else(|| {
@@ -684,6 +688,27 @@ mod tests {
         assert_eq!(win.workspace_info().name, "backend", "custom name wins");
         win.set_name(String::new());
         assert_eq!(win.workspace_info().name, "shell", "empty name clears the override");
+    }
+
+    /// A workspace anchored to a directory is NAMED for it, without waiting for shell
+    /// integration: the pane's live cwd (which needs the integration) wins when present, the
+    /// anchored dir fills in when it isn't, and a rename still beats both.
+    #[test]
+    fn workspace_dir_names_the_window_when_the_pane_has_no_cwd() {
+        let mut win = remote_window(); // remote pane: no live cwd, the un-integrated case
+        assert_eq!(win.workspace_info().name, "shell");
+        win.set_workspace_dir(r"C:\Workspace\personal\projects\gmux".to_string());
+        let info = win.workspace_info();
+        assert_eq!(info.name, "gmux", "the folder the user picked names the workspace");
+        assert_eq!(info.cwd.as_deref(), Some(r"C:\Workspace\personal\projects\gmux"));
+        // A rename still wins, and clearing it goes back to the dir name, not to "shell".
+        win.set_name("api".to_string());
+        assert_eq!(win.workspace_info().name, "api");
+        win.set_name(String::new());
+        assert_eq!(win.workspace_info().name, "gmux");
+        // Unpinning the dir falls all the way back.
+        win.set_workspace_dir(String::new());
+        assert_eq!(win.workspace_info().name, "shell");
     }
 
     #[test]

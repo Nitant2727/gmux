@@ -1550,7 +1550,16 @@ impl Renderer {
             } else {
                 BG_SIDEBAR
             };
-            let dot_ink = if r.active { on_accent(accent()) } else { TEXT_DIM };
+            // A busy workspace's dot is GREEN — "an agent is working here" should read from
+            // across the room, and a filled-vs-hollow dot in the same grey didn't. Idle rings
+            // keep the quiet ink.
+            let dot_ink = if r.busy {
+                PROGRESS
+            } else if r.active {
+                on_accent(accent())
+            } else {
+                TEXT_DIM
+            };
             let dot_cx = ROW_OUTER_PAD + ROW_PAD_H + STATUS_DOT / 2.0;
             let dot_cy = line1 + ch / 2.0;
             let disc = |rd: &mut Vec<RoundedVertex>, radius: f32, color: [f32; 4]| {
