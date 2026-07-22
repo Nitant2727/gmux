@@ -593,6 +593,7 @@ mod tests {
             Call::ResizeView { w: 800, h: 600, cell_w: 9, cell_h: 18, pane_chrome: 34, pane_chrome_y: 56 },
             Call::FocusPane { dir: "right".into() },
             Call::ClosePane,
+            Call::ClosePaneId { pane: 9 },
             Call::ToggleZoom,
             Call::ResizeSplit { pane: 4, dx: 0.5, dy: -0.25 },
             Call::SwitchWindow { next: true },
