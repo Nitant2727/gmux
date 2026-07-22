@@ -21,7 +21,8 @@ use winit::window::{Window, WindowId};
 use crate::config::{config_path, default_template, Action, Config, Keymap};
 use crate::daemon_client::{spawn_output_subscriber, DaemonClient};
 use crate::renderer::{
-    GroupHeader, PaletteView, PaneView, SearchBar, SidebarItem, SidebarRow, SPINNER_STEP_MS,
+    GroupHeader, PaletteView, PaneView, SearchBar, SettingsView, SidebarItem, SidebarRow,
+    SPINNER_STEP_MS,
 };
 use crate::Renderer;
 
@@ -176,6 +177,20 @@ struct Selection {
     end: (u16, u16),
 }
 
+/// The settings overlay's state (Ctrl+,).
+struct SettingsState {
+    /// 0 = theme, 1 = keys.
+    tab: usize,
+    sel: usize,
+    /// Rebinding: the next chord pressed becomes this action's binding.
+    capturing: bool,
+}
+
+/// Accent choices the theme tab cycles through, in order. "default" is gmux's own accent and
+/// "system" follows Windows; the rest are common terminal accents, so the cycle is useful without
+/// a colour picker.
+const ACCENT_CYCLE: &[&str] = &["default", "system", "#3b8ae6", "#8f7ae6", "#4bb58a", "#d98a4b", "#c9566d"];
+
 /// A press on a pane's title strip that may become a pane rearrange once the cursor moves past the
 /// threshold. Dropping on another pane swaps the two.
 struct PaneDrag {
@@ -246,6 +261,50 @@ enum ItemMeta {
     Header(String),
     /// A workspace row, carrying its index among the VISIBLE rows (already windowed).
     Row(usize),
+}
+
+/// Format a pressed chord the way `gmux.json` writes it (`ctrl+shift+d`, `alt+left`), for the
+/// settings panel's rebinding capture. Returns `None` for a chord the config parser would reject —
+/// notably one with no modifier, which would swallow that key before it reached the pane. Mirrors
+/// the token vocabulary of `config::parse_chord`. Pure/tested.
+fn chord_string(mods: ModifiersState, key: &Key) -> Option<String> {
+    let mut parts = Vec::new();
+    if mods.control_key() {
+        parts.push("ctrl");
+    }
+    if mods.shift_key() {
+        parts.push("shift");
+    }
+    if mods.alt_key() {
+        parts.push("alt");
+    }
+    if mods.super_key() {
+        parts.push("super");
+    }
+    if parts.is_empty() {
+        return None; // a bare key would eat normal typing
+    }
+    let name = match key {
+        Key::Named(NamedKey::ArrowLeft) => "left".to_string(),
+        Key::Named(NamedKey::ArrowRight) => "right".to_string(),
+        Key::Named(NamedKey::ArrowUp) => "up".to_string(),
+        Key::Named(NamedKey::ArrowDown) => "down".to_string(),
+        Key::Named(NamedKey::PageUp) => "pageup".to_string(),
+        Key::Named(NamedKey::PageDown) => "pagedown".to_string(),
+        Key::Named(NamedKey::Home) => "home".to_string(),
+        Key::Named(NamedKey::End) => "end".to_string(),
+        Key::Character(c) => {
+            let c = c.to_lowercase();
+            // Only single characters are bindable; the parser reads one char per token.
+            if c.chars().count() != 1 {
+                return None;
+            }
+            c
+        }
+        _ => return None,
+    };
+    parts.push(&name);
+    Some(parts.join("+"))
 }
 
 /// Whether a workspace row survives the sidebar filter. Matches the same fuzzy subsequence the
@@ -867,6 +926,8 @@ struct State {
     confirm_close: Option<ConfirmClose>,
     /// The command palette overlay (Ctrl+Shift+P), or `None`.
     palette: Option<PaletteState>,
+    /// The settings overlay (Ctrl+,), or `None`.
+    settings: Option<SettingsState>,
     /// Keyboard copy mode (Ctrl+Shift+M), or `None`.
     copy_mode: Option<CopyModeState>,
     /// Last divider press `(pane, when)` — a second press within `CLICK_INTERVAL` equalizes.
@@ -1081,6 +1142,7 @@ impl ApplicationHandler for App {
             preedit: None,
             confirm_close: None,
             palette: None,
+            settings: None,
             copy_mode: None,
             last_divider_click: None,
             palette_recent: Vec::new(),
@@ -1373,6 +1435,14 @@ impl ApplicationHandler for App {
                 if let Some(st) = self.state.as_mut() {
                     if st.rename.is_some() {
                         st.rename_key(&event, self.mods);
+                        return;
+                    }
+                }
+                // The settings panel intercepts every key while open (including plain letters,
+                // which pick rows and start captures).
+                if let Some(st) = self.state.as_mut() {
+                    if st.settings.is_some() {
+                        st.settings_key(&event, self.mods);
                         return;
                     }
                 }
@@ -1719,25 +1789,13 @@ impl State {
             Action::ScrollPageDown => self.scroll_page(-1),
             Action::Paste => self.paste_clipboard(),
             Action::OpenSettings => {
-                // First open writes a fully-populated, self-documenting gmux.json; thereafter we
-                // open whatever's there. Then hand it to the OS's default editor for .json.
-                let path = config_path();
-                if !path.exists() {
-                    if let Some(dir) = path.parent() {
-                        let _ = std::fs::create_dir_all(dir);
-                    }
-                    if let Err(e) = std::fs::write(&path, default_template()) {
-                        eprintln!("gmux: could not write config template {}: {e}", path.display());
-                    }
-                }
-                // `cmd /c start "" <path>` launches the file's associated editor and returns at once.
-                // The empty "" is start's window-title arg (else it would swallow the path as title).
-                if let Err(e) = std::process::Command::new("cmd")
-                    .args(["/c", "start", "", &path.to_string_lossy()])
-                    .spawn()
-                {
-                    eprintln!("gmux: could not open settings {}: {e}", path.display());
-                }
+                // The panel covers accent, font size and every keybinding; 'e' inside it still
+                // hands the raw gmux.json to an editor for what it does not cover.
+                self.search = None;
+                self.rename = None;
+                self.palette = None;
+                self.settings = Some(SettingsState { tab: 0, sel: 0, capturing: false });
+                self.window.request_redraw();
             }
             Action::Search => self.enter_search(),
         }
@@ -2392,6 +2450,205 @@ impl State {
             _ => {}
         }
         self.window.request_redraw();
+    }
+
+    /// The settings panel's rows for the open tab: `(label, value)`.
+    ///
+    /// Theme values come from the config file rather than the live renderer, because the file is
+    /// what the panel edits — showing the resolved colour would make "default" and an explicit hex
+    /// look identical.
+    fn settings_rows(&self, tab: usize) -> Vec<(String, String)> {
+        let cfg = Config::load();
+        if tab == 0 {
+            let accent = cfg
+                .theme
+                .as_ref()
+                .and_then(|t| t.accent.clone())
+                .unwrap_or_else(|| "default".to_string());
+            vec![
+                ("accent".to_string(), accent),
+                ("font size".to_string(), format!("{:.0} px", self.font_px)),
+                (
+                    "follow mouse focus".to_string(),
+                    if self.focus_follows_mouse { "on" } else { "off" }.to_string(),
+                ),
+            ]
+        } else {
+            // Every bindable action with its CURRENT chord (config override, else the default).
+            let overrides = cfg.keys.unwrap_or_default();
+            crate::config::default_bindings()
+                .iter()
+                .map(|(name, chord, _)| {
+                    let cur = overrides.get(*name).cloned().unwrap_or_else(|| chord.to_string());
+                    (name.to_string(), cur)
+                })
+                .collect()
+        }
+    }
+
+    /// A key press while the settings panel is open. Arrows move, Tab switches section, Enter acts
+    /// on the row (cycling a theme value, or starting a chord capture), Escape backs out.
+    fn settings_key(&mut self, event: &KeyEvent, mods: ModifiersState) {
+        let Some(st) = self.settings.as_ref() else { return };
+        // Capturing: the very next chord becomes the binding. Escape aborts; a bare modifier is
+        // the prefix of the chord being pressed, not the chord itself.
+        if st.capturing {
+            if matches!(&event.logical_key, Key::Named(NamedKey::Escape)) {
+                if let Some(st) = self.settings.as_mut() {
+                    st.capturing = false;
+                }
+                self.window.request_redraw();
+                return;
+            }
+            if matches!(
+                &event.logical_key,
+                Key::Named(NamedKey::Control | NamedKey::Shift | NamedKey::Alt | NamedKey::Super)
+            ) {
+                return;
+            }
+            let (tab, sel) = (st.tab, st.sel);
+            if let Some(chord) = chord_string(mods, &event.logical_key) {
+                let rows = self.settings_rows(tab);
+                if let Some((action, _)) = rows.get(sel) {
+                    let action = action.clone();
+                    self.write_config(|cfg| {
+                        let keys = cfg
+                            .as_object_mut()
+                            .unwrap()
+                            .entry("keys")
+                            .or_insert_with(|| serde_json::json!({}));
+                        if let Some(map) = keys.as_object_mut() {
+                            map.insert(action, serde_json::Value::String(chord));
+                        }
+                    });
+                }
+            }
+            if let Some(st) = self.settings.as_mut() {
+                st.capturing = false;
+            }
+            self.window.request_redraw();
+            return;
+        }
+
+        let tab = st.tab;
+        let rows = self.settings_rows(tab).len().max(1);
+        let Some(st) = self.settings.as_mut() else { return };
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.settings = None,
+            Key::Named(NamedKey::ArrowDown) => st.sel = (st.sel + 1) % rows,
+            Key::Named(NamedKey::ArrowUp) => st.sel = st.sel.checked_sub(1).unwrap_or(rows - 1),
+            Key::Named(NamedKey::Tab) | Key::Named(NamedKey::ArrowRight) | Key::Named(NamedKey::ArrowLeft) => {
+                st.tab = 1 - st.tab;
+                st.sel = 0;
+            }
+            Key::Named(NamedKey::Enter) => {
+                let sel = st.sel;
+                if tab == 1 {
+                    st.capturing = true;
+                } else {
+                    self.apply_theme_row(sel);
+                }
+            }
+            // 'e' hands the raw file to the OS editor — the panel covers the common cases, not
+            // colour schemes or per-pane settings.
+            Key::Character(c) if c.as_str() == "e" => self.open_config_file(),
+            _ => {}
+        }
+        self.window.request_redraw();
+    }
+
+    /// Enter on a theme row: cycle the accent, step the font size, or flip the boolean.
+    fn apply_theme_row(&mut self, sel: usize) {
+        match sel {
+            0 => {
+                let cur = Config::load().theme.and_then(|t| t.accent);
+                let idx = cur
+                    .as_deref()
+                    .and_then(|c| ACCENT_CYCLE.iter().position(|p| p.eq_ignore_ascii_case(c)))
+                    .unwrap_or(0);
+                let next = ACCENT_CYCLE[(idx + 1) % ACCENT_CYCLE.len()];
+                self.write_config(|cfg| {
+                    let theme = cfg
+                        .as_object_mut()
+                        .unwrap()
+                        .entry("theme")
+                        .or_insert_with(|| serde_json::json!({}));
+                    if let Some(map) = theme.as_object_mut() {
+                        // "default" means "no accent key at all", so the built-in wins.
+                        if next == "default" {
+                            map.remove("accent");
+                        } else {
+                            map.insert("accent".into(), serde_json::Value::String(next.into()));
+                        }
+                    }
+                });
+            }
+            1 => {
+                // Wrap at the clamp so one key can walk the whole range.
+                let next = if self.font_px >= 28.0 { 10.0 } else { self.font_px + 2.0 };
+                self.write_config(|cfg| {
+                    cfg.as_object_mut()
+                        .unwrap()
+                        .insert("font_px".into(), serde_json::json!(next));
+                });
+                self.config_font_px = next;
+                self.apply_font_px(next);
+            }
+            2 => {
+                let next = !self.focus_follows_mouse;
+                self.write_config(|cfg| {
+                    cfg.as_object_mut()
+                        .unwrap()
+                        .insert("focus_follows_mouse".into(), serde_json::json!(next));
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Read `gmux.json`, apply `edit`, write it back. Everything the panel doesn't touch is
+    /// preserved (it edits the parsed JSON, not a template), and the config's own mtime watcher
+    /// picks the change up and re-applies it live.
+    fn write_config(&mut self, edit: impl FnOnce(&mut serde_json::Value)) {
+        let path = config_path();
+        let mut cfg: serde_json::Value = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str(t.strip_prefix('\u{feff}').unwrap_or(&t)).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        if !cfg.is_object() {
+            cfg = serde_json::json!({});
+        }
+        edit(&mut cfg);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match serde_json::to_string_pretty(&cfg) {
+            Ok(text) => {
+                if let Err(e) = std::fs::write(&path, text) {
+                    eprintln!("gmux: could not write settings: {e}");
+                }
+            }
+            Err(e) => eprintln!("gmux: could not serialize settings: {e}"),
+        }
+    }
+
+    /// Hand `gmux.json` to the OS's editor (the panel's 'e' key, and the old Ctrl+, behaviour).
+    fn open_config_file(&mut self) {
+        let path = config_path();
+        if !path.exists() {
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if let Err(e) = std::fs::write(&path, default_template()) {
+                eprintln!("gmux: could not write config template {}: {e}", path.display());
+            }
+        }
+        if let Err(e) = std::process::Command::new("cmd")
+            .args(["/c", "start", "", &path.to_string_lossy()])
+            .spawn()
+        {
+            eprintln!("gmux: could not open settings {}: {e}", path.display());
+        }
     }
 
     /// A key press while the sidebar filter is open. Escape closes it (restoring the full list),
@@ -3855,6 +4112,27 @@ impl State {
                 items: visible,
             }
         });
+        // Settings overlay: rows for the open tab, windowed around the selection like the palette
+        // (the keys tab lists every action, which is taller than any window).
+        let settings_view = self.settings.as_ref().map(|s| {
+            let all = self.settings_rows(s.tab);
+            let sel = s.sel.min(all.len().saturating_sub(1));
+            let start = sel.saturating_sub(11);
+            let rows: Vec<(String, String)> = all.into_iter().skip(start).take(12).collect();
+            SettingsView {
+                tabs: vec!["theme".into(), "keys".into()],
+                tab: s.tab,
+                rows,
+                selected: sel - start,
+                footer: if s.capturing {
+                    "press the new chord  ·  esc cancels".into()
+                } else if s.tab == 1 {
+                    "enter rebinds  ·  tab switches  ·  e opens gmux.json  ·  esc closes".into()
+                } else {
+                    "enter changes  ·  tab switches  ·  e opens gmux.json  ·  esc closes".into()
+                },
+            }
+        });
         self.renderer.render_frame(
             &view,
             &items,
@@ -3869,6 +4147,7 @@ impl State {
             search_bar.as_ref(),
             self.preedit.as_deref(),
             palette_view.as_ref(),
+            settings_view.as_ref(),
         );
         // Present explicitly: dropping a SurfaceTexture does NOT present it — unpresented frames
         // exhaust the swapchain and every later acquire times out (window stays white/stale).
@@ -4358,6 +4637,43 @@ mod tests {
                 SidebarItem::Row(r) => r.name.clone(),
             })
             .collect()
+    }
+
+    #[test]
+    fn captured_chords_round_trip_through_the_config_parser() {
+        use winit::keyboard::{Key, NamedKey};
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        assert_eq!(
+            chord_string(ctrl_shift, &Key::Character("D".into())).as_deref(),
+            Some("ctrl+shift+d"),
+            "captured chords are lowercased, like the config writes them"
+        );
+        assert_eq!(
+            chord_string(ModifiersState::ALT, &Key::Named(NamedKey::ArrowLeft)).as_deref(),
+            Some("alt+left")
+        );
+        // A bare key is refused: binding it would swallow that key before the pane ever saw it.
+        assert_eq!(chord_string(ModifiersState::empty(), &Key::Character("q".into())), None);
+        // Keys the config parser has no token for are refused rather than written unparseably.
+        assert_eq!(chord_string(ctrl_shift, &Key::Named(NamedKey::F7)), None);
+
+        // The real contract: anything captured must parse back to the same binding.
+        for (mods, key) in [
+            (ctrl_shift, Key::Character("k".into())),
+            (ModifiersState::ALT | ModifiersState::SHIFT, Key::Named(NamedKey::ArrowUp)),
+            (ModifiersState::CONTROL, Key::Named(NamedKey::PageDown)),
+        ] {
+            let chord = chord_string(mods, &key).expect("captured");
+            let km = crate::config::Keymap::build(&crate::config::Config {
+                keys: Some([("split_h".to_string(), chord.clone())].into_iter().collect()),
+                ..Default::default()
+            });
+            assert_eq!(
+                km.action(mods, &key),
+                Some(crate::config::Action::SplitH),
+                "{chord} must bind the action it was captured for"
+            );
+        }
     }
 
     #[test]

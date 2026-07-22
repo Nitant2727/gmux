@@ -203,7 +203,7 @@ mod tests {
             progress: None,
             progress_error: false,
         }];
-        r.render_frame(&view, &items(rows), sw, &[], w, h, "", false, None, None, None, None, None);
+        r.render_frame(&view, &items(rows), sw, &[], w, h, "", false, None, None, None, None, None, None);
         let px = read_rgba(&r, &tex, w, h).expect("readback");
         // The active row is a solid accent pill (cmux blue #0091ff) inset ROW_OUTER_PAD from the
         // panel edge. x=1 is outside the pill entirely (neutral panel gray); the centre is accent.
@@ -348,7 +348,7 @@ mod tests {
             progress: None,
             progress_error: false,
         }];
-        r.render_frame(&view, &items(rows), sw, &[], w, h, "", false, None, None, None, None, None);
+        r.render_frame(&view, &items(rows), sw, &[], w, h, "", false, None, None, None, None, None, None);
         let px = read_rgba(&r, &tex, w, h).expect("readback");
         let top = pixel(&px, w, 2, 2);
         let bottom = pixel(&px, w, 2, h - 3);
@@ -475,9 +475,9 @@ mod tests {
             n
         };
         let sb = SearchBar { label: "find:".into(), query: "foo".into(), current: 1, total: 5, overlay_only: false };
-        r.render_frame(&view, &[], 0, &[pv()], w, h, "", false, None, None, Some(&sb), None, None);
+        r.render_frame(&view, &[], 0, &[pv()], w, h, "", false, None, None, Some(&sb), None, None, None);
         let with = white_in_band(&read_rgba(&r, &tex, w, h).expect("readback"));
-        r.render_frame(&view, &[], 0, &[pv()], w, h, "", false, None, None, None, None, None);
+        r.render_frame(&view, &[], 0, &[pv()], w, h, "", false, None, None, None, None, None, None);
         let without = white_in_band(&read_rgba(&r, &tex, w, h).expect("readback"));
         assert!(with > 3, "search band should draw the query text ({with} white px)");
         assert_eq!(without, 0, "no search bar → no band text ({without} white px)");
@@ -666,7 +666,22 @@ mod tests {
         r.advance_spinner(); // step off frame 0 so a lit spoke shows in the busy row
         // Drop indicator above the last item, as a reorder drag would show it.
         let drop_at = Some(rows.len().saturating_sub(1));
-        r.render_frame(&view, &rows, sw, &[pane], w, h, "", false, drop_at, Some("ag"), Some(&sb), None, None);
+        // Settings panel over the frame, as Ctrl+, shows it.
+        let sv = crate::renderer::SettingsView {
+            tabs: vec!["theme".into(), "keys".into()],
+            tab: 1,
+            rows: vec![
+                ("split_h".into(), "ctrl+shift+d".into()),
+                ("split_v".into(), "ctrl+shift+e".into()),
+                ("close_pane".into(), "ctrl+shift+w".into()),
+                ("toggle_zoom".into(), "ctrl+shift+z".into()),
+                ("new_window".into(), "ctrl+shift+t".into()),
+                ("command_palette".into(), "ctrl+shift+p".into()),
+            ],
+            selected: 2,
+            footer: "enter rebinds  ·  tab switches  ·  e opens gmux.json  ·  esc closes".into(),
+        };
+        r.render_frame(&view, &rows, sw, &[pane], w, h, "", false, drop_at, Some("ag"), Some(&sb), None, None, Some(&sv));
         let px = read_rgba(&r, &tex, w, h).expect("readback");
         let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
         for p in px.chunks(4) {
