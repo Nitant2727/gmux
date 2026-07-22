@@ -23,6 +23,9 @@
 //! call would require a daemon↔GUI RPC bridge, which is out of scope. `eval_js` stays a crate API
 //! with real plumbing plus an `#[ignore]`d manual test; pipe-exposed eval waits for that bridge.
 
+pub mod embedded;
+pub use embedded::EmbeddedBrowser;
+
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
