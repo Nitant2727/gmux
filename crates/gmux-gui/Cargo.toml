@@ -28,6 +28,8 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell_Common",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 # M12: only pulled in with `--features browser`; keeps WebView2/COM out of the default graph.
 gmux-browser = { path = "../gmux-browser", optional = true }

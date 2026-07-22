@@ -1,8 +1,9 @@
 //! Blocking client to the gmux daemon over the named pipe. The thin-client GUI uses this to fetch
 //! layout/grids for rendering and to send input/control. If no daemon is answering, it spawns one
-//! (`gmux --daemon`) as a `DETACHED_PROCESS` with null stdio, so `ensure_console` allocates it a
-//! hidden console — required for its ConPTY panes to bind their stdio (the M0 console-binding
-//! finding; see `spawn_daemon` for why other spawn modes are fatal).
+//! (`gmux --daemon`) as a `DETACHED_PROCESS` that inherits no handles and starts with `SW_HIDE`, so
+//! `ensure_console` allocates it a console whose host window never appears — the console itself is
+//! required for its ConPTY panes to bind their stdio (the M0 console-binding finding; see
+//! `spawn_daemon` for why the obvious alternatives are fatal).
 //!
 //! If the daemon dies mid-session (crash, upgrade, killed), [`DaemonClient::call`] reconnects
 //! transparently — plain reconnect first (the daemon may have restarted on its own), respawn if
@@ -10,7 +11,6 @@
 
 use std::collections::HashSet;
 use std::io::{self, BufReader};
-use std::os::windows::process::CommandExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -19,12 +19,6 @@ use std::time::Duration;
 use gmux_pipe::PipeStream;
 use gmux_proto::{read_msg, write_msg, Call, NotifyWire, Request, Response, ResultBody};
 use winit::event_loop::EventLoopProxy;
-
-/// `DETACHED_PROCESS`: the daemon starts with NO console, so `gmux_pty::ensure_console` takes
-/// its AllocConsole path (hidden console + std handles repointed) — the configuration ConPTY
-/// binding was designed around. `CREATE_NO_WINDOW` combined with null/redirected stdio was
-/// empirically fatal: the daemon's ConPTY children died instantly (spawn-mode matrix, round 4).
-const DETACHED_PROCESS: u32 = 0x0000_0008;
 
 pub struct DaemonClient {
     reader: BufReader<PipeStream>,
@@ -189,18 +183,69 @@ fn connect_or_spawn_stream(name: &str) -> io::Result<PipeStream> {
     Err(io::Error::new(io::ErrorKind::TimedOut, "could not reach or start the gmux daemon"))
 }
 
+/// `SW_HIDE` in the daemon's `STARTUPINFO`. Windows passes the creating process's show-window
+/// setting on to the console host it launches for that process — so the console `ensure_console`
+/// allocates comes up hidden instead of as a second visible terminal.
+///
+/// This is the part that actually fixes it. `ShowWindow(GetConsoleWindow(), SW_HIDE)` inside the
+/// daemon does not: on Windows 11, where Windows Terminal is the default console host, the console
+/// window belongs to *Terminal*, and `GetConsoleWindow` hands back this process's legacy
+/// pseudo-window — hiding which is invisible to the user, so every launch popped a terminal
+/// titled `gmux.exe` alongside the app.
+/// Start `gmux --daemon` detached, with a hidden console.
+///
+/// Uses `CreateProcessW` rather than `std::process::Command` for one reason: `STARTUPINFOW` is the
+/// only way to set the show-window flag, and `Command::show_window` is still unstable. Handles are
+/// deliberately NOT inherited — a GUI launched with redirected or broken stdio would otherwise pass
+/// those handles to the daemon, whose ConPTY panes then die instantly (daemon exits "all panes
+/// exited" -> GUI reconnect churn -> fatal exit).
+///
+/// `DETACHED_PROCESS` stays: the daemon starts console-less so `gmux_pty::ensure_console` takes its
+/// `AllocConsole` path, which is the configuration the ConPTY binding was designed around.
+/// `CREATE_NO_WINDOW` looks like the obvious way to suppress the window and is **fatal** — retried
+/// in round 67 on the theory that `ensure_console`'s later handle-repair had made it safe, and the
+/// daemon still died as its first pane spawned, respawning in a ~2s loop. What was missing was not
+/// a different creation flag but the show-window field below.
 fn spawn_daemon() {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe)
-            .arg("--daemon")
-            .creation_flags(DETACHED_PROCESS)
-            // Null stdio, never inherit: a GUI launched with redirected/broken handles would
-            // pass them to the daemon, whose ConPTY panes then die instantly (daemon exits
-            // "all panes exited" -> GUI reconnect churn -> fatal exit).
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        CreateProcessW, DETACHED_PROCESS, PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+    let Ok(exe) = std::env::current_exe() else { return };
+    // CreateProcessW may write into the command line buffer, so it must be owned and mutable.
+    let mut cmdline: Vec<u16> =
+        format!("\"{}\" --daemon", exe.display()).encode_utf16().chain(std::iter::once(0)).collect();
+
+    let mut si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..Default::default() };
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE.0 as u16;
+    let mut pi = PROCESS_INFORMATION::default();
+
+    let ok = unsafe {
+        CreateProcessW(
+            None,
+            Some(PWSTR(cmdline.as_mut_ptr())),
+            None,
+            None,
+            false, // no handle inheritance
+            DETACHED_PROCESS,
+            None,
+            None,
+            &si,
+            &mut pi,
+        )
+    };
+    if ok.is_ok() {
+        // We never wait on the daemon; drop our references so it isn't held open by this process.
+        unsafe {
+            let _ = CloseHandle(pi.hThread);
+            let _ = CloseHandle(pi.hProcess);
+        }
+    } else {
+        eprintln!("gmux: could not start the daemon: {:?}", ok);
     }
 }
 
