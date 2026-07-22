@@ -308,6 +308,8 @@ const SET_PAD: f32 = 14.0;
 const SET_TAB_GAP: f32 = 22.0;
 /// Side of one colour chip in a scheme ribbon.
 const SET_CHIP: f32 = 11.0;
+/// Width of the settings card's scrollbar, and the gutter the rows give up for it.
+const SET_BAR: f32 = 4.0;
 
 /// The settings card's laid-out rect plus its row metrics.
 struct Card {
@@ -376,6 +378,19 @@ fn settings_tab_index(x: f32, y: f32, tabs: &[String], rows: usize, cw_cell: f32
     None
 }
 
+/// A scrollbar thumb as `(offset from the track's top, height)`: the window's share of the list,
+/// placed at the window's share of the way through it. The height is floored so the thumb stays
+/// grabbable-looking on a long list, and the floor is taken out of the travel rather than allowed
+/// to push the thumb past the track's end. Pure/tested.
+fn scroll_thumb(total: usize, visible: usize, offset: usize, track: f32) -> (f32, f32) {
+    if total <= visible || visible == 0 {
+        return (0.0, track); // nothing hidden: a full-length thumb, no travel
+    }
+    let th = (track * visible as f32 / total as f32).max(SET_BAR * 3.0).min(track);
+    let at = (offset as f32 / (total - visible) as f32).clamp(0.0, 1.0);
+    ((track - th) * at, th)
+}
+
 /// One settings row: a label on the left, a value on the right, and an optional colour ribbon
 /// previewing what the value means (a terminal scheme's background, six ANSI colours, foreground).
 #[derive(Default)]
@@ -402,6 +417,11 @@ pub struct SettingsView {
     pub footer: String,
     /// The row filter, when open. Drawn at the tab strip's right end with a caret.
     pub query: Option<String>,
+    /// How many rows the open tab has in total, and which one `rows[0]` is — the app windows the
+    /// list, so the card alone can't tell how much of it is off-screen. `total > rows.len()` is
+    /// what puts a scrollbar on the card.
+    pub total: usize,
+    pub offset: usize,
 }
 
 /// The active pane's search overlay: a band drawn at the pane bottom. `current`/`total` are shown
@@ -1293,12 +1313,13 @@ impl Renderer {
 
     /// Whether `(x, y)` lands on the given settings row (as returned by [`Self::settings_row_at`])
     /// *inside its colour ribbon*, rather than on its label or value.
-    pub fn settings_swatch_hit(&self, x: f32, chips: usize, rows: usize, surf_w: u32, surf_h: u32) -> bool {
+    pub fn settings_swatch_hit(&self, x: f32, chips: usize, rows: usize, scrollable: bool, surf_w: u32, surf_h: u32) -> bool {
         if chips == 0 {
             return false;
         }
         let c = settings_card(rows, self.cell_h() as f32, surf_w as f32, surf_h as f32);
-        let right = c.px + c.pw - SET_PAD;
+        // Mirrors the row's own right edge, which gives up a gutter when the bar is drawn.
+        let right = c.px + c.pw - SET_PAD - if scrollable { SET_BAR + 6.0 } else { 0.0 };
         x >= right - SET_CHIP * chips as f32 && x < right
     }
 
@@ -1961,6 +1982,17 @@ impl Renderer {
             }
 
             let rows_y = py + SET_PAD + head;
+            // A scrollbar down the card's right edge whenever the list is taller than the card:
+            // without it, a windowed list looks like the whole list, and "my binding isn't here"
+            // is indistinguishable from "scroll down".
+            let scrollable = sv.total > sv.rows.len() && !sv.rows.is_empty();
+            if scrollable {
+                let (x0, x1) = (px + pw - SET_PAD - SET_BAR, px + pw - SET_PAD);
+                let (y0, y1) = (rows_y, rows_y + row_h * sv.rows.len() as f32);
+                push_rounded(&mut obg, x0, y0, x1, y1, SET_BAR / 2.0, rgba_a(TEXT, 0.06), fw, fh);
+                let (dy, th) = scroll_thumb(sv.total, sv.rows.len(), sv.offset, y1 - y0);
+                push_rounded(&mut obg, x0, y0 + dy, x1, y0 + dy + th, SET_BAR / 2.0, rgba_a(TEXT, 0.24), fw, fh);
+            }
             for (i, row) in sv.rows.iter().enumerate() {
                 let ry = rows_y + row_h * i as f32;
                 if ry + row_h > py + ph - row_h {
@@ -1972,7 +2004,7 @@ impl Renderer {
                 self.text_run(&row.label, px + SET_PAD, ry + 4.0, rgba(TEXT), fw, fh, &mut ogl);
                 // The ribbon sits at the card's right edge and the value text to its left, so the
                 // swatch holds one x while cycling — it's the thing you watch, not the name.
-                let mut right = px + pw - SET_PAD;
+                let mut right = px + pw - SET_PAD - if scrollable { SET_BAR + 6.0 } else { 0.0 };
                 if !row.swatch.is_empty() {
                     const CHIP: f32 = SET_CHIP;
                     let sw = CHIP * row.swatch.len() as f32;
@@ -2249,6 +2281,37 @@ struct GlyphOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_settings_thumb_spans_its_window_and_stays_inside_the_track() {
+        const TRACK: f32 = 240.0;
+        // Twelve of twenty-five rows visible: the thumb is that share, at the top when unscrolled
+        // and flush with the track's end at the last window — a thumb that stopped short would say
+        // "there is more below" when there isn't.
+        let (top, h) = scroll_thumb(25, 12, 0, TRACK);
+        assert_eq!(top, 0.0);
+        assert!((h - TRACK * 12.0 / 25.0).abs() < 0.01);
+        let (bottom, h2) = scroll_thumb(25, 12, 13, TRACK);
+        assert_eq!(h2, h, "the thumb doesn't resize as it travels");
+        assert!((bottom + h2 - TRACK).abs() < 0.01, "the last window ends flush");
+        // Halfway is halfway.
+        let (mid, _) = scroll_thumb(25, 12, 6, TRACK);
+        assert!(mid > 0.0 && mid < bottom);
+
+        // A very long list floors the thumb's height, and the floor comes out of the travel rather
+        // than pushing the thumb through the end of the track.
+        let (far, tiny) = scroll_thumb(4000, 12, 3988, TRACK);
+        assert!(tiny >= 12.0, "floored, not a hairline");
+        assert!((far + tiny - TRACK).abs() < 0.01, "still ends flush");
+
+        // Nothing hidden (or nothing shown) has no travel and no thumb to place.
+        assert_eq!(scroll_thumb(12, 12, 0, TRACK), (0.0, TRACK));
+        assert_eq!(scroll_thumb(3, 12, 0, TRACK), (0.0, TRACK));
+        assert_eq!(scroll_thumb(25, 0, 0, TRACK), (0.0, TRACK), "empty window, no division by zero");
+        // An offset past the end clamps instead of running off.
+        let (over, oh) = scroll_thumb(25, 12, 999, TRACK);
+        assert!((over + oh - TRACK).abs() < 0.01);
+    }
 
     #[test]
     fn settings_clicks_land_on_the_row_that_was_drawn_there() {

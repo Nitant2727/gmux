@@ -643,19 +643,6 @@ mod tests {
         list.extend(rows.map(crate::renderer::SidebarItem::Row));
         let rows = list;
         let sw = r.sidebar_width();
-        let pane = PaneView {
-            snap: &snap,
-            attention: Attention::Quiet,
-            active: true,
-            rect: Rect { x: sw, y: 0, w: w - sw, h },
-            scrolled: 0,
-            history: 120,
-            title: "powershell — build".into(),
-            selection: None,
-            show_close: true,
-            drop_target: false,
-            dragging: false,
-        };
         let sb = SearchBar {
             label: "find:".into(),
             query: "warn".into(),
@@ -666,25 +653,31 @@ mod tests {
         r.advance_spinner(); // step off frame 0 so a lit spoke shows in the busy row
         // Drop indicator above the last item, as a reorder drag would show it.
         let drop_at = Some(rows.len().saturating_sub(1));
-        // Settings panel over the frame, as Ctrl+, shows it.
-        let sv = crate::renderer::SettingsView {
-            tabs: ["theme", "keys", "schemes", "accent", "font"].iter().map(|s| s.to_string()).collect(),
-            tab: 1,
-            rows: crate::app::key_rows_for_preview()
-                .into_iter()
-                .filter(|r| crate::app::row_matches_filter(&r.label, Some(&r.value), "split"))
-                .collect(),
-            selected: 0,
-            query: Some("split".into()),
-            footer: "enter rebinds · del resets one · / filters · esc closes".into(),
-        };
-        r.render_frame(&view, &rows, sw, &[pane], w, h, "", false, drop_at, Some("ag"), Some(&sb), None, None, Some(&sv));
-        let px = read_rgba(&r, &tex, w, h).expect("readback");
-        let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
-        for p in px.chunks(4) {
-            out.extend_from_slice(&p[..3]);
+        // One frame per settings view, so a release check can look at every tab of the panel.
+        let tabs: Vec<String> =
+            ["theme", "keys", "schemes", "accent", "font"].iter().map(|s| s.to_string()).collect();
+        for (name, sv) in crate::app::settings_views_for_preview(tabs) {
+            let pane = PaneView {
+                snap: &snap,
+                attention: Attention::Quiet,
+                active: true,
+                rect: Rect { x: sw, y: 0, w: w - sw, h },
+                scrolled: 0,
+                history: 120,
+                title: "powershell — build".into(),
+                selection: None,
+                show_close: true,
+                drop_target: false,
+                dragging: false,
+            };
+            r.render_frame(&view, &rows, sw, &[pane], w, h, "", false, drop_at, Some("ag"), Some(&sb), None, None, Some(&sv));
+            let px = read_rgba(&r, &tex, w, h).expect("readback");
+            let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+            for p in px.chunks(4) {
+                out.extend_from_slice(&p[..3]);
+            }
+            std::fs::write(format!("chrome_preview_{name}.ppm"), out).expect("write");
         }
-        std::fs::write("chrome_preview.ppm", out).expect("write");
     }
 }
 
