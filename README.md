@@ -161,7 +161,9 @@ attention washes blue, and the focused pane carries an accent ring. Set `"theme"
 Terminal cell colors are separate. Seven schemes ship built in — `campbell` (the Windows Terminal
 default), `one-dark`, `gruvbox-dark`, `nord`, `catppuccin-mocha`, `tokyo-night`, `solarized-dark` —
 picked from the settings panel's **color scheme** row or by setting `"theme": { "preset":
-"nord" }`. A preset is the coarsest layer: `theme.scheme` (a Windows Terminal scheme file),
+"nord" }`. The panel draws each scheme's own colors as a ribbon beside its name — background, the
+six ANSI hues, foreground — so cycling shows you the palette instead of asking you to recognise it
+by name. A preset is the coarsest layer: `theme.scheme` (a Windows Terminal scheme file),
 `theme.ansi` (16 inline hex strings), and `theme.fg` / `theme.bg` all still override it, so you can
 take a scheme and change two colors. Changes apply to every running pane without a restart.
 

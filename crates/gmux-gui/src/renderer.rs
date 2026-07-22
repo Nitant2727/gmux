@@ -292,14 +292,23 @@ pub struct PaletteView {
     pub selected: usize,
 }
 
+/// One settings row: a label on the left, a value on the right, and an optional colour ribbon
+/// previewing what the value means (a terminal scheme's background, six ANSI colours, foreground).
+pub struct SettingsRow {
+    pub label: String,
+    pub value: String,
+    /// Colours to draw as a ribbon at the row's right edge. Empty = a plain value row.
+    pub swatch: Vec<Rgb>,
+}
+
 /// The settings overlay (Ctrl+,): a centered panel with a tab strip and a list of
-/// `(label, value)` rows. The app owns what the rows mean and what Enter does to them; the
+/// [`SettingsRow`]s. The app owns what the rows mean and what Enter does to them; the
 /// renderer only lays them out.
 pub struct SettingsView {
     pub tabs: Vec<String>,
     /// Index into `tabs` of the open section.
     pub tab: usize,
-    pub rows: Vec<(String, String)>,
+    pub rows: Vec<SettingsRow>,
     /// Index into `rows` of the highlighted row.
     pub selected: usize,
     /// Hint line along the bottom (changes while capturing a chord).
@@ -1832,7 +1841,7 @@ impl Renderer {
             }
 
             let rows_y = py + PAD + head;
-            for (i, (label, value)) in sv.rows.iter().enumerate() {
+            for (i, row) in sv.rows.iter().enumerate() {
                 let ry = rows_y + row_h * i as f32;
                 if ry + row_h > py + ph - row_h {
                     break; // clipped by the card; the app windows the rows
@@ -1840,10 +1849,26 @@ impl Renderer {
                 if i == sv.selected {
                     push_rounded(&mut obg, px + 4.0, ry, px + pw - 4.0, ry + row_h, RADIUS - 2.0, rgba(SIDEBAR_ROW_ACTIVE), fw, fh);
                 }
-                self.text_run(label, px + PAD, ry + 4.0, rgba(TEXT), fw, fh, &mut ogl);
-                let vw = value.chars().count() as f32 * cw_cell;
+                self.text_run(&row.label, px + PAD, ry + 4.0, rgba(TEXT), fw, fh, &mut ogl);
+                // The ribbon sits at the card's right edge and the value text to its left, so the
+                // swatch holds one x while cycling — it's the thing you watch, not the name.
+                let mut right = px + pw - PAD;
+                if !row.swatch.is_empty() {
+                    const CHIP: f32 = 11.0;
+                    let sw = CHIP * row.swatch.len() as f32;
+                    let (x0, y0) = (right - sw, ry + (row_h - CHIP) / 2.0);
+                    for (n, c) in row.swatch.iter().enumerate() {
+                        let cx = x0 + CHIP * n as f32;
+                        push_rounded(&mut obg, cx, y0, cx + CHIP, y0 + CHIP, 1.0, rgba(*c), fw, fh);
+                    }
+                    // One ring around the whole ribbon: a scheme's background chip is near-black
+                    // on a near-black card, and unringed it reads as a gap rather than a colour.
+                    stroke_rounded(&mut obg, x0, y0, right, y0 + CHIP, 2.0, 1.0, rgba_a(TEXT, 0.18), fw, fh);
+                    right = x0 - 10.0;
+                }
+                let vw = row.value.chars().count() as f32 * cw_cell;
                 let ink = if i == sv.selected { accent() } else { TEXT_DIM };
-                self.text_run(value, (px + pw - PAD - vw).max(px + PAD), ry + 4.0, rgba(ink), fw, fh, &mut ogl);
+                self.text_run(&row.value, (right - vw).max(px + PAD), ry + 4.0, rgba(ink), fw, fh, &mut ogl);
             }
             // Footer hints, pinned to the card's bottom edge.
             self.text_run(&sv.footer, px + PAD, py + ph - PAD - ch_cell, rgba(TEXT_DIM), fw, fh, &mut ogl);

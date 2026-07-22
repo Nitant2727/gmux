@@ -21,7 +21,7 @@ use winit::window::{Window, WindowId};
 use crate::config::{config_path, default_template, Action, Config, Keymap};
 use crate::daemon_client::{spawn_output_subscriber, DaemonClient};
 use crate::renderer::{
-    GroupHeader, PaletteView, PaneView, SearchBar, SettingsView, SidebarItem, SidebarRow,
+    GroupHeader, PaletteView, PaneView, SearchBar, SettingsRow, SettingsView, SidebarItem, SidebarRow,
     SPINNER_STEP_MS,
 };
 use crate::Renderer;
@@ -2457,7 +2457,12 @@ impl State {
     /// Theme values come from the config file rather than the live renderer, because the file is
     /// what the panel edits — showing the resolved colour would make "default" and an explicit hex
     /// look identical.
-    fn settings_rows(&self, tab: usize) -> Vec<(String, String)> {
+    fn settings_rows(&self, tab: usize) -> Vec<SettingsRow> {
+        let plain = |label: &str, value: String| SettingsRow {
+            label: label.to_string(),
+            value,
+            swatch: Vec::new(),
+        };
         let cfg = Config::load();
         if tab == 0 {
             let accent = cfg
@@ -2471,11 +2476,18 @@ impl State {
                 .and_then(|t| t.preset.clone())
                 .unwrap_or_else(|| "default".to_string());
             vec![
-                ("color scheme".to_string(), preset),
-                ("accent".to_string(), accent),
-                ("font size".to_string(), format!("{:.0} px", self.font_px)),
-                (
-                    "follow mouse focus".to_string(),
+                SettingsRow {
+                    swatch: crate::config::preset_swatch(&preset)
+                        .into_iter()
+                        .map(|[r, g, b]| Rgb { r, g, b })
+                        .collect(),
+                    label: "color scheme".to_string(),
+                    value: preset,
+                },
+                plain("accent", accent),
+                plain("font size", format!("{:.0} px", self.font_px)),
+                plain(
+                    "follow mouse focus",
                     if self.focus_follows_mouse { "on" } else { "off" }.to_string(),
                 ),
             ]
@@ -2486,7 +2498,7 @@ impl State {
                 .iter()
                 .map(|(name, chord, _)| {
                     let cur = overrides.get(*name).cloned().unwrap_or_else(|| chord.to_string());
-                    (name.to_string(), cur)
+                    plain(name, cur)
                 })
                 .collect()
         }
@@ -2515,8 +2527,8 @@ impl State {
             let (tab, sel) = (st.tab, st.sel);
             if let Some(chord) = chord_string(mods, &event.logical_key) {
                 let rows = self.settings_rows(tab);
-                if let Some((action, _)) = rows.get(sel) {
-                    let action = action.clone();
+                if let Some(row) = rows.get(sel) {
+                    let action = row.label.clone();
                     self.write_config(|cfg| {
                         let keys = cfg
                             .as_object_mut()
@@ -4152,7 +4164,7 @@ impl State {
             let all = self.settings_rows(s.tab);
             let sel = s.sel.min(all.len().saturating_sub(1));
             let start = sel.saturating_sub(11);
-            let rows: Vec<(String, String)> = all.into_iter().skip(start).take(12).collect();
+            let rows: Vec<SettingsRow> = all.into_iter().skip(start).take(12).collect();
             SettingsView {
                 tabs: vec!["theme".into(), "keys".into()],
                 tab: s.tab,

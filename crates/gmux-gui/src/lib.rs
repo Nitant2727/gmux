@@ -667,14 +667,26 @@ mod tests {
         // Drop indicator above the last item, as a reorder drag would show it.
         let drop_at = Some(rows.len().saturating_sub(1));
         // Settings panel over the frame, as Ctrl+, shows it.
+        let row = |label: &str, value: &str| crate::renderer::SettingsRow {
+            label: label.into(),
+            value: value.into(),
+            swatch: Vec::new(),
+        };
         let sv = crate::renderer::SettingsView {
             tabs: vec!["theme".into(), "keys".into()],
             tab: 0,
             rows: vec![
-                ("color scheme".into(), "tokyo-night".into()),
-                ("accent".into(), "#3b8ae6".into()),
-                ("font size".into(), "18 px".into()),
-                ("follow mouse focus".into(), "off".into()),
+                crate::renderer::SettingsRow {
+                    label: "color scheme".into(),
+                    value: "tokyo-night".into(),
+                    swatch: crate::config::preset_swatch("tokyo-night")
+                        .into_iter()
+                        .map(|[r, g, b]| gmux_mux::Rgb { r, g, b })
+                        .collect(),
+                },
+                row("accent", "#3b8ae6"),
+                row("font size", "18 px"),
+                row("follow mouse focus", "off"),
             ],
             selected: 0,
             footer: "enter changes  ·  tab switches  ·  e opens gmux.json  ·  esc closes".into(),
