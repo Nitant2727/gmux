@@ -278,6 +278,15 @@ const SETTINGS_TABS: [&str; 5] = ["theme", "keys", "schemes", "accent", "font"];
 const FONT_SIZES: [f32; 12] =
     [10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 20.0, 22.0, 24.0];
 
+/// Which row of `names` holds `current`, or `fallback` when it holds none of them. Case-insensitive
+/// like the config's own lookups. `fallback` is what makes a hand-pinned value visible: an accent
+/// the list doesn't offer belongs on the custom row, not on row 0 pretending to be the default.
+/// Pure/tested.
+fn row_for_value(names: &[&str], current: Option<&str>, fallback: usize) -> usize {
+    let Some(cur) = current else { return 0 };
+    names.iter().position(|n| n.eq_ignore_ascii_case(cur)).unwrap_or(fallback)
+}
+
 /// The size a font row stands for, read back from its own label (`"18 px"`). The label is what
 /// survives filtering, so it — not a position in the ladder — is what the picker acts on.
 fn font_px_from_label(label: &str) -> Option<f32> {
@@ -3023,7 +3032,7 @@ impl State {
                 let back = matches!(&event.logical_key, Key::Named(NamedKey::ArrowLeft));
                 let n = SETTINGS_TABS.len();
                 let next = if back { (tab + n - 1) % n } else { (tab + 1) % n };
-                self.enter_tab(next, 0); // leaving a picker abandons the try-on
+                self.enter_tab(next); // leaving a picker abandons the try-on
             }
             Key::Named(NamedKey::Enter) => {
                 match (tab, label.as_str()) {
@@ -3161,7 +3170,7 @@ impl State {
         let tabs: Vec<String> = SETTINGS_TABS.iter().map(|s| (*s).to_string()).collect();
         if let Some(i) = self.renderer.settings_tab_at(x, y, &tabs, rows.len(), sw, sh) {
             if i != tab {
-                self.enter_tab(i, 0);
+                self.enter_tab(i);
             }
             return true;
         }
@@ -3316,8 +3325,13 @@ impl State {
     /// Open a settings tab: abandons whatever was being tried on, and on the font tab remembers the
     /// size in force, which both anchors the list (see [`Self::font_rows`]) and is what Escape puts
     /// back. Every path that changes tabs goes through here.
-    fn enter_tab(&mut self, tab: usize, sel: usize) {
+    fn enter_tab(&mut self, tab: usize) {
         self.cancel_preview();
+        // Every picker opens on the value it is currently using. Computed AFTER cancel_preview, so
+        // the font tab anchors to the size actually in force rather than one left over from a
+        // preview. Landing on row 0 instead meant the first Down press previewed the 10px font and
+        // shrank the whole window — the pickers are live, so the opening row has to be the safe one.
+        let sel = self.row_in_use(tab);
         let px = self.font_px;
         if let Some(st) = self.settings.as_mut() {
             st.tab = tab;
@@ -3328,6 +3342,30 @@ impl State {
             }
         }
         self.window.request_redraw();
+    }
+
+    /// The row a tab should open on: the one holding the value in use. Lists that aren't pickers
+    /// open at the top.
+    fn row_in_use(&self, tab: usize) -> usize {
+        let cfg = Config::load();
+        match tab {
+            2 => row_for_value(
+                &crate::config::preset_names(),
+                cfg.theme.as_ref().and_then(|t| t.preset.as_deref()),
+                0, // no preset = "default", which is the first row anyway
+            ),
+            3 => row_for_value(
+                ACCENT_CYCLE,
+                cfg.theme.as_ref().and_then(|t| t.accent.as_deref()),
+                ACCENT_CYCLE.len(), // a pinned hex the list doesn't offer lives on the custom row
+            ),
+            4 => self
+                .font_rows()
+                .iter()
+                .position(|px| (px - self.font_px).abs() < 0.01)
+                .unwrap_or(0),
+            _ => 0,
+        }
     }
 
     /// The font picker's sizes. Anchored to the size that was in force when the tab was opened, NOT
@@ -3431,30 +3469,11 @@ impl State {
     /// one. Only the boolean is flipped in place.
     fn apply_theme_row(&mut self, label: &str) {
         match label {
-            "color scheme" => {
-                let cur = Config::load().theme.and_then(|t| t.preset);
-                let at = cur
-                    .as_deref()
-                    .and_then(|c| crate::config::preset_names().iter().position(|n| n.eq_ignore_ascii_case(c)))
-                    .unwrap_or(0);
-                self.enter_tab(2, at);
-            }
-            "accent" => {
-                let cur = Config::load().theme.and_then(|t| t.accent);
-                let at = cur
-                    .as_deref()
-                    .and_then(|c| ACCENT_CYCLE.iter().position(|p| p.eq_ignore_ascii_case(c)))
-                    .unwrap_or(if cur.is_some() { ACCENT_CYCLE.len() } else { 0 }); // a pinned hex = the custom row
-                self.enter_tab(3, at);
-            }
-            "font size" => {
-                let at = self
-                    .font_rows()
-                    .iter()
-                    .position(|px| (px - self.font_px).abs() < 0.01)
-                    .unwrap_or(0);
-                self.enter_tab(4, at);
-            }
+            // Each opens on the value in use; `enter_tab` owns that rule now, so the doorway and a
+            // Tab press land on the same row instead of two paths deciding it differently.
+            "color scheme" => self.enter_tab(2),
+            "accent" => self.enter_tab(3),
+            "font size" => self.enter_tab(4),
             "follow mouse focus" => {
                 let next = !self.focus_follows_mouse;
                 self.write_config(|cfg| {
@@ -5603,6 +5622,31 @@ mod tests {
         assert_eq!(empty, serde_json::json!({}));
         let mut junk = serde_json::json!("not an object");
         strip_for_reset(&mut junk, ResetScope::All);
+    }
+
+    #[test]
+    fn a_picker_opens_on_the_value_it_is_using() {
+        // Every picker applies the row under the selection live, so opening on row 0 instead of on
+        // the value in use made the first Down press preview something the user never chose — on
+        // the font tab that was 10px, which visibly shrank the whole window.
+        let schemes = crate::config::preset_names();
+        assert_eq!(row_for_value(&schemes, Some("nord"), 0), 4);
+        assert_eq!(row_for_value(&schemes, Some("NORD"), 0), 4, "case-insensitive, like the config");
+        assert_eq!(row_for_value(&schemes, None, 0), 0, "nothing set = the 'default' row");
+
+        // An accent the list doesn't offer belongs on the custom row, not on row 0 pretending to
+        // be the default: row 0 would preview the built-in accent over the user's pinned one.
+        let custom = ACCENT_CYCLE.len();
+        assert_eq!(row_for_value(ACCENT_CYCLE, Some("#3b8ae6"), custom), 2);
+        assert_eq!(row_for_value(ACCENT_CYCLE, Some("#ff00aa"), custom), custom);
+        assert_eq!(row_for_value(ACCENT_CYCLE, Some("system"), custom), 1);
+        assert_eq!(row_for_value(ACCENT_CYCLE, None, custom), 0);
+
+        // The font tab resolves the same way, through the ladder that always carries the size in
+        // force — including one reached by Ctrl+= that isn't a listed step.
+        let ladder = font_ladder(19.0);
+        assert_eq!(ladder.iter().position(|p| *p == 19.0), Some(9));
+        assert_eq!(font_ladder(18.0).iter().position(|p| *p == 18.0), Some(8));
     }
 
     #[test]
